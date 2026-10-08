@@ -1,0 +1,42 @@
+# 📮 kummerkasten-bot
+
+[matrix]
+homeserver   = "https://matrix.example.org"
+user_id      = "@kummerkasten:example.org"
+# Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
+access_token = "syt_REPLACE_ME"
+device_id    = "REPLACE_ME"
+# recovery_key = "OPTIONAL RECOVERY KEY"
+
+[security]
+# Who runs the Kummerkasten: `!kk …` in a verified, encrypted direct chat.
+admin_users = ["@admin:example.org"]
+# Nobody else may invite the bot anywhere. Admins may always open a direct
+# chat with it, and invite it to rooms they authorized (`!kk rooms add`).
+# Both lists are required: "all" is refused at startup.
+allowed_inviters = []
+allowed_rooms    = []
+# encryption_strategy = "identity_based"   # all_devices | identity_based | only_trusted
+
+# Admin commands only from devices the bot has verified (`!admin verify`).
+[security.admin_dm]
+require_verified_device = true
+
+[kummerkasten]
+# Every date residents see, and when a day ends.
+timezone = "Europe/Berlin"
+# Time of the starting rhythm — the 1st, 3rd and 5th Sunday of each month.
+# Used once, on first start; afterwards `!kk rule set …` changes it.
+plenum_time = "19:00"
+
+# Starting values; admins change them with `!admin set <key> <value>`.
+[kummerkasten.settings]
+# Results never describe fewer people than this (never below 2).
+privacy_threshold = 3
+# An unfinished draft is tidied away after this many minutes.
+session_minutes = 60
+# A plenum counts as completed from this local time on its day.
+complete_at = "23:59"
+# The one check-in reminder goes this many hours before the check-in closes
+# (to those who haven't answered; per check-in it can be switched off).
+reminder_hours = 24

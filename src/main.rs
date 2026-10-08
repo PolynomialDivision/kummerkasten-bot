@@ -1,0 +1,251 @@
+//! 📮 kummerkasten-bot — feedback, check-ins and ideas for the house, in
+//! private Matrix chats. See README.md.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use mxbot_common::{
+    admin::Dispatch,
+    matrix_sdk::{
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::{
+                reaction::OriginalSyncReactionEvent,
+                room::{
+                    member::OriginalSyncRoomMemberEvent,
+                    message::{MessageType, OriginalSyncRoomMessageEvent},
+                },
+            },
+            OwnedRoomId,
+        },
+        Room, RoomState,
+    },
+    rooms::DynamicRooms,
+    send::send_with_retry,
+    settings::Settings,
+    Bot,
+};
+use tokio::sync::{Mutex, Notify};
+
+mod access;
+mod admin;
+mod admin_checkins;
+mod admin_results;
+mod catalog;
+mod checkins;
+mod config;
+mod db;
+mod dm;
+mod engine;
+mod flow;
+mod ideas;
+mod lifecycle;
+mod markup;
+mod measures;
+mod plenum;
+mod plenums;
+mod reconcile;
+mod results;
+mod scheduler;
+mod screens;
+mod secrets;
+mod stats;
+mod store;
+mod submissions;
+mod summary;
+mod surveys;
+mod time;
+
+/// Where a message goes.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// `!kk …` from an admin in their verified direct chat.
+    Admin,
+    /// Anything else: a resident's chat or an authorized room.
+    Normal,
+}
+
+fn route(dispatch: Dispatch, body: &str) -> Option<Route> {
+    match dispatch {
+        Dispatch::Handled => None,
+        Dispatch::AdminDm if is_admin_command(body) => Some(Route::Admin),
+        Dispatch::AdminDm | Dispatch::Continue => Some(Route::Normal),
+    }
+}
+
+fn is_admin_command(body: &str) -> bool {
+    let first = body.split_whitespace().next().unwrap_or("");
+    first.eq_ignore_ascii_case("!kk")
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config: config::Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
+    mxbot_common::logging::init("kummerkasten_bot");
+    config::check_security(&config.security)?;
+    let zone = time::Zone::parse(&config.kummerkasten.timezone)?;
+
+    let store_path = mxbot_common::config::store_path_from_env();
+    std::fs::create_dir_all(&store_path)
+        .with_context(|| format!("Creating {}", store_path.display()))?;
+    let db = db::Db::open(&store_path.join("kummerkasten.sqlite")).await?;
+    let secrets = secrets::Secrets::load_or_create(&store_path.join("kummerkasten.key"))?;
+    let settings = Settings::load(
+        store_path.join("settings.json"),
+        config.kummerkasten.settings.clone(),
+    )
+    .await?;
+
+    // First start: the house's rhythm as the starting rule. Then plenums
+    // into view and a round open.
+    let plenum_time = time::parse_hm(&config.kummerkasten.plenum_time)?;
+    db.run(move |conn| {
+        let now = Utc::now();
+        let rule = plenum::Recurrence::default_rule(plenum_time);
+        if plenums::ensure_rule(conn, &rule, zone.date(now))? {
+            tracing::info!(rule = %rule.describe(), "Stored the starting plenum rhythm");
+        }
+        plenums::materialize(conn, zone, now)?;
+        plenums::ensure_round(conn, now)?;
+        Ok(())
+    })
+    .await?;
+
+    let authorized = db.run(|c| store::authorized_rooms(c)).await?;
+    let rooms = DynamicRooms::new(
+        authorized
+            .iter()
+            .filter_map(|(id, _)| OwnedRoomId::try_from(id.as_str()).ok()),
+    );
+    // Residents' chats are created by the bot, never joined on invitation:
+    // `[security]` lets only admins invite it, into authorized rooms.
+    let bot = Bot::builder("kummerkasten-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .settings(settings.store().clone())
+        .dynamic_rooms(rooms.clone())
+        .admin_help(admin::SHORT_HELP)
+        .start(&config.matrix, &config.security)
+        .await?;
+
+    let kk = dm::Kk {
+        client: bot.client.clone(),
+        bot: bot.user_id.clone(),
+        engine: engine::Engine::new(db, secrets, zone).with_threshold({
+            let settings = settings.clone();
+            Arc::new(move || settings.get().privacy_threshold() as i64)
+        }),
+        settings,
+        rooms,
+        ops: Arc::new(Mutex::new(())),
+        wake: Arc::new(Notify::new()),
+        pending_starts: Arc::default(),
+    };
+
+    bot.client.add_event_handler({
+        let kk = kk.clone();
+        let bot = bot.clone();
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let kk = kk.clone();
+            let bot = bot.clone();
+            async move {
+                if ev.sender == kk.bot || room.state() != RoomState::Joined {
+                    return;
+                }
+                let dispatch = bot.admin.handle(&room, &ev, encryption.as_ref()).await;
+                let body = match &ev.content.msgtype {
+                    MessageType::Text(text) => text.body.trim().to_owned(),
+                    _ => String::new(),
+                };
+                match route(dispatch, &body) {
+                    None => {}
+                    Some(Route::Admin) => {
+                        let reply = admin::run(&kk, &ev.sender, &body).await;
+                        if let Err(error) = send_with_retry(&room, markup::notice(&reply)).await {
+                            tracing::warn!(%error, "Could not answer an admin");
+                        }
+                    }
+                    Some(Route::Normal) => {
+                        if kk.is_chat(&room).await {
+                            if is_admin_command(&body) {
+                                // Not an admin (or not their verified chat).
+                                let _ = send_with_retry(
+                                    &room,
+                                    markup::notice("🔒 `!kk` is for admins, in their verified direct chat with me."),
+                                )
+                                .await;
+                                return;
+                            }
+                            dm::on_message(&kk, &room, &ev, encryption.as_ref()).await;
+                        } else {
+                            dm::on_room_message(&kk, &room, &ev).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    bot.client.add_event_handler({
+        let kk = kk.clone();
+        move |ev: OriginalSyncReactionEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let kk = kk.clone();
+            async move {
+                if ev.sender == kk.bot || room.state() != RoomState::Joined {
+                    return;
+                }
+                if kk.is_chat(&room).await {
+                    dm::on_reaction(&kk, &room, &ev, encryption.as_ref()).await;
+                } else {
+                    dm::on_entry_reaction(&kk, &room, &ev).await;
+                }
+            }
+        }
+    });
+
+    bot.client.add_event_handler({
+        let kk = kk.clone();
+        move |ev: OriginalSyncRoomMemberEvent, room: Room| {
+            let kk = kk.clone();
+            async move {
+                if ev.state_key == kk.bot {
+                    return;
+                }
+                if kk.is_chat(&room).await {
+                    dm::on_member(&kk, &room, &ev).await;
+                } else {
+                    dm::on_authorized_join(&kk, &room, &ev).await;
+                }
+            }
+        }
+    });
+
+    bot.initial_sync().await;
+    tracing::info!("Initial sync complete");
+    tokio::spawn(scheduler::run(kk.clone()));
+    bot.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_admins_in_their_verified_chat_reach_admin_commands() {
+        // The console said: an admin, in their verified, encrypted chat.
+        assert_eq!(
+            route(Dispatch::AdminDm, "!kk rooms add !r:x"),
+            Some(Route::Admin)
+        );
+        // Anyone else — a resident in their chat, anyone in a room — is
+        // routed as a normal message (and told `!kk` is for admins).
+        assert_eq!(
+            route(Dispatch::Continue, "!kk rooms add !r:x"),
+            Some(Route::Normal)
+        );
+        assert_eq!(route(Dispatch::AdminDm, "!menu"), Some(Route::Normal));
+        assert_eq!(route(Dispatch::Handled, "!admin status"), None);
+        assert!(!is_admin_command("!kkk"));
+    }
+}

@@ -1,0 +1,15 @@
+# Credentials — never commit
+config.toml
+
+# Runtime data: Matrix store, kummerkasten.sqlite (resident feedback),
+# kummerkasten.key (HMAC secret) and settings.json
+store/
+
+# The same files, should they ever land outside store/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+
+# Rust build artifacts
+target/
