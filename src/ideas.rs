@@ -1,7 +1,7 @@
 //! 💡 Ideas: shared on purpose, supported and commented without names.
 //!
 //! An idea only exists because its author chose 🌍 *Add to Ideas* (from
-//! feedback or a check-in answer that asks what to change) — never
+//! feedback or a check-in answer that asks what to change), never
 //! automatically. It is a separate public object: nothing links it to the
 //! author, the submission or the response it came from, and their own
 //! identity and retention choices stay as they were.
@@ -12,7 +12,7 @@
 //! and to show "✅ you support this" to that account), never list who does.
 //!
 //! "A similar idea already exists" is deterministic: normalized keywords
-//! (overlap), the same canonical problem. It only suggests — residents
+//! (overlap), the same canonical problem. It only suggests: residents
 //! decide, nothing is merged.
 
 use std::collections::BTreeSet;
@@ -253,7 +253,7 @@ pub fn create(conn: &Connection, new: &NewIdea, today: NaiveDate) -> Result<i64>
 
 // ── Support and comments (one per account, never a list of names) ──────────
 
-/// 👍 — `true` if it wasn't supported by this account yet.
+/// 👍: `true` if it wasn't supported by this account yet.
 pub fn support(conn: &Connection, secrets: &Secrets, id: i64, mxid: &str) -> Result<bool> {
     usable(conn, id)?;
     Ok(conn.execute(
@@ -282,7 +282,7 @@ pub fn supports(conn: &Connection, secrets: &Secrets, id: i64, mxid: &str) -> Re
         .is_some())
 }
 
-/// 💬 — one comment per account and idea; writing again replaces it.
+/// 💬: one comment per account and idea; writing again replaces it.
 pub fn comment(
     conn: &Connection,
     secrets: &Secrets,
@@ -532,7 +532,7 @@ pub(crate) mod tests {
             &secrets,
             id,
             "@a:x",
-            "Yes please — Saturday morning",
+            "Yes please, Saturday morning",
             day(),
         )
         .unwrap();
@@ -540,7 +540,7 @@ pub(crate) mod tests {
         assert_eq!(get(&conn, id).unwrap().unwrap().comments, 2);
         assert!(comments(&conn, id, 5)
             .unwrap()
-            .contains(&"Yes please — Saturday morning".to_owned()));
+            .contains(&"Yes please, Saturday morning".to_owned()));
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub fn set_joined(conn: &Connection, mxid: &str) -> Result<()> {
     Ok(())
 }
 
-/// They left their chat: forget it (and what was tracked in it — the bot
+/// They left their chat: forget it (and what was tracked in it, the bot
 /// can't redact there any more). Their floor stays for a next chat.
 pub fn drop_dm(conn: &Connection, mxid: &str, room_id: &str) -> Result<()> {
     conn.execute(

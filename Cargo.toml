@@ -21,8 +21,3 @@ tracing      = "0.1"
 [dev-dependencies]
 tempfile = "3"
 toml     = "1"
-
-# Local development against the mxbot-common checkout (its `private` module
-# and runtime room allow-list are not pushed yet). Do not commit.
-[patch."https://github.com/PolynomialDivision/mxbot-common"]
-mxbot-common = { path = "../mxbot-common" }

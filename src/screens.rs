@@ -1,6 +1,6 @@
 //! What each screen says, and its buttons (reactions the bot seeds under
 //! the message). A tap is mapped back to an action by rendering the same
-//! screen again — nothing about buttons needs storing.
+//! screen again: nothing about buttons needs storing.
 //!
 //! Lists use their own emojis when those are distinct, numbers otherwise
 //! (🍳 Kitchen 1–4), and typing the number works too.
@@ -52,7 +52,7 @@ pub struct Ctx<'a> {
 }
 
 /// Content prepared for a results or ideas screen (already through the
-/// privacy policy — screens only lay it out).
+/// privacy policy: screens only lay it out).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prepared {
     Results {
@@ -172,7 +172,7 @@ impl Builder {
         self.options(&items, |i| action(nodes[i]))
     }
 
-    /// `(emoji, label)` options as buttons — see [`Builder::choices`].
+    /// `(emoji, label)` options as buttons: see [`Builder::choices`].
     fn options(
         &mut self,
         items: &[(String, String)],
@@ -312,7 +312,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
         Screen::Suggestion => {
             let mut b = Builder::new("💡 **What would you change?**");
             b.gap()
-                .line("Optional — send it as a message, or skip.")
+                .line("Optional. Send it as a message, or skip.")
                 .gap();
             b.button(SKIP, "Skip", Action::Skip);
             b.nav()
@@ -326,7 +326,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
             let mut b = Builder::new("🏠 **Which floor do you live on?**");
             b.gap()
                 .line("I'll remember it for next time. Your submissions only")
-                .line("ever store the floor — never who you are.")
+                .line("ever store the floor, never who you are.")
                 .gap();
             b.choices(&cat.floors(), |n| Action::Floor(n.id));
             b.nav()
@@ -357,7 +357,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
             }
             b.line(match draft.location {
                 Some(l) => format!("📍 {}", cat.location_path(l)),
-                None => "📍 —".to_owned(),
+                None => "📍 (none)".to_owned(),
             });
             match draft.identity {
                 Some(Identity::Floor) => {
@@ -374,7 +374,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
             b.line(if draft.for_plenum {
                 "🗣️ Include in next plenum"
             } else {
-                "🤫 Not for the plenum — just for the record"
+                "🤫 Not for the plenum, just for the record"
             });
             if let Some(r) = draft.retention {
                 b.line(r.title());
@@ -445,10 +445,10 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
                         b.line(format!("💡 {}", quote(sug)));
                     }
                     b.gap();
-                    b.button(DELETE, "**Delete it** — for good", Action::Delete);
+                    b.button(DELETE, "**Delete it** for good", Action::Delete);
                 }
                 None => {
-                    b.line("⏳ I've forgotten which one that was — send the code again.");
+                    b.line("⏳ I've forgotten which one that was. Send the code again.");
                 }
             }
             b.nav()
@@ -456,7 +456,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
         Screen::Privacy => {
             let mut b = Builder::new("🔐 **Privacy**");
             b.gap()
-                .line("🧹 Messages in this chat are temporary — they're removed after the next plenum.")
+                .line("🧹 Messages in this chat are temporary. They're removed after the next plenum.")
                 .line("🗄️ Submitted feedback is stored as you choose: kept, or deleted after the next plenum.")
                 .line("🥷 Anonymous feedback is not stored with your Matrix account; 🏠 floor feedback only with your floor.")
                 .line("🔑 For deletion codes I keep only a fingerprint, never the code.")
@@ -494,7 +494,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
                 if run.plenum_id.is_some() {
                     b.line("🗣️ For the next plenum");
                 }
-                b.line("👀 At the end you choose how to submit — anonymously if you like.")
+                b.line("👀 At the end you choose how to submit, anonymously if you like.")
                     .gap();
                 b.button(BEGIN, "**Start**", Action::Begin);
                 b.nav()
@@ -510,7 +510,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
         Screen::CheckinComment { .. } => {
             let mut b = Builder::new("💬 **Anything to add?**");
             b.gap()
-                .line("Optional — send it as a message, or skip.")
+                .line("Optional. Send it as a message, or skip.")
                 .gap();
             b.button(SKIP, "Skip", Action::Skip);
             b.nav()
@@ -534,7 +534,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
             }
             b.gap();
             b.button("🌍", "**Add to Ideas**", Action::Share(Share::Public))
-                .line("     everyone can see and 👍 it — without your name");
+                .line("     everyone can see and 👍 it, without your name");
             if matches!(flow.screen(), Screen::ShareIdea) {
                 b.button(
                     "🗣️",
@@ -684,7 +684,7 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
         Screen::IdeaComment { .. } => {
             let mut b = Builder::new("💬 **Your comment**");
             b.gap()
-                .line("Write it as a message — it's shown without your name.")
+                .line("Write it as a message. It's shown without your name.")
                 .line("One comment per idea: writing again replaces yours.");
             b.nav()
         }
@@ -700,7 +700,7 @@ fn lost_results() -> View {
 /// How a draft's idea will be shared (preview line).
 fn idea_line(plan: &IdeaPlan) -> &'static str {
     match plan {
-        IdeaPlan::New => "🌍 Also shared on the Ideas board — without your name",
+        IdeaPlan::New => "🌍 Also shared on the Ideas board, without your name",
         IdeaPlan::Support { .. } => "👍 Also supports the similar idea",
         IdeaPlan::Comment { .. } => "💬 Also added as a comment to the similar idea",
     }
@@ -723,7 +723,7 @@ fn identities(b: &mut Builder, ctx: &Ctx, draft_floor: Option<i64>, allowed: &[I
                     &floor_label(ctx, ctx.own_floor.or(draft_floor)),
                     Action::Identity(Identity::Floor),
                 )
-                .line("     only your floor is stored — on a floor with few people,")
+                .line("     only your floor is stored. On a floor with few people,")
                 .line("     that can give you away");
             }
             Identity::Named => {
@@ -969,7 +969,7 @@ fn menu(ctx: &Ctx) -> View {
 
 pub fn intro() -> String {
     "👋 **Hi, I'm the Kummerkasten!** 📮\n\n\
-     Tell me what's bothering you, what's going well, or what you'd change — \
+     Tell me what's bothering you, what's going well, or what you'd change, \
      anonymously if you like. 🌱\n\n\
      🔐 **Privacy**\n\
      Messages in this chat are temporary and will be removed after the next plenum. 🧹\n\
@@ -1016,8 +1016,8 @@ pub fn submitted(
     match token {
         Some(token) => text.push_str(&format!(
             "🔑 Your deletion code:\n\n`{token}`\n\n\
-             Keep this code if you want to manage or delete this submission later — \
-             📌 save it somewhere outside this chat. Once you have, tap ✅ and I'll \
+             Keep this code if you want to manage or delete this submission later. \
+             📌 Save it somewhere outside this chat. Once you have, tap ✅ and I'll \
              remove this message; otherwise it goes when the chat is cleared after \
              the plenum.\n\n"
         )),
@@ -1074,7 +1074,7 @@ pub fn checkin_notice(run: &Run, ctx: &Ctx) -> String {
 /// The one optional reminder.
 pub fn checkin_reminder(run: &Run, ctx: &Ctx) -> String {
     format!(
-        "🔔 **Quick reminder**\n\nThe {} {} check-in is still open — until {}.\n\
+        "🔔 **Quick reminder**\n\nThe {} {} check-in is still open until {}.\n\
          It takes {}. 🌱\n\n{START_CHECKIN} **Continue**",
         run.emoji,
         crate::markup::literal(&run.title),
@@ -1083,11 +1083,11 @@ pub fn checkin_reminder(run: &Run, ctx: &Ctx) -> String {
     )
 }
 
-/// Into the central room — only when the admin chose it.
+/// Into the central room: only when the admin chose it.
 pub fn checkin_announcement(run: &Run, ctx: &Ctx) -> String {
     format!(
         "📊 **New check-in: {} {}**\n\n{} · 🗓️ open until {}\n\n\
-         Answer it in your private Kummerkasten chat — tap 📮 below if you don't have one yet. \
+         Answer it in your private Kummerkasten chat. Tap 📮 below if you don't have one yet. \
          🥷 Anonymous if you like.",
         run.emoji,
         crate::markup::literal(&run.title),

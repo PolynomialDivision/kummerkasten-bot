@@ -1,6 +1,6 @@
 //! The conversation as an explicit state machine: a stack of screens (the
-//! top one is showing; ⬅️ Back pops it) and the draft collected so far —
-//! feedback or check-in answers. Pure — no Matrix, no database; `engine`
+//! top one is showing; ⬅️ Back pops it) and the draft collected so far:
+//! feedback or check-in answers. Pure: no Matrix, no database; `engine`
 //! runs the effects.
 
 use std::collections::BTreeMap;
@@ -102,7 +102,7 @@ pub enum IdeaPlan {
     Comment { id: i64 },
 }
 
-/// 🌍 / 🗣️ / 🔒 — sharing a suggestion.
+/// 🌍 / 🗣️ / 🔒: sharing a suggestion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Share {
     Public,
@@ -438,7 +438,7 @@ pub fn apply_in(flow: &mut Flow, action: Action, env: &Env) -> Effect {
                     None => flow.draft.idea = Some(IdeaPlan::New),
                 },
                 // Not on the board; the feedback itself goes to the plenum
-                // (🗣️) or not (🔒) — both can still be changed in the preview.
+                // (🗣️) or not (🔒): both can still be changed in the preview.
                 Share::PlenumOnly => {
                     flow.draft.idea = None;
                     flow.draft.for_plenum = true;
@@ -578,7 +578,7 @@ pub fn apply_in(flow: &mut Flow, action: Action, env: &Env) -> Effect {
         }
         (screen, action) if is_checkin(&screen) => match env.run {
             Some(run) if flow.run() == Some(run.id) => checkin(flow, screen, action, run, env),
-            _ => Effect::Hint("⏳ I've lost track of that check-in — open it again from the menu."),
+            _ => Effect::Hint("⏳ I've lost track of that check-in. Open it again from the menu."),
         },
         (_, Action::Text(_)) => Effect::Hint("👆 Tap one of the buttons under my last message."),
         _ => Effect::Hint("👆 That button isn't for this step."),
@@ -614,7 +614,7 @@ fn checkin(flow: &mut Flow, screen: Screen, action: Action, run: &Run, env: &Env
         }
         (S::CheckinQuestion { index }, action) => {
             let Some(q) = run.questions.get(index) else {
-                return Effect::Hint("⏳ That question is gone — open the check-in again.");
+                return Effect::Hint("⏳ That question is gone. Open the check-in again.");
             };
             match (q.kind, action) {
                 (_, Action::Skip) if !q.required => {
@@ -684,7 +684,7 @@ fn checkin(flow: &mut Flow, screen: Screen, action: Action, run: &Run, env: &Env
                             ..Answer::default()
                         };
                         if q.asks_suggestion {
-                            // "What would you change?" — offer it as an idea.
+                            // "What would you change?": offer it as an idea.
                             flow.push(S::CheckinShareIdea { index });
                             return Effect::Show;
                         }
@@ -812,9 +812,9 @@ fn after_text(flow: &mut Flow, cat: &Catalog) {
 fn clean(text: &str) -> Result<String, &'static str> {
     let text = text.trim();
     if text.is_empty() {
-        Err("✍️ Write a few words — anything is fine.")
+        Err("✍️ Write a few words. Anything is fine.")
     } else if text.chars().count() > MAX_TEXT {
-        Err("📏 That's a bit long for one message — could you shorten it?")
+        Err("📏 That's a bit long for one message. Could you shorten it?")
     } else {
         Ok(text.to_owned())
     }
@@ -1070,7 +1070,7 @@ mod tests {
             ),
             Effect::Show
         );
-        // "What would you change?": offered as an idea — kept in the answers.
+        // "What would you change?": offered as an idea, kept in the answers.
         assert_eq!(f.screen(), &Screen::CheckinShareIdea { index: 2 });
         assert_eq!(
             step(&mut f, Action::Share(Share::Private), cat, run, None),

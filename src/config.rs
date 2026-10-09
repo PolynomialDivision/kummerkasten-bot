@@ -55,7 +55,7 @@ pub struct Tunables {
     pub complete_at: String,
     /// Complete a plenum automatically at `complete_at` on its day. Off by
     /// default: a date passing doesn't mean the plenum happened (it may be
-    /// delayed, moved or not take place), and completing deletes data —
+    /// delayed, moved or not take place), and completing deletes data:
     /// admins complete it (`!kk plenum complete`).
     #[serde(default)]
     pub auto_complete: bool,
@@ -122,7 +122,7 @@ pub fn check_security(security: &SecurityConfig) -> Result<()> {
         );
     }
     if security.allowed_inviters.is_all() {
-        bail!("[security] allowed_inviters must not be \"all\" (usually [] — admins may always invite)");
+        bail!("[security] allowed_inviters must not be \"all\" (usually []; admins may always invite)");
     }
     Ok(())
 }

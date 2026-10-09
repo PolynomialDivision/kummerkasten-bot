@@ -1,6 +1,6 @@
 //! Residents' private chats on the Matrix side: opening them, sending what
 //! the engine says (and tracking every event for redaction), and turning
-//! messages and taps into engine input — each only after checking, fresh
+//! messages and taps into engine input: each only after checking, fresh
 //! from the server, that the chat is still just the bot and that resident,
 //! encrypted, and that they are still in an authorized room.
 
@@ -45,7 +45,7 @@ use crate::{
 
 /// Room-version policy for new chats: the versions this implementation
 /// explicitly supports, in our order of preference (a deliberate list, not
-/// a sort — room version IDs are opaque). A new chat gets the first one the
+/// a sort: room version IDs are opaque). A new chat gets the first one the
 /// homeserver lists as *stable*; when none matches, the server's default.
 /// Supporting a newer version means testing it and putting it in front.
 pub const PREFERRED_SUPPORTED_ROOM_VERSIONS: [RoomVersionId; 3] =
@@ -120,7 +120,7 @@ impl Kk {
     }
 }
 
-/// Send `msgs` to `mxid`'s chat `room`, tracking every event (edits too —
+/// Send `msgs` to `mxid`'s chat `room`, tracking every event (edits too:
 /// they carry content). A live message gets its buttons and becomes the
 /// screen whose taps count; an edit changes that screen in place.
 pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
@@ -198,7 +198,7 @@ async fn consume(kk: &Kk, room: &Room, reaction: &OwnedEventId) {
     }
 }
 
-/// Lost access: drop the conversation, say so — no house data.
+/// Lost access: drop the conversation, say so, no house data.
 async fn lock(kk: &Kk, room: &Room, mxid: &str) {
     let (m, room_id) = (mxid.to_owned(), room.room_id().to_string());
     let _ = kk
@@ -279,17 +279,17 @@ pub async fn on_message(
     kk.wake.notify_one();
 }
 
-/// A tap in a resident's chat — counted only on their live screen.
-pub async fn on_reaction(
-    kk: &Kk,
-    room: &Room,
-    ev: &OriginalSyncReactionEvent,
-    encryption: Option<&EncryptionInfo>,
-) {
+/// A tap in a resident's chat: counted only on their live screen.
+/// A tap in a resident's chat. Unlike messages, reactions needn't arrive
+/// encrypted: Element Web and FluffyChat send them in the clear even in
+/// encrypted rooms (an emoji and the event it points at: public anyway).
+/// They carry no text; the chat itself is still checked to be private and
+/// encrypted before anything happens.
+pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
     let Some(resident) = kk.resident_of(room).await else {
         return;
     };
-    if resident.mxid != ev.sender.as_str() || encryption.is_none() {
+    if resident.mxid != ev.sender.as_str() {
         return;
     }
     let _op = kk.ops.lock().await;
@@ -439,7 +439,7 @@ pub async fn open_chat(kk: &Kk, user: &UserId) -> Result<Opened> {
     open_chat_at(kk, user, None).await
 }
 
-/// Open (or bring up) `user`'s chat — at `at` if they have one already.
+/// Open (or bring up) `user`'s chat, at `at` if they have one already.
 pub async fn open_chat_at(kk: &Kk, user: &UserId, at: Option<MenuItem>) -> Result<Opened> {
     let Some(who) = kk.who(user).await else {
         return Ok(Opened::Locked);
@@ -566,7 +566,7 @@ pub async fn on_entry_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEv
 /// Post an entry message with its 📮 into an authorized room.
 pub async fn post_entry(kk: &Kk, room: &Room) -> Result<()> {
     let text = "📮 **Kummerkasten**\n\n\
-                Something on your mind — a problem, an idea, a thank-you? 🌱\n\
+                Something on your mind? A problem, an idea, a thank-you? 🌱\n\
                 Tap 📮 and I'll open a private chat with you.\n\n\
                 🥷 anonymous if you like · 🔐 private · 🧹 tidied up after every plenum";
     post_with_entry(kk, room, text).await
@@ -752,7 +752,7 @@ async fn tell(kk: &Kk, room: &Room, who: &Who, run_id: i64, which: CheckinText) 
     true
 }
 
-/// Tell everyone `run` concerns about it — the start notice or the one
+/// Tell everyone `run` concerns about it: the start notice or the one
 /// reminder. Before the notice, every eligible resident without a chat
 /// gets one (see [`reconcile`]). Access, target and "not answered yet" are
 /// checked for each person right before sending; what is stored is only
@@ -818,7 +818,7 @@ pub async fn send_checkin(kk: &Kk, run_id: i64, which: CheckinText) {
     tracing::info!(run = run_id, kind = ?which, sent, "Check-in messages sent");
 }
 
-/// Announce `run` in the central room(s) — only for runs set to.
+/// Announce `run` in the central room(s): only for runs set to.
 pub async fn announce_checkin(kk: &Kk, run_id: i64) {
     let text = match kk
         .engine

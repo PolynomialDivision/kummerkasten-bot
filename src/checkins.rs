@@ -3,14 +3,14 @@
 //!
 //! * Starting a run copies nothing but points at the exact question versions
 //!   (which then can't change any more) in their order, and stores the
-//!   target as a rule — resolved, against fresh Matrix membership, whenever
+//!   target as a rule: resolved, against fresh Matrix membership, whenever
 //!   someone is notified, starts, continues or submits.
 //! * Submitting writes, in one transaction, a participation key
 //!   `HMAC(secret, run ‖ Matrix ID)` and a response with a random UUID.
 //!   Neither has a timestamp or a row order, and nothing links them: the
 //!   database can say *whether* someone answered, not *what*.
 //! * Notices, reminders and announcements go out per run in one batch whose
-//!   time is stored on the run — never per person, so no "reminded" flag
+//!   time is stored on the run, never per person, so no "reminded" flag
 //!   can tell who had answered by then. What is kept is aggregate: how many
 //!   were eligible when it started, how many notices and reminders went
 //!   out. The messages themselves are remembered (event → run, no room)
@@ -35,7 +35,7 @@ use crate::{
     time,
 };
 
-/// Who a run asks — a rule, not a list of people.
+/// Who a run asks: a rule, not a list of people.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
@@ -223,7 +223,7 @@ pub enum Deadline {
     Default,
     /// Exactly then, whatever happens to the plenum.
     Fixed(DateTime<Utc>),
-    /// This long before its plenum starts — and moves with it.
+    /// This long before its plenum starts, and moves with it.
     BeforePlenum(Duration),
 }
 
@@ -251,7 +251,7 @@ impl Default for StartOptions {
     }
 }
 
-/// What starting would do — shown to the admin before it happens.
+/// What starting would do: shown to the admin before it happens.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub template: String,
@@ -318,11 +318,11 @@ pub fn plan(
         (Deadline::Default, None) => (now + Duration::days(7), None),
         (Deadline::BeforePlenum(before), Some((_, _, at))) => (at - before, Some(-before)),
         (Deadline::BeforePlenum(_), None) => {
-            bail!("A deadline before the plenum needs a plenum — leave out `no-plenum`.")
+            bail!("A deadline before the plenum needs a plenum. Leave out `no-plenum`.")
         }
     };
     if closes_at <= now + Duration::hours(1) {
-        bail!("It would close too soon — give people at least an hour.");
+        bail!("It would close too soon. Give people at least an hour.");
     }
     let reminder_at = Some(closes_at - remind_before)
         .filter(|at| opts.reminder && *at >= now + Duration::hours(1));
@@ -358,7 +358,7 @@ pub fn start(conn: &mut Connection, plan: &Plan, actor: &str, now: DateTime<Utc>
         .collect();
     if current != plan.versions {
         bail!(
-            "«{}» changed in the meantime — plan the start again.",
+            "«{}» changed in the meantime. Plan the start again.",
             plan.template
         );
     }
@@ -493,8 +493,8 @@ pub enum Refused {
 impl Refused {
     pub fn message(&self) -> &'static str {
         match self {
-            Refused::Closed => "⏰ This check-in has closed — nothing was saved.",
-            Refused::NotAsked => "🔒 This check-in isn't for you (any more) — nothing was saved.",
+            Refused::Closed => "⏰ This check-in has closed. Nothing was saved.",
+            Refused::NotAsked => "🔒 This check-in isn't for you (any more). Nothing was saved.",
             Refused::AlreadyAnswered => "✅ You've already answered this check-in. Thank you!",
             Refused::Incomplete => "✍️ A required question is still open.",
         }
@@ -512,7 +512,7 @@ pub struct Submission<'a> {
     pub answers: &'a BTreeMap<usize, Answer>,
 }
 
-/// Store a response — in the caller's transaction, with the participation
+/// Store a response, in the caller's transaction, with the participation
 /// key. Checks again that the run is open, meant for them, not answered
 /// yet, and that the answers fit the questions.
 pub fn submit(
@@ -866,7 +866,7 @@ pub fn count_batch(
     Ok(())
 }
 
-/// A run in the admin overview — with a count of answers, nothing more.
+/// A run in the admin overview, with a count of answers, nothing more.
 pub struct RunRow {
     pub id: i64,
     pub emoji: String,
@@ -999,7 +999,7 @@ pub(crate) mod tests {
             old.questions[1].choices[0].label,
             "Cleaning turns are skipped"
         );
-        // The next run asks the new wording — measuring the same metric,
+        // The next run asks the new wording: measuring the same metric,
         // and the reworded choice still stands for the same problem.
         let run2 = started(&mut conn, now, StartOptions::default());
         assert_eq!(

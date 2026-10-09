@@ -2,7 +2,7 @@
 //!
 //! A rule only *proposes* dates. `plenums` turns them into concrete rows
 //! (with stable IDs) once they come into view, and from then on a row is
-//! what counts — moving or cancelling one occurrence never touches the
+//! what counts: moving or cancelling one occurrence never touches the
 //! rule, and changing the rule never rewrites a plenum something already
 //! points at. New kinds of rules are new variants here; stored rules keep
 //! deserializing.
@@ -25,7 +25,7 @@ const WEEKDAY_NAMES: [&str; 7] = [
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Recurrence {
-    /// The `nths` occurrences of `weekday` (0 = Monday) in every month —
+    /// The `nths` occurrences of `weekday` (0 = Monday) in every month:
     /// `[1, 3, 5]` is the 1st, 3rd and (where a month has one) 5th.
     MonthlyNth {
         weekday: u8,
@@ -133,9 +133,9 @@ impl Recurrence {
 
     /// Admin syntax, after `!kk rule set`:
     ///
-    /// * `sun 1,3,5 19:00` — those Sundays of each month
-    /// * `sun 19:00` — every Sunday; `sat,sun 19:00` — both days
-    /// * `every 2 sun 19:00 from 2026-11-01` — every second week
+    /// * `sun 1,3,5 19:00`, those Sundays of each month
+    /// * `sun 19:00`, every Sunday; `sat,sun 19:00`, both days
+    /// * `every 2 sun 19:00 from 2026-11-01`, every second week
     pub fn parse(args: &[&str], today: NaiveDate) -> Result<Self> {
         let mut args: Vec<&str> = args.to_vec();
         let mut every = 1;

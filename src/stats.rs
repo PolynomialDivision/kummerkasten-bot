@@ -3,14 +3,14 @@
 //!
 //! * **Comparable only by meaning.** A longitudinal series is one canonical
 //!   metric (scale questions) or one canonical problem within one metric
-//!   (choice questions) — whatever the wording of each version. Different
+//!   (choice questions): whatever the wording of each version. Different
 //!   metrics are never merged; each point keeps the exact question version.
 //! * **Two signals, never mixed.** Check-in shares ("38% selected this")
 //!   and spontaneous feedback counts ("9 submissions mentioned this") are
 //!   returned separately and never combined into one number.
 //! * **Privacy threshold.** Every value describing a group needs at least
 //!   `k` responses behind it. Breakdowns (by floor) hide small groups *and*
-//!   then more, until what is hidden adds up to at least `k` — otherwise
+//!   then more, until what is hidden adds up to at least `k`: otherwise
 //!   the whole minus the visible groups would give the hidden one away.
 //! * **No live differencing.** Check-in results appear once a run is
 //!   closed; spontaneous counts of the running round leave out today. So
@@ -34,7 +34,7 @@ pub fn all_days() -> NaiveDate {
 }
 
 /// Which groups of a breakdown may be shown, given each group's number of
-/// responses (`counts`, all groups — they add up to the whole) and the
+/// responses (`counts`, all groups: they add up to the whole) and the
 /// threshold `k`: none if the whole is under `k`; otherwise every group
 /// with at least `k`, minus the smallest visible ones as long as the
 /// hidden ones together have fewer than `k` (complementary suppression:
@@ -81,7 +81,7 @@ pub struct Point {
     pub question_version_id: i64,
     /// Answers behind it.
     pub n: i64,
-    /// The mean — `None` with fewer than `k` answers.
+    /// The mean: `None` with fewer than `k` answers.
     pub value: Option<f64>,
 }
 
@@ -154,7 +154,7 @@ pub struct Share {
     pub question_version_id: i64,
     /// Respondents who answered the question.
     pub n: i64,
-    /// Percent of them who picked this problem — `None` with `n < k`.
+    /// Percent of them who picked this problem: `None` with `n < k`.
     pub percent: Option<i64>,
 }
 
@@ -236,7 +236,7 @@ pub fn problem_series(conn: &Connection, topic_root: i64, k: i64) -> Result<Vec<
 // ── Spontaneous feedback ────────────────────────────────────────────────────
 
 /// Submissions of round `round_id` (as stored now) before `today`, by
-/// canonical problem, in topic `topic_root` (or all topics) — counts of
+/// canonical problem, in topic `topic_root` (or all topics): counts of
 /// submissions, not of people.
 pub fn mentions(
     conn: &Connection,
@@ -305,7 +305,7 @@ pub fn round_numbers(conn: &Connection, round_id: i64, today: NaiveDate) -> Resu
     )?)
 }
 
-/// A closed check-in's participation: responses, and the denominator —
+/// A closed check-in's participation: responses, and the denominator:
 /// residents eligible when it started (counted then, as a number only).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Participation {
@@ -354,7 +354,7 @@ pub fn participation(conn: &Connection, topic_root: Option<i64>) -> Result<Vec<P
 
 // ── Breakdown by floor ──────────────────────────────────────────────────────
 
-/// A scale question's mean by floor — only floors stated as the identity
+/// A scale question's mean by floor: only floors stated as the identity
 /// (🏠); everyone else is "not stated". Hidden groups are `None`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloorRow {

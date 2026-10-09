@@ -1,6 +1,6 @@
 //! The bot's own small markup: `**bold**`, `*italic*`, `~~struck~~`,
 //! `` `code` ``, line breaks; a backslash makes the next character literal. Everything is
-//! HTML-escaped, and messages never mention anyone — residents' text is
+//! HTML-escaped, and messages never mention anyone: residents' text is
 //! shown inside screens (the preview), and an `@user:server` in it must not
 //! ping that person. (`mxbot_common::format::mentionify` would.)
 

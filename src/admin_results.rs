@@ -1,4 +1,4 @@
-//! `!kk ideas …`, `!kk measure …`, `!kk summary …` — M3's admin side,
+//! `!kk ideas …`, `!kk measure …`, `!kk summary …`: M3's admin side,
 //! from an admin's verified chat.
 
 use anyhow::{Context, Result};
@@ -14,11 +14,11 @@ use crate::{
 };
 
 pub const HELP: &str = "💡 **Ideas**
-`!kk ideas` — all, with numbers · `!kk idea <n>` — one, with its comments
+`!kk ideas`: all, with numbers · `!kk idea <n>`: one, with its comments
 `!kk idea <n> status <suggested|discussing|trying|implemented|rejected|archived>`
 `!kk idea <n> rename <title>` · `!kk idea <n> topic <topic key>`
-`!kk idea add <topic key> <title>` — e.g. one raised at the plenum
-   (supporters are never listed — only counted)
+`!kk idea add <topic key> <title>`: e.g. one raised at the plenum
+   (supporters are never listed. Only counted)
 
 🧪 **Measures** (what the plenum decided to try)
 `!kk measures` · `!kk measure add <topic key> <title> [problem <key>] [metric <key>] [plenum <n>] [from 2026-10-19] [status trying]`
@@ -26,7 +26,7 @@ pub const HELP: &str = "💡 **Ideas**
 `!kk measure <n> describe <text>` · `rename <title>` · `from <date>` · `until <date|none>` · `plenum <n>`
 
 📮 **Plenum summary** (the day before, into the central room(s))
-`!kk summary preview [plenum n]` — what it would say now";
+`!kk summary preview [plenum n]`: what it would say now";
 
 /// Handles the M3 commands; `None` for anything else.
 pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<String>> {
@@ -170,7 +170,7 @@ async fn list_measures(kk: &Kk) -> Result<String> {
         .run(move |c| {
             let all = measures::all(c)?;
             if all.is_empty() {
-                return Ok("🧪 No measures yet — `!kk measure add …`".to_owned());
+                return Ok("🧪 No measures yet. `!kk measure add …`".to_owned());
             }
             let cat = Catalog::load(c)?;
             let today = zone.date(Utc::now());
@@ -248,7 +248,7 @@ async fn add_measure(kk: &Kk, actor: &str, topic: &str, rest: &[&str]) -> Result
         .await?;
     Ok(format!(
         "🧪 Measure #{id} recorded. It shows on the topic's timeline in 📈 Results once it \
-         has a start date — as context, never as a cause."
+         has a start date (as context, never as a cause)."
     ))
 }
 
@@ -300,7 +300,7 @@ async fn preview(kk: &Kk, rest: &[&str]) -> Result<String> {
             };
             let cat = Catalog::load(c)?;
             let text = summary::render(c, &cat, id, k, zone, Utc::now())?;
-            Ok(format!("👀 **Preview** — nothing was posted.\n\n{text}"))
+            Ok(format!("👀 **Preview**: nothing was posted.\n\n{text}"))
         })
         .await
 }

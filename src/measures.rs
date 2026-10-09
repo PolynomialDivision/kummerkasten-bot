@@ -2,7 +2,7 @@
 //!
 //! Stored with what they are about (topic, optionally a canonical problem
 //! or metric), the concrete plenum that decided them, start and end dates
-//! and a status. Results show them on a topic's timeline as *context* —
+//! and a status. Results show them on a topic's timeline as *context*:
 //! the bot never says a measure caused a change; interpreting is up to the
 //! residents and the plenum.
 

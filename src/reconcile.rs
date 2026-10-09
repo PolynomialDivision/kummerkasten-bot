@@ -7,7 +7,7 @@
 //!    each, which of them they are in *now* (no access: nothing happens);
 //! 2. keeps those the check-in is for;
 //! 3. reuses their chat if they have one (joined, or invited and not
-//!    joined yet — never a second one);
+//!    joined yet, never a second one);
 //! 4. otherwise creates the encrypted private chat and invites them,
 //!    waiting out the homeserver's rate limit when it says so.
 //!
@@ -242,7 +242,7 @@ mod tests {
         assert!(chat_of(&db, "@new:x").is_some());
         // No access: no chat, no row.
         assert_eq!(chat_of(&db, "@gone:x"), None);
-        // Again: nothing new (idempotent) — the new one is pending now.
+        // Again: nothing new (idempotent), the new one is pending now.
         let again = reconcile(&db, &hs, &Target::House).await.unwrap();
         assert_eq!(again.created, 0);
         assert_eq!(again.pending, 2);

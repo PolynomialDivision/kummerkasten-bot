@@ -25,7 +25,7 @@ require_verified_device = true
 [kummerkasten]
 # Every date residents see, and when a day ends.
 timezone = "Europe/Berlin"
-# Time of the starting rhythm — the 1st, 3rd and 5th Sunday of each month.
+# Time of the starting rhythm: the 1st, 3rd and 5th Sunday of each month.
 # Used once, on first start; afterwards `!kk rule set …` changes it.
 plenum_time = "19:00"
 
@@ -35,8 +35,13 @@ plenum_time = "19:00"
 privacy_threshold = 3
 # An unfinished draft is tidied away after this many minutes.
 session_minutes = 60
-# A plenum counts as completed from this local time on its day.
-complete_at = "23:59"
+# A plenum whose date passed waits for an admin's `!kk plenum complete`.
+# With auto_complete it completes by itself at complete_at on its day.
+auto_complete = false
+complete_at   = "23:59"
+# The day-before summary goes to the central room this many hours before
+# the plenum.
+summary_hours_before = 24
 # The one check-in reminder goes this many hours before the check-in closes
 # (to those who haven't answered; per check-in it can be switched off).
 reminder_hours = 24

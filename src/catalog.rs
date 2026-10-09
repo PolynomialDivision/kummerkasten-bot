@@ -223,7 +223,7 @@ pub fn add_problem(conn: &Connection, key: &str, topic: &str, label: &str) -> Re
     Ok(())
 }
 
-/// New wording; the key — and everything pointing at the row — stays.
+/// New wording; the key (and everything pointing at the row) stays.
 pub fn rename(
     conn: &Connection,
     kind: Kind,
@@ -255,7 +255,7 @@ pub fn set_active(conn: &Connection, kind: Kind, key: &str, active: bool) -> Res
     Ok(())
 }
 
-/// "key — emoji label" lines, retired ones marked.
+/// "key: emoji label" lines, retired ones marked.
 pub fn listing(conn: &Connection, kind: Kind) -> Result<String> {
     let sql = match kind {
         Kind::Problem => "SELECT p.key, '', p.label, p.active, coalesce(t.key, '')
@@ -293,7 +293,7 @@ pub fn listing(conn: &Connection, kind: Kind) -> Result<String> {
         } else {
             String::new()
         };
-        out.push(format!("{indent}`{key}` — {emoji} {label}{topic}{retired}").replace("—  ", "— "));
+        out.push(format!("{indent}`{key}`: {emoji} {label}{topic}{retired}").replace(":  ", ": "));
     }
     Ok(out.join("\n"))
 }
@@ -323,7 +323,7 @@ mod tests {
         let kitchens = cat.locations.iter().find(|l| l.key == "kitchens").unwrap();
         assert_eq!(cat.location_children(Some(kitchens.id)).len(), 4);
 
-        // A new subtopic naming a new problem — no code involved.
+        // A new subtopic naming a new problem: no code involved.
         add_problem(
             &conn,
             "kitchen.dishwasher",
@@ -362,6 +362,6 @@ mod tests {
         assert!(listing(&conn, Kind::Topic).unwrap().contains("retired"));
         assert!(listing(&conn, Kind::Problem)
             .unwrap()
-            .contains("`kitchen.dishwasher` — Dishwasher not emptied · kitchen"));
+            .contains("`kitchen.dishwasher`: Dishwasher not emptied · kitchen"));
     }
 }

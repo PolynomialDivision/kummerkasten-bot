@@ -2,7 +2,7 @@
 //! that was announced moves or is cancelled.
 //!
 //! When: the next scheduled plenum, `before` ahead of its *current* start
-//! (it follows every move), once — `announced_at` is set before anything is
+//! (it follows every move), once: `announced_at` is set before anything is
 //! sent, so a crash means a missed summary, never two. A cancelled plenum
 //! is never summarized. If an announced plenum moves or is cancelled,
 //! `update_pending` asks for one short update (taken the same way); a move
@@ -19,7 +19,7 @@ use crate::{
     time::{self, Zone},
 };
 
-/// The plenum whose summary is due now, marked as announced — or `None`.
+/// The plenum whose summary is due now, marked as announced, or `None`.
 /// Due: the earliest scheduled plenum, not announced yet, starting in at
 /// most `before` but not started yet.
 pub fn take_summary(
@@ -79,7 +79,7 @@ pub fn take_updates(conn: &Connection) -> Result<Vec<(i64, Update)>> {
 // ── Texts ───────────────────────────────────────────────────────────────────
 
 /// The day-before summary of plenum `id`: playful, compact, aggregate
-/// only — counts, topics and problems with at least `k` behind them, idea
+/// only: counts, topics and problems with at least `k` behind them, idea
 /// titles (shared on purpose). Never anyone's words, never small groups.
 pub fn render(
     conn: &Connection,
@@ -167,7 +167,7 @@ pub fn render(
         lines.extend(discussing);
     }
     lines.push(String::new());
-    lines.push("📮 Open the Kummerkasten · 📈 Results · 💡 Ideas — tap below.".to_owned());
+    lines.push("📮 Open the Kummerkasten · 📈 Results · 💡 Ideas. Tap below.".to_owned());
     Ok(lines.join("\n"))
 }
 
@@ -281,10 +281,10 @@ pub fn amended(
 ) -> String {
     let note = match what {
         Update::Moved => format!(
-            "🗓️ **Moved to {}** — see the update.",
+            "🗓️ **Moved to {}**. See the update.",
             zone.day_time_label(plenum.starts_at, zone.date(now))
         ),
-        Update::Cancelled => "❌ **This plenum won't take place** — see the update.".to_owned(),
+        Update::Cancelled => "❌ **This plenum won't take place**. See the update.".to_owned(),
     };
     // A second move replaces the first note.
     let rest = body
@@ -397,7 +397,7 @@ mod tests {
             take_summary(&conn, at(2026, 10, 17, 20), day()).unwrap(),
             None
         );
-        // … but on Sunday evening, a day before the new one — once.
+        // … but on Sunday evening, a day before the new one, once.
         assert_eq!(
             take_summary(&conn, at(2026, 10, 18, 20), day()).unwrap(),
             Some(p.id)
@@ -505,7 +505,7 @@ mod tests {
             at(2026, 10, 10, 9),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("cancel this one instead"), "{err}");
+        assert!(err.to_string().contains("Cancel this one instead"), "{err}");
         // Nor can the later one jump before it.
         assert!(plenums::reschedule(
             &mut conn,
@@ -583,7 +583,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(points_at, p.id);
-        // The original Sunday night passes: nothing is cleaned up — even
+        // The original Sunday night passes: nothing is cleaned up, even
         // under the auto-complete policy, the plenum isn't due on that date.
         let complete_at = NaiveTime::from_hms_opt(23, 59, 0).unwrap();
         let sunday_night = at(2026, 10, 18, 23) + Duration::minutes(59);
@@ -595,7 +595,7 @@ mod tests {
             round,
             "the round stays open during the postponement"
         );
-        // Monday night it is past its new time: awaiting completion — but
+        // Monday night it is past its new time: awaiting completion, but
         // still nothing deleted, the round still open.
         let monday_night = at(2026, 10, 19, 22);
         let waiting = plenums::get(&conn, p.id).unwrap().unwrap();

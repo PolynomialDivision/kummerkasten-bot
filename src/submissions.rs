@@ -1,8 +1,8 @@
 //! Submissions: what is stored, with which identity, and how it goes away.
 //!
-//! * 🥷 anonymous — no Matrix ID, no floor;
-//! * 🏠 floor — the floor, no Matrix ID;
-//! * 👤 named — the Matrix ID.
+//! * 🥷 anonymous: no Matrix ID, no floor;
+//! * 🏠 floor: the floor, no Matrix ID;
+//! * 👤 named: the Matrix ID.
 //!
 //! The table's CHECK constraints enforce exactly that, so no code path can
 //! quietly keep more. Anonymous and floor submissions get a deletion code;
@@ -97,7 +97,7 @@ pub struct NewSubmission {
 #[derive(Debug, PartialEq)]
 pub struct Submitted {
     pub id: i64,
-    /// The deletion code, for anonymous and floor submissions — shown once.
+    /// The deletion code, for anonymous and floor submissions: shown once.
     pub token: Option<String>,
     pub round_id: i64,
     pub plenum_id: i64,
@@ -211,7 +211,7 @@ fn view(r: &rusqlite::Row) -> rusqlite::Result<View> {
     })
 }
 
-/// The submission a deletion code belongs to — that one only.
+/// The submission a deletion code belongs to: that one only.
 pub fn by_token(conn: &Connection, secrets: &Secrets, token: &str) -> Result<Option<View>> {
     let Some(hmac) = secrets.token_hmac(token) else {
         return Ok(None);
@@ -249,7 +249,7 @@ pub fn named_one(conn: &Connection, mxid: &str, id: i64) -> Result<Option<View>>
         .optional()?)
 }
 
-/// A submission that has a deletion code, by ID — only for one whose code
+/// A submission that has a deletion code, by ID: only for one whose code
 /// was just entered.
 pub fn coded_one(conn: &Connection, id: i64) -> Result<Option<View>> {
     Ok(conn
@@ -312,7 +312,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// Every column of every table, as text — to look for the user anywhere.
+    /// Every column of every table, as text, to look for the user anywhere.
     fn everything(conn: &Connection) -> String {
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")

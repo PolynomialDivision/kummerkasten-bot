@@ -1,4 +1,4 @@
-//! `!kk survey …`, `!kk metric …`, `!kk checkin …` — editing check-in
+//! `!kk survey …`, `!kk metric …`, `!kk checkin …`: editing check-in
 //! templates and starting check-ins, from an admin's verified chat.
 
 use std::time::{Duration as StdDuration, Instant};
@@ -21,19 +21,19 @@ const PLAN_VALID: StdDuration = StdDuration::from_secs(30 * 60);
 
 pub const HELP: &str = "📊 **Check-ins**
 `!kk surveys` · `!kk survey new <key> <emoji> <title> [topic <topic>]`
-`!kk survey <key>` — the questions, numbered
-`!kk survey <key> intro <text>`
+`!kk survey <key>`: the questions, numbered
+`!kk survey <key> intro <text>` · `!kk survey <key> title [emoji] <title>`
 `!kk survey <key> add <scale|yesno|single|multiple|text> [optional] [suggestion] [metric <key>] [problem <key>] <question>`
 `!kk survey <key> edit <n> <question>` · `required <n>` · `optional <n>` · `comment <n> on|off`
 `!kk survey <key> metric <n> <key|none>` · `problem <n> <key|none>` · `scale <n> <min> <max>`
 `!kk survey <key> choice <n> add [problem <key>] [other] [emoji] <label>`
 `!kk survey <key> choice <n> rename <c> <label>` · `choice <n> problem <c> <key|none>` · `choice <n> remove <c>`
 `!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview`
-`!kk metrics` · `!kk metric add <key> <topic> <label>`
+`!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
 `!kk checkin start <key> [house | room <!room> | floor <location>] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
    without `closes`: until the plenum starts; `1d-before`/`12h-before` follow the plenum when it moves, a date doesn't
 `!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin close <n>`
-`!kk rooms central <!room> [off]` — where `announce` posts";
+`!kk rooms central <!room> [off]`: where `announce` posts";
 
 /// Handles the check-in commands; `None` for anything else.
 pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<String>> {
@@ -62,7 +62,22 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                 .run(move |c| surveys::set_intro(c, &key, &text))
                 .await
                 .map(|()| {
-                    "✏️ Intro updated — new check-ins show it; started ones keep theirs.".to_owned()
+                    "✏️ Intro updated. New check-ins show it; started ones keep theirs.".to_owned()
+                })
+        }
+        ["survey", key, "title", first, more @ ..] => {
+            let (emoji, title) = if looks_like_emoji(first) && !more.is_empty() {
+                (Some(first.to_string()), more.join(" "))
+            } else {
+                (None, [&[*first], more].concat().join(" "))
+            };
+            let key = key.to_string();
+            kk.engine
+                .db
+                .run(move |c| surveys::rename_template(c, &key, emoji.as_deref(), &title))
+                .await
+                .map(|()| {
+                    "✏️ Title updated. New check-ins show it; started ones keep theirs.".to_owned()
                 })
         }
         ["survey", key, "add", kind, rest @ ..] => add(kk, key, kind, rest).await,
@@ -117,7 +132,15 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                 .db
                 .run(move |c| surveys::add_metric(c, &key, &topic, &label))
                 .await
-                .map(|()| "🧠 Metric added — point questions at it with `!kk survey <key> metric <n> <metric>`.".to_owned())
+                .map(|()| "🧠 Metric added. Point questions at it with `!kk survey <key> metric <n> <metric>`.".to_owned())
+        }
+        ["metric", "rename", key, label @ ..] if !label.is_empty() => {
+            let (key, label) = (key.to_string(), label.join(" "));
+            kk.engine
+                .db
+                .run(move |c| surveys::rename_metric(c, &key, &label))
+                .await
+                .map(|()| "✏️ Metric renamed. Its key and history stay.".to_owned())
         }
         ["checkin", "start", key, rest @ ..] => plan_start(kk, actor, key, rest).await,
         ["checkin", "go"] => go(kk, actor).await,
@@ -126,7 +149,7 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(actor);
-            Ok("❌ Dropped — nothing was started.".to_owned())
+            Ok("❌ Dropped. Nothing was started.".to_owned())
         }
         ["checkins"] => runs(kk).await,
         ["checkin", "close", n] => match n.trim_start_matches('#').parse::<i64>() {
@@ -266,7 +289,7 @@ async fn run_edit(kk: &Kk, key: &str, n: &str, edit: Edit) -> Result<String> {
     Ok(match edited.new_version {
         Some(_) => format!(
             "⚠️ **This question was already asked in a check-in.**\n\
-             So I created a new version for future check-ins — previous check-ins \
+             So I created a new version for future check-ins. Previous check-ins \
              (and their answers) stay exactly as they were.\n\
              🧠 If the meaning changed, point it at a different metric too: \
              `!kk survey {key} metric {n} <metric>`."
@@ -401,12 +424,12 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
                 ..Default::default()
             };
             let mut out = vec![
-                "👀 **Preview** — what residents will see".to_owned(),
+                "👀 **Preview**: what residents will see".to_owned(),
                 String::new(),
                 screens::checkin_notice(&run, &ctx),
             ];
             for i in 0..run.questions.len() {
-                out.push("———".to_owned());
+                out.push("· · ·".to_owned());
                 out.push(screens::question_preview(&run, i));
             }
             Ok(out.join("\n"))
@@ -552,7 +575,7 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
                 )?;
                 i += 1;
             }
-            other => bail!("I don't understand {other:?} — see `!kk help`."),
+            other => bail!("I don't understand {other:?}. See `!kk help`."),
         }
         i += 1;
     }
@@ -618,7 +641,7 @@ async fn go(kk: &Kk, actor: &str) -> Result<String> {
         .remove(actor)
         .filter(|(_, at)| at.elapsed() < PLAN_VALID)
         .map(|(plan, _)| plan)
-        .context("Nothing to start — plan it first with `!kk checkin start <key> …`.")?;
+        .context("Nothing to start. Plan it first with `!kk checkin start <key> …`.")?;
     let actor = actor.to_owned();
     let id = kk
         .engine
@@ -635,7 +658,7 @@ async fn runs(kk: &Kk) -> Result<String> {
     let zone = kk.engine.zone;
     let list = kk.engine.db.run(|c| checkins::overview(c)).await?;
     if list.is_empty() {
-        return Ok("📊 No check-ins yet — `!kk checkin start cleaning`".to_owned());
+        return Ok("📊 No check-ins yet. `!kk checkin start cleaning`".to_owned());
     }
     let today = zone.date(Utc::now());
     let mut out = vec!["📊 **Check-ins**".to_owned()];

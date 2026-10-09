@@ -5,7 +5,7 @@
 //! keeping their identity); an unused version is simply edited. The
 //! database enforces it too (triggers in `002_checkins.sql`). What a
 //! question measures is its canonical metric; what a choice stands for, its
-//! canonical problem — both stable keys, whatever the wording.
+//! canonical problem: both stable keys, whatever the wording.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -168,6 +168,24 @@ pub fn set_intro(conn: &Connection, key: &str, intro: &str) -> Result<()> {
     conn.execute(
         "UPDATE survey_templates SET intro = ?2 WHERE id = ?1",
         params![id, intro],
+    )?;
+    Ok(())
+}
+
+/// A template's emoji and title. Started check-ins keep theirs.
+pub fn rename_template(
+    conn: &Connection,
+    key: &str,
+    emoji: Option<&str>,
+    title: &str,
+) -> Result<()> {
+    let id = template_id(conn, key)?;
+    if title.trim().is_empty() {
+        bail!("A title, please.");
+    }
+    conn.execute(
+        "UPDATE survey_templates SET emoji = coalesce(?2, emoji), title = ?3 WHERE id = ?1",
+        params![id, emoji, title.trim()],
     )?;
     Ok(())
 }
@@ -606,6 +624,21 @@ pub fn add_metric(conn: &Connection, key: &str, topic: &str, label: &str) -> Res
     Ok(())
 }
 
+/// A metric's label. Its key: what comparisons go by, stays.
+pub fn rename_metric(conn: &Connection, key: &str, label: &str) -> Result<()> {
+    if label.trim().is_empty() {
+        bail!("A label, please.");
+    }
+    let changed = conn.execute(
+        "UPDATE metrics SET label = ?2 WHERE key = ?1",
+        params![key, label.trim()],
+    )?;
+    if changed == 0 {
+        bail!("There's no metric «{key}» (`!kk metrics`).");
+    }
+    Ok(())
+}
+
 pub fn metrics(conn: &Connection) -> Result<String> {
     let mut stmt = conn.prepare(
         "SELECT m.key, m.label, coalesce(t.key, ''), m.active
@@ -623,7 +656,7 @@ pub fn metrics(conn: &Connection) -> Result<String> {
     for row in rows {
         let (key, label, topic, active) = row?;
         out.push(format!(
-            "`{key}` — {label} · {topic}{}",
+            "`{key}`: {label} · {topic}{}",
             if active { "" } else { " · 🗄️ retired" }
         ));
     }
@@ -655,6 +688,27 @@ pub(crate) mod tests {
         assert!(qs[2].current.asks_suggestion);
         assert!(!qs[2].current.required);
         assert!(qs.iter().all(|q| !q.used));
+    }
+
+    #[test]
+    fn templates_and_metrics_can_be_renamed() {
+        let conn = memory_connection();
+        rename_template(&conn, "cleaning", Some("🚽"), "Toilet cleaning").unwrap();
+        rename_template(&conn, "cleaning", None, "Toilets").unwrap();
+        let (emoji, title): (String, String) = conn
+            .query_row(
+                "SELECT emoji, title FROM survey_templates WHERE key = 'cleaning'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((emoji.as_str(), title.as_str()), ("🚽", "Toilets"));
+        assert!(rename_template(&conn, "cleaning", None, " ").is_err());
+        assert!(rename_template(&conn, "nonsense", None, "x").is_err());
+
+        rename_metric(&conn, "cleaning.overall_satisfaction", "Cleaning (1–5)").unwrap();
+        assert!(metrics(&conn).unwrap().contains("Cleaning (1–5)"));
+        assert!(rename_metric(&conn, "nonsense", "x").is_err());
     }
 
     #[test]

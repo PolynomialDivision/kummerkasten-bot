@@ -1,4 +1,4 @@
-//! 📮 kummerkasten-bot — feedback, check-ins and ideas for the house, in
+//! 📮 kummerkasten-bot: feedback, check-ins and ideas for the house, in
 //! private Matrix chats. See README.md.
 
 use std::sync::Arc;
@@ -189,14 +189,14 @@ async fn main() -> Result<()> {
 
     bot.client.add_event_handler({
         let kk = kk.clone();
-        move |ev: OriginalSyncReactionEvent, room: Room, encryption: Option<EncryptionInfo>| {
+        move |ev: OriginalSyncReactionEvent, room: Room| {
             let kk = kk.clone();
             async move {
                 if ev.sender == kk.bot || room.state() != RoomState::Joined {
                     return;
                 }
                 if kk.is_chat(&room).await {
-                    dm::on_reaction(&kk, &room, &ev, encryption.as_ref()).await;
+                    dm::on_reaction(&kk, &room, &ev).await;
                 } else {
                     dm::on_entry_reaction(&kk, &room, &ev).await;
                 }
@@ -238,7 +238,7 @@ mod tests {
             route(Dispatch::AdminDm, "!kk rooms add !r:x"),
             Some(Route::Admin)
         );
-        // Anyone else — a resident in their chat, anyone in a room — is
+        // Anyone else: a resident in their chat, anyone in a room, is
         // routed as a normal message (and told `!kk` is for admins).
         assert_eq!(
             route(Dispatch::Continue, "!kk rooms add !r:x"),

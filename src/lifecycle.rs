@@ -1,6 +1,6 @@
-//! The end of a round: a plenum is completed — by an admin, when it has
+//! The end of a round: a plenum is completed, by an admin, when it has
 //! actually taken place (or, only if the `auto_complete` policy is on,
-//! automatically at `complete_at` on its day) — and in one transaction
+//! automatically at `complete_at` on its day), and in one transaction
 //!
 //! 1. the plenum is marked completed and its round closed,
 //! 2. submissions to delete after this plenum are deleted (with their codes),
@@ -48,7 +48,7 @@ pub fn complete(
     let next = plenums::next(&tx)?.context("No plenum is scheduled.")?;
     if next.id != plenum_id {
         bail!(
-            "Plenum #{} comes first — complete or cancel it before #{plenum_id}.",
+            "Plenum #{} comes first. Complete or cancel it before #{plenum_id}.",
             next.id
         );
     }
@@ -112,7 +112,7 @@ pub fn complete(
 }
 
 /// Scheduled plenums whose day is over (local time past `complete_at` on
-/// their day, or a later day), oldest first — for the auto-complete
+/// their day, or a later day), oldest first, for the auto-complete
 /// policy only. Without it, such a plenum just awaits completion.
 pub fn due(
     conn: &Connection,

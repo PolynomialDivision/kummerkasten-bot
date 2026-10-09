@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// Migrations in order. Never edit one that has shipped — add the next.
+/// Migrations in order. Never edit one that has shipped: add the next.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_initial.sql")),
     (2, include_str!("../migrations/002_checkins.sql")),
@@ -72,7 +72,7 @@ impl Db {
 /// database file instead of leaving it in free pages. An extra measure,
 /// not a guarantee of physical erasure: the WAL (until its next
 /// checkpoint), the filesystem, the storage hardware, snapshots and backups
-/// may still hold older data — see the README.
+/// may still hold older data: see the README.
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;

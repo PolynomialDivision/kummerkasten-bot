@@ -16,7 +16,7 @@
 //! row: same ID, so its round, its "delete after" submissions, check-ins,
 //! measures and announcements stay with it; `original_starts_at` keeps the
 //! first date. A move never changes the order of scheduled plenums (that
-//! would hand the round to another one) — cancel instead. A plenum whose
+//! would hand the round to another one): cancel instead. A plenum whose
 //! time has passed is *awaiting completion*, not completed: only an admin
 //! (or the explicit auto-complete policy) completes it.
 
@@ -135,7 +135,7 @@ pub fn next(conn: &Connection) -> Result<Option<Plenum>> {
     Ok(upcoming(conn, 1)?.into_iter().next())
 }
 
-/// The next `limit` scheduled plenums, in order — `[1]` is the one after next.
+/// The next `limit` scheduled plenums, in order: `[1]` is the one after next.
 pub fn upcoming(conn: &Connection, limit: usize) -> Result<Vec<Plenum>> {
     query(
         conn,
@@ -403,7 +403,7 @@ pub fn add(
 /// a move by a day or two only the update.
 pub const FRESH_SUMMARY_AFTER: Duration = Duration::hours(72);
 
-/// Move one occurrence — at any notice, even on its day or after its time
+/// Move one occurrence, at any notice, even on its day or after its time
 /// passed without it happening. Same row, same ID: its round, "delete
 /// after" submissions, check-ins and everything else stay with it, and
 /// what follows its date (check-in deadlines set relative to it, the
@@ -430,14 +430,14 @@ pub fn reschedule(
     let later = others.iter().find(|p| !comes_before(p, &before));
     if let Some(p) = earlier.filter(|p| starts_at <= p.starts_at) {
         bail!(
-            "That would put it before plenum #{} on {} — move or cancel that one instead.",
+            "That would put it before plenum #{} on {}. Move or cancel that one instead.",
             p.id,
             zone.day_time_label(p.starts_at, zone.date(now))
         );
     }
     if let Some(p) = later.filter(|p| starts_at >= p.starts_at) {
         bail!(
-            "That would put it after plenum #{} on {} — cancel this one instead, \
+            "That would put it after plenum #{} on {}. Cancel this one instead, \
              so its round carries on to that one.",
             p.id,
             zone.day_time_label(p.starts_at, zone.date(now))
@@ -519,7 +519,7 @@ pub enum Removed {
 pub fn remove(conn: &mut Connection, id: i64, actor: &str, now: DateTime<Utc>) -> Result<Removed> {
     let p = get(conn, id)?.with_context(|| format!("There is no plenum #{id}."))?;
     if p.status == Status::Completed {
-        bail!("Plenum #{id} already took place — it stays in the history.");
+        bail!("Plenum #{id} already took place. It stays in the history.");
     }
     if p.status == Status::Scheduled {
         cancel(conn, id, actor, now)?;

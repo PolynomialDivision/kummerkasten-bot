@@ -1,5 +1,5 @@
 //! Who may use the Kummerkasten: whoever is joined to one of the authorized
-//! rooms *right now*, as the homeserver says — asked again before every
+//! rooms *right now*, as the homeserver says: asked again before every
 //! action, never remembered. Errors count as "no".
 
 use std::future::Future;
@@ -105,7 +105,7 @@ mod tests {
         );
         // A room that isn't authorized doesn't count.
         assert!(!authorized(&server, std::slice::from_ref(&house), alice).await);
-        // Leaving locks it again — at the very next check.
+        // Leaving locks it again, at the very next check.
         server.joined.lock().unwrap().clear();
         assert!(!authorized(&server, &rooms, alice).await);
         // If the server can't answer, the answer is no.

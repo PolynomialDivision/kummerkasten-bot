@@ -1,6 +1,6 @@
 //! Runs a resident's conversation: loads their session, maps a tap or a
 //! message to an action, applies it (`flow`), carries out the effect in the
-//! database and says which messages to send (`screens`). No Matrix here —
+//! database and says which messages to send (`screens`). No Matrix here:
 //! `dm` sends what comes out and records the events.
 //!
 //! Privacy notes:
@@ -113,7 +113,7 @@ impl Msg {
     }
 
     /// The receipt with a deletion code: it stays until the round is
-    /// cleared — or until they say they saved the code.
+    /// cleared, or until they say they saved the code.
     fn code(text: String, view: screens::View) -> Self {
         Msg {
             kind: Kind::Receipt,
@@ -179,7 +179,7 @@ impl Engine {
         self
     }
 
-    /// The smallest group a result may describe — never below 2.
+    /// The smallest group a result may describe, never below 2.
     pub fn k(&self) -> i64 {
         (self.threshold)().max(2)
     }
@@ -460,7 +460,7 @@ impl Engine {
     }
 
     /// What a results, ideas or sharing screen shows (through the privacy
-    /// policy — never raw feedback).
+    /// policy, never raw feedback).
     fn prepare(
         &self,
         conn: &Connection,
@@ -632,7 +632,7 @@ impl Engine {
                 let secret = (flow.screen() == &Screen::ManageEnter).then_some(event_id);
                 if flow.wants_text(run.as_ref()) {
                     match screens::typed(&view, &body) {
-                        // "cancel"/"back" typed — but never on a text step
+                        // "cancel"/"back" typed, but never on a text step
                         // where it might be the actual answer.
                         Some(a @ (Action::Back | Action::Cancel)) if body.trim().len() < 12 => {
                             (a, secret)
@@ -685,12 +685,12 @@ impl Engine {
                 };
                 let done = if support {
                     ideas::support(conn, &self.secrets, id, mxid)
-                        .map(|_| "👍 Thanks — your support counts.")
+                        .map(|_| "👍 Thanks. Your support counts.")
                 } else {
                     ideas::withdraw(conn, &self.secrets, id, mxid)
                         .map(|_| "↩️ Your 👍 is taken back.")
                 };
-                let note = done.unwrap_or("🗄️ That idea is closed — nothing changed.");
+                let note = done.unwrap_or("🗄️ That idea is closed. Nothing changed.");
                 save(conn, mxid, room_id, &flow, now)?;
                 return Ok(vec![
                     Msg::note(note),
@@ -701,8 +701,8 @@ impl Engine {
                 let today = self.zone.date(now);
                 out.push(Msg::note(
                     match ideas::comment(conn, &self.secrets, id, mxid, &text, today) {
-                        Ok(()) => "💬 Thanks — your comment is there, without your name.",
-                        Err(_) => "🗄️ That idea is closed — the comment wasn't added.",
+                        Ok(()) => "💬 Thanks. Your comment is there, without your name.",
+                        Err(_) => "🗄️ That idea is closed. The comment wasn't added.",
                     },
                 ));
             }
@@ -726,7 +726,7 @@ impl Engine {
                     tracing::warn!(error = %e, "A submission could not be stored");
                     save(conn, mxid, room_id, &flow, now)?;
                     return Ok(vec![Msg::note(
-                        "😕 Something went wrong storing that — nothing was saved. Try ✅ again in a moment.",
+                        "😕 Something went wrong storing that. Nothing was saved. Try ✅ again in a moment.",
                     )]);
                 }
             },
@@ -756,7 +756,7 @@ impl Engine {
                 if self.too_many_attempts(mxid) {
                     save(conn, mxid, room_id, &flow, now)?;
                     return Ok(vec![Msg::note(
-                        "⏳ That's a lot of tries — please wait a few minutes.",
+                        "⏳ That's a lot of tries. Please wait a few minutes.",
                     )]);
                 }
                 match submissions::by_token(conn, &self.secrets, &token)? {
@@ -765,7 +765,7 @@ impl Engine {
                         self.count_attempt(mxid);
                         save(conn, mxid, room_id, &flow, now)?;
                         return Ok(vec![Msg::note(
-                            "🤔 That code doesn't match any submission — check it and try again.",
+                            "🤔 That code doesn't match any submission. Check it and try again.",
                         )]);
                     }
                 }
@@ -793,7 +793,7 @@ impl Engine {
                     }
                     None => {
                         return Ok(vec![Msg::note(
-                            "⏳ I've forgotten which one that was — send the code again.",
+                            "⏳ I've forgotten which one that was. Send the code again.",
                         )])
                     }
                 }
@@ -908,7 +908,7 @@ impl Engine {
         let today = self.zone.date(now);
         let done =
             submissions::submit(&tx, &self.secrets, &new, mxid, d.floor.or(own_floor), today)?;
-        // The idea, if they chose to share one — not linked to the submission.
+        // The idea, if they chose to share one, not linked to the submission.
         let shared = match (d.idea, flow.idea_text(cat)) {
             (Some(plan), Some(text)) => Some(self.share(
                 &tx,
@@ -978,7 +978,7 @@ impl Engine {
             // Dropping `tx` rolls everything back.
             return Ok(Err(refused));
         }
-        // Answers they chose to share as ideas — linked to no response.
+        // Answers they chose to share as ideas: linked to no response.
         let today = self.zone.date(now);
         let round = plenums::open_round(&tx)?.map(|r| r.id);
         for (index, plan) in &draft.ideas {
@@ -1035,7 +1035,7 @@ impl Engine {
                     },
                     today,
                 )?;
-                "🌍 Shared on the 💡 Ideas board — without your name.".to_owned()
+                "🌍 Shared on the 💡 Ideas board, without your name.".to_owned()
             }
             IdeaPlan::Support { id } => match ideas::support(conn, &self.secrets, id, mxid) {
                 Ok(_) => "👍 Added your support to the similar idea.".to_owned(),
@@ -1787,7 +1787,7 @@ mod tests {
         let page = chat.tap("1️⃣");
         assert!(screen(&page).text.contains("👍 0"));
         let supported = chat.tap("👍");
-        assert!(supported[0].text.contains("your support counts"));
+        assert!(supported[0].text.contains("Your support counts"));
         assert!(supported[1].text.contains("✅ You support this idea."));
         assert!(supported[1].text.contains("👍 1"));
         // A second 👍 isn't offered (and wouldn't count): only take it back.

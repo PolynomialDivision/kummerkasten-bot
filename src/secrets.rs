@@ -4,7 +4,7 @@
 //!
 //! The master key is 32 random bytes in `store/kummerkasten.key` (mode
 //! 0600), created on first start. Losing it makes existing deletion codes
-//! useless; leaking it lets whoever also has the database test guesses —
+//! useless; leaking it lets whoever also has the database test guesses:
 //! keep it out of database backups' reach (see the README).
 
 use std::path::Path;
@@ -16,7 +16,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Crockford base32: no I, L, O, U — nothing to misread.
+/// Crockford base32: no I, L, O, U, nothing to misread.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// 16 characters × 5 bits = 80 bits of randomness, from the OS.
 pub const TOKEN_CHARS: usize = 16;

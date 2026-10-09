@@ -1,6 +1,6 @@
 //! The clock: every minute (and whenever a handler wakes it) plenums come
 //! into view, rounds open, finished plenums are completed, check-ins open,
-//! remind and close, stale drafts are tidied — and the Matrix side catches
+//! remind and close, stale drafts are tidied, and the Matrix side catches
 //! up with the database: marked events are redacted, cleared chats get
 //! their notice and a fresh menu.
 //!
@@ -86,7 +86,7 @@ async fn plenum_clock(kk: &Kk) {
 
 /// 📮 The day-before summary of the next plenum (once, following its
 /// current date), and the short update for an announced plenum that moved
-/// or was cancelled — into the central room(s). Marked before sending: a
+/// or was cancelled: into the central room(s). Marked before sending: a
 /// crash means a missed post, never a second one.
 async fn summary_clock(kk: &Kk) {
     let before = kk.settings.get().summary_before();
@@ -273,7 +273,7 @@ fn room_of(kk: &Kk, room_id: &str) -> Option<mxbot_common::matrix_sdk::Room> {
 }
 
 /// Redact what the database marked, then forget it. Something that keeps
-/// failing is given up after a few tries (and logged — without content).
+/// failing is given up after a few tries (and logged, without content).
 async fn redact_marked(kk: &Kk) {
     loop {
         let batch = match kk.engine.db.run(|c| store::doomed(c, 50)).await {
@@ -335,7 +335,7 @@ async fn redact_marked(kk: &Kk) {
     }
 }
 
-/// Chats that were cleared get the notice and a fresh menu — once.
+/// Chats that were cleared get the notice and a fresh menu, once.
 async fn post_notices(kk: &Kk) {
     let pending = match kk.engine.db.run(|c| store::pending_notices(c)).await {
         Ok(pending) => pending,

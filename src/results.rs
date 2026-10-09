@@ -1,5 +1,5 @@
 //! 📈 What residents see under Results: short, what changed first, then
-//! recurring problems, ideas — with drill-down. Text only, built from
+//! recurring problems, ideas, with drill-down. Text only, built from
 //! [`stats`] (which applies the privacy policy); no raw feedback, no free
 //! text answers, ever.
 //!
@@ -94,7 +94,7 @@ pub fn home(
     }
     if topics.is_empty() {
         lines.push(
-            "🌱 No check-in results yet — they appear here once a check-in closes.".to_owned(),
+            "🌱 No check-in results yet. They appear here once a check-in closes.".to_owned(),
         );
     } else {
         lines.push("Pick a topic for its history:".to_owned());
@@ -327,7 +327,7 @@ pub fn floors(conn: &Connection, run: i64, qv: i64, k: i64) -> Result<String> {
         }
         lines.push(String::new());
         lines.push(format!(
-            "🔒 Groups under {k} answers are hidden — and so is anything that would let \
+            "🔒 Groups under {k} answers are hidden, and so is anything that would let \
              someone work them out."
         ));
     }
@@ -394,7 +394,7 @@ pub fn plenum(
     }
     lines.push(String::new());
     lines.push(
-        "🧹 Feedback that was to be deleted after this plenum is gone — and counts nowhere."
+        "🧹 Feedback that was to be deleted after this plenum is gone, and counts nowhere."
             .to_owned(),
     );
     Ok(lines.join("\n"))
