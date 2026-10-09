@@ -97,7 +97,7 @@ pub fn home(
             "🌱 No check-in results yet. They appear here once a check-in closes.".to_owned(),
         );
     } else {
-        lines.push("Pick a topic for its history:".to_owned());
+        lines.push("👇 Pick a topic for its history:".to_owned());
     }
     Ok((lines.join("\n"), topics))
 }
@@ -332,7 +332,7 @@ pub fn floors(conn: &Connection, run: i64, qv: i64, k: i64) -> Result<String> {
         ));
     }
     lines.push(String::new());
-    lines.push("Only answers given “with my floor” count here.".to_owned());
+    lines.push("🏠 Only answers given “with my floor” count here.".to_owned());
     Ok(lines.join("\n"))
 }
 
@@ -407,7 +407,7 @@ pub fn board(conn: &Connection, cat: &Catalog) -> Result<(String, Vec<(i64, Stri
     if list.is_empty() {
         lines.push("🌱 No ideas yet. Share one under 📝 Share something → 💡.".to_owned());
     } else {
-        lines.push("Tap one to support it or add a comment:".to_owned());
+        lines.push("👆 Tap one to support it or add a comment:".to_owned());
     }
     let items = list
         .into_iter()

@@ -240,7 +240,7 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                 .await?;
             let mut out = vec!["🗓️ **Plenums**".to_owned()];
             if let Some(p) = previous {
-                out.push(format!("Previous: {}", line_of(kk, &p, now)));
+                out.push(format!("⏮️ Previous: {}", line_of(kk, &p, now)));
             }
             out.extend(list.iter().map(|p| line_of(kk, p, now)));
             Ok(out.join("\n"))

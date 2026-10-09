@@ -4,7 +4,7 @@
 -- submission is gone from every statistic, nothing keeps counting it. No
 -- shadow aggregates.
 --
--- Ideas are public objects a resident chose to share — separate from the
+-- Ideas are public objects a resident chose to share: separate from the
 -- feedback or answer they came from (which keeps its own identity and
 -- retention). Nothing links an idea to its author, a submission or a
 -- response. Support and comments are counted per account through a keyed
@@ -31,7 +31,7 @@ CREATE INDEX ideas_topic ON ideas(topic_id);
 CREATE INDEX ideas_problem ON ideas(problem_id);
 
 -- That an account supports an idea: HMAC(secret, idea ‖ Matrix ID). No
--- time, no row order, never shown — only counted.
+-- time, no row order, never shown, only counted.
 CREATE TABLE idea_supports (
     idea_id        INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
     supporter_key  BLOB NOT NULL,

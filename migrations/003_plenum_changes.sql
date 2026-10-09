@@ -30,7 +30,7 @@ UPDATE plenums SET original_starts_at = coalesce(
 
 -- 'fixed': `closes_at` is what the admin set and never moves.
 -- 'relative_to_plenum': `closes_at` = the plenum's start + offset, and the
--- reminder `reminder_offset_minutes` before that — both recomputed whenever
+-- reminder `reminder_offset_minutes` before that. Both recomputed whenever
 -- the plenum moves (or the round moves to another plenum).
 ALTER TABLE survey_runs ADD COLUMN deadline_mode TEXT NOT NULL DEFAULT 'fixed'
     CHECK (deadline_mode IN ('fixed', 'relative_to_plenum'));

@@ -2,7 +2,7 @@
 name = "kummerkasten-bot"
 version = "0.1.0"
 edition = "2021"
-description = "📮 Kummerkasten — feedback, check-ins and ideas for the house, in Matrix"
+description = "📮 Kummerkasten: feedback, check-ins and ideas for the house, in Matrix"
 
 [dependencies]
 anyhow       = "1"

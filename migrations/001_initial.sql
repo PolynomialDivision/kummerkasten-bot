@@ -1,4 +1,4 @@
--- 📮 Kummerkasten — initial schema.
+-- 📮 Kummerkasten: initial schema.
 --
 -- Conventions:
 --   * timestamps are UTC, RFC 3339 text; `*_on` columns are local dates
