@@ -49,7 +49,7 @@ use crate::{
 /// homeserver lists as *stable*; when none matches, the server's default.
 /// Supporting a newer version means testing it and putting it in front.
 pub const PREFERRED_SUPPORTED_ROOM_VERSIONS: [RoomVersionId; 3] =
-    [RoomVersionId::V12, RoomVersionId::V11, RoomVersionId::V10];
+    mxbot_common::private::PREFERRED_ROOM_VERSIONS;
 
 /// The 📮 on entry messages (and 📈 / 💡 under a plenum summary).
 pub const ENTRY: &str = "📮";

@@ -115,6 +115,7 @@ impl Tunables {
 /// The Kummerkasten only goes where admins send it: no "all" in the
 /// invite allow-lists (the shared default when they're left out).
 pub fn check_security(security: &SecurityConfig) -> Result<()> {
+    security.validate()?;
     if security.allowed_rooms.is_all() {
         bail!(
             "[security] allowed_rooms must be a list (usually []): rooms are authorized \
