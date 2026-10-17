@@ -407,6 +407,11 @@ pub enum Edit {
         n: usize,
         label: String,
     },
+    /// Its emoji (its button); empty: none (the choices are numbered).
+    ChoiceEmoji {
+        n: usize,
+        emoji: String,
+    },
     ChoiceProblem {
         n: usize,
         problem: Option<String>,
@@ -446,6 +451,7 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
     match &edit {
         Edit::AddChoice { .. }
         | Edit::RenameChoice { .. }
+        | Edit::ChoiceEmoji { .. }
         | Edit::RemoveChoice { .. }
         | Edit::ChoiceProblem { .. }
             if !v.kind.has_choices() =>
@@ -457,7 +463,10 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
             bail!("A scale goes from 0–10, with 2 to 10 steps.")
         }
         Edit::Text(t) if t.trim().is_empty() => bail!("The question needs a text."),
-        Edit::RenameChoice { n, .. } | Edit::RemoveChoice { n } | Edit::ChoiceProblem { n, .. }
+        Edit::RenameChoice { n, .. }
+        | Edit::ChoiceEmoji { n, .. }
+        | Edit::RemoveChoice { n }
+        | Edit::ChoiceProblem { n, .. }
             if *n == 0 || *n > v.choices.len() =>
         {
             bail!("There's no choice {n}.")
@@ -566,6 +575,12 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
                 params![v.choices[n - 1].version_id, label.trim()],
             )?;
         }
+        Edit::ChoiceEmoji { n, emoji } => {
+            tx.execute(
+                "UPDATE choice_versions SET emoji = ?2 WHERE id = ?1",
+                params![v.choices[n - 1].version_id, emoji.trim()],
+            )?;
+        }
         Edit::ChoiceProblem { n, .. } => {
             tx.execute(
                 "UPDATE choice_versions SET problem_id = ?2 WHERE id = ?1",
@@ -582,6 +597,16 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
     }
     tx.commit()?;
     Ok(Edited { new_version })
+}
+
+/// The emojis of question `n`'s choices (its current version).
+pub fn choice_emojis(conn: &Connection, key: &str, n: usize) -> Result<Vec<String>> {
+    Ok(nth(conn, key, n)?
+        .current
+        .choices
+        .into_iter()
+        .map(|c| c.emoji)
+        .collect())
 }
 
 /// Stop or start asking question `n` in new check-ins.

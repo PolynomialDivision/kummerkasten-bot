@@ -10,11 +10,12 @@
 //!   Neither has a timestamp or a row order, and nothing links them: the
 //!   database can say *whether* someone answered, not *what*.
 //! * Notices, reminders and announcements go out per run in one batch whose
-//!   time is stored on the run, never per person, so no "reminded" flag
-//!   can tell who had answered by then. What is kept is aggregate: how many
-//!   were eligible when it started, how many notices and reminders went
-//!   out. The messages themselves are remembered (event → run, no room)
-//!   only while the run is open, so their 📊 works.
+//!   time is stored on the run. They go through the outbox (`outbox.rs`),
+//!   which holds one row per chat only while the batch goes out, so a
+//!   crash doesn't lose them; nothing per person is kept afterwards. What
+//!   is kept is aggregate: how many were eligible when it started, how many
+//!   notices and reminders went out. The messages themselves are remembered
+//!   (event → run, no room) only while the run is open, so their 📊 works.
 //! * A deadline is either fixed, or relative to the run's plenum: then it
 //!   (and the reminder before it) follows that plenum when it moves, or
 //!   when the round moves on to another plenum because one was cancelled.
@@ -726,7 +727,7 @@ pub fn follow_round(
     follow_plenum(conn, plenum_id, now)
 }
 
-// ── Delivery batches (per run, never per person) ────────────────────────────
+// ── Delivery batches (per run; per person only in the outbox, briefly) ─────
 
 /// Close runs whose time is up. Returns how many.
 pub fn close_due(conn: &Connection, now: DateTime<Utc>) -> Result<usize> {
@@ -753,8 +754,8 @@ pub fn close(conn: &Connection, id: i64, now: DateTime<Utc>) -> Result<bool> {
     Ok(closed)
 }
 
-/// Mark due batches of one kind as sent and return their runs: the time is
-/// set *before* sending, so a crash means a missed message, never a second.
+/// Mark due batches of one kind as taken and return their runs, to be
+/// queued in the outbox in the same transaction (it sends them, retrying).
 fn take(conn: &Connection, column: &str, due: &str, now: DateTime<Utc>) -> Result<Vec<i64>> {
     let now = time::to_text(now);
     let ids: Vec<i64> = {
@@ -994,6 +995,17 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
+        // A used choice's emoji (its button) changes the same way.
+        edit(
+            &mut conn,
+            "cleaning",
+            2,
+            Edit::ChoiceEmoji {
+                n: 3,
+                emoji: "🐢".into(),
+            },
+        )
+        .unwrap();
         let old = run(&conn, run1.id).unwrap();
         assert_eq!(old, run1, "the old run reads exactly as before");
         assert_eq!(
@@ -1016,6 +1028,8 @@ pub(crate) mod tests {
         assert_eq!(c1.choice_id, c2.choice_id);
         assert_ne!(c1.version_id, c2.version_id);
         assert_eq!(c2.problem.as_deref(), Some("cleaning.skipped_turns"));
+        assert_eq!(run1.questions[1].choices[2].emoji, "⏳");
+        assert_eq!(run2.questions[1].choices[2].emoji, "🐢");
         // The database itself refuses to touch what was asked.
         assert!(conn
             .execute(

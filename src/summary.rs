@@ -3,7 +3,9 @@
 //!
 //! When: the next scheduled plenum, `before` ahead of its *current* start
 //! (it follows every move), once: `announced_at` is set before anything is
-//! sent, so a crash means a missed summary, never two. A cancelled plenum
+//! sent, and the summary is queued in the outbox in the same transaction:
+//! it goes out once, also across a crash (the outbox retries with the same
+//! Matrix transaction ID). A cancelled plenum
 //! is never summarized. If an announced plenum moves or is cancelled,
 //! `update_pending` asks for one short update (taken the same way); a move
 //! by more than [`plenums::FRESH_SUMMARY_AFTER`] also clears `announced_at`,

@@ -43,6 +43,7 @@ mod ideas;
 mod lifecycle;
 mod markup;
 mod measures;
+mod outbox;
 mod plenum;
 mod plenums;
 mod reconcile;
@@ -182,19 +183,31 @@ async fn main() -> Result<()> {
                     None => {}
                     Some(Route::Admin) => {
                         let reply = admin::run(&kk, &ev.sender, &body).await;
-                        if let Err(error) = send_with_retry(&room, markup::notice(&reply)).await {
-                            tracing::warn!(%error, "Could not answer an admin");
+                        match send_with_retry(&room, markup::notice(&reply)).await {
+                            // In their Kummerkasten chat: the command and the answer
+                            // are messages after the screen (it isn't edited above
+                            // them), cleared with the round.
+                            Ok(answer) if kk.is_chat(&room).await => {
+                                dm::track(&kk, &room, &ev.event_id, false).await;
+                                dm::track(&kk, &room, &answer, false).await;
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(%error, "Could not answer an admin"),
                         }
                     }
                     Some(Route::Normal) => {
                         if kk.is_chat(&room).await {
                             if is_admin_command(&body) {
                                 // Not an admin (or not their verified chat).
-                                let _ = send_with_retry(
+                                dm::track(&kk, &room, &ev.event_id, true).await;
+                                if let Ok(answer) = send_with_retry(
                                     &room,
                                     markup::notice("🔒 `!kk` is for admins, in their verified direct chat with me."),
                                 )
-                                .await;
+                                .await
+                                {
+                                    dm::track(&kk, &room, &answer, true).await;
+                                }
                                 return;
                             }
                             dm::on_message(&kk, &room, &ev, encryption.as_ref()).await;

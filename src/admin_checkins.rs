@@ -27,7 +27,7 @@ pub const HELP: &str = "📊 **Check-ins**
 `!kk survey <key> edit <n> <question>` · `required <n>` · `optional <n>` · `comment <n> on|off`
 `!kk survey <key> metric <n> <key|none>` · `problem <n> <key|none>` · `scale <n> <min> <max>`
 `!kk survey <key> choice <n> add [problem <key>] [other] [emoji] <label>`
-`!kk survey <key> choice <n> rename <c> <label>` · `choice <n> problem <c> <key|none>` · `choice <n> remove <c>`
+`!kk survey <key> choice <n> rename <c> <label>` · `choice <n> emoji <c> <emoji|none>` · `choice <n> problem <c> <key|none>` · `choice <n> remove <c>`
 `!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview`
 `!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
 `!kk checkin start <key> [house | room <!room> | floor <location>] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
@@ -269,6 +269,10 @@ fn choice_edit(verb: &str, rest: &[&str]) -> Option<Edit> {
             n: c.parse().ok()?,
             label: label.join(" "),
         },
+        ("emoji", [c, emoji]) => Edit::ChoiceEmoji {
+            n: c.parse().ok()?,
+            emoji: none_or(emoji).unwrap_or_default(),
+        },
         ("problem", [c, key]) => Edit::ChoiceProblem {
             n: c.parse().ok()?,
             problem: none_or(key),
@@ -282,12 +286,33 @@ async fn run_edit(kk: &Kk, key: &str, n: &str, edit: Edit) -> Result<String> {
     let n = number(n)?;
     let key = key.to_owned();
     let k = key.clone();
-    let edited = kk
+    let touches_keys = matches!(
+        edit,
+        Edit::AddChoice { .. } | Edit::ChoiceEmoji { .. } | Edit::RemoveChoice { .. }
+    );
+    let (edited, warnings) = kk
         .engine
         .db
-        .run(move |c| surveys::edit(c, &k, n, edit))
+        .run(move |c| {
+            let edited = surveys::edit(c, &k, n, edit)?;
+            let warnings = if touches_keys {
+                screens::choice_key_warnings(&surveys::choice_emojis(c, &k, n)?)
+            } else {
+                Vec::new()
+            };
+            Ok((edited, warnings))
+        })
         .await?;
-    Ok(match edited.new_version {
+    let reply = run_edit_reply(&key, n, &edited);
+    Ok(if warnings.is_empty() {
+        reply
+    } else {
+        format!("{reply}\n{}", warnings.join("\n"))
+    })
+}
+
+fn run_edit_reply(key: &str, n: usize, edited: &surveys::Edited) -> String {
+    match edited.new_version {
         Some(_) => format!(
             "⚠️ **This question was already asked in a check-in.**\n\
              So I created a new version for future check-ins. Previous check-ins \
@@ -296,7 +321,7 @@ async fn run_edit(kk: &Kk, key: &str, n: &str, edit: Edit) -> Result<String> {
              `!kk survey {key} metric {n} <metric>`."
         ),
         None => "✏️ Done.".to_owned(),
-    })
+    }
 }
 
 async fn templates(kk: &Kk) -> Result<String> {
@@ -718,6 +743,20 @@ mod tests {
             Some(Edit::Scale { min: 0, max: 10 })
         );
         assert_eq!(edit_of("frobnicate", &[]), None);
+        assert_eq!(
+            choice_edit("emoji", &["2", "2️⃣"]),
+            Some(Edit::ChoiceEmoji {
+                n: 2,
+                emoji: "2️⃣".into()
+            })
+        );
+        assert_eq!(
+            choice_edit("emoji", &["1", "none"]),
+            Some(Edit::ChoiceEmoji {
+                n: 1,
+                emoji: String::new()
+            })
+        );
         assert_eq!(
             choice_edit(
                 "add",

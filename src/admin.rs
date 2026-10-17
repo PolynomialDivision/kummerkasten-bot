@@ -418,13 +418,25 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                         [round.id],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
-                    Ok(format!(
+                    let stuck = store::stuck_redactions(c)?;
+                    let pending = crate::outbox::waiting(c)?;
+                    let mut out = format!(
                         "🌱 **Round #{}** · for plenum #{} on {}\n💬 {total} submission(s), \
                          {delete_after} to be deleted after it",
                         round.id,
                         plenum.id,
                         zone.day_time_label(plenum.starts_at, zone.date(now))
-                    ))
+                    );
+                    if stuck > 0 {
+                        out.push_str(&format!(
+                            "\n⚠️ {stuck} chat message(s) could not be deleted yet; I keep trying \
+                             (the log says why)"
+                        ));
+                    }
+                    if pending > 0 {
+                        out.push_str(&format!("\n📤 {pending} message(s) waiting to go out"));
+                    }
+                    Ok(out)
                 })
                 .await?;
             Ok(summary)

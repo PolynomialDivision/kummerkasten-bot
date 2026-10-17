@@ -5,28 +5,32 @@
 //! their notice and a fresh menu.
 //!
 //! All of it is driven by state in the database, so a restart in the middle
-//! simply carries on. Batches (check-in notices, reminders) are marked as
-//! sent before they go out: a crash means one missed message, never two.
+//! simply carries on. Batches (check-in notices, reminders, announcements,
+//! plenum summaries and updates) are marked and queued in the outbox in one
+//! transaction; the outbox sends them, retrying, each with its own Matrix
+//! transaction ID, so a crash neither loses nor (as a rule) doubles one.
+//! Redactions that fail are retried with a growing wait, never forgotten
+//! while the message is still there; a chat a resident left is left only
+//! once it is redacted.
 
 use std::time::Duration;
 
 use chrono::Utc;
 use mxbot_common::matrix_sdk::{
-    ruma::{OwnedEventId, OwnedRoomId, OwnedUserId},
+    ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId},
     RoomState,
 };
 
 use crate::{
-    checkins,
+    checkins::{self, Batch},
     dm::{self, Kk},
     engine::{CheckinText, Msg},
-    lifecycle, plenums, screens, store, summary,
+    lifecycle, outbox, plenums, reconcile, screens, store, summary,
 };
 
 const TICK: Duration = Duration::from_secs(60);
 /// Between two redactions, to stay friendly with the homeserver.
 const REDACT_PAUSE: Duration = Duration::from_millis(250);
-const MAX_REDACT_ATTEMPTS: i64 = 5;
 
 pub async fn run(kk: Kk) {
     loop {
@@ -42,8 +46,10 @@ async fn tick(kk: &Kk) {
     plenum_clock(kk).await;
     summary_clock(kk).await;
     checkin_clock(kk).await;
+    outbox_clock(kk).await;
     expire_drafts(kk).await;
     redact_marked(kk).await;
+    leave_left_chats(kk).await;
     post_notices(kk).await;
     dm::post_missing_entries(kk).await;
 }
@@ -87,154 +93,353 @@ async fn plenum_clock(kk: &Kk) {
 
 /// 📮 The day-before summary of the next plenum (once, following its
 /// current date), and the short update for an announced plenum that moved
-/// or was cancelled: into the central room(s). Marked before sending: a
-/// crash means a missed post, never a second one.
+/// or was cancelled: queued for the central room(s) in the transaction that
+/// marks them, and sent by [`outbox_clock`].
 async fn summary_clock(kk: &Kk) {
     let before = kk.settings.get().summary_before();
-    let (zone, k) = (kk.engine.zone, kk.engine.k());
-    let due = kk
+    let queued = kk
         .engine
         .db
         .run(move |conn| {
             let now = Utc::now();
             if checkins::central_rooms(conn)?.is_empty() {
                 // Nowhere to post: nothing is marked as announced either.
-                return Ok((None, Vec::new()));
+                return Ok(0);
             }
-            let cat = crate::catalog::Catalog::load(conn)?;
-            let summary = match summary::take_summary(conn, now, before)? {
-                Some(id) => {
-                    let p = plenums::get(conn, id)?.map(|p| p.starts_at);
-                    Some((id, summary::render(conn, &cat, id, k, zone, now)?, p))
-                }
-                None => None,
-            };
-            let mut updates = Vec::new();
-            for (id, what) in summary::take_updates(conn)? {
-                let Some(plenum) = plenums::get(conn, id)? else {
-                    continue;
+            let tx = conn.unchecked_transaction()?;
+            let mut queued = 0;
+            if let Some(id) = summary::take_summary(&tx, now, before)? {
+                outbox::queue(&tx, outbox::Kind::Summary, id, now)?;
+                queued += 1;
+            }
+            for (id, what) in summary::take_updates(&tx)? {
+                let kind = match what {
+                    summary::Update::Moved => outbox::Kind::Moved,
+                    summary::Update::Cancelled => outbox::Kind::Cancelled,
                 };
-                let text = summary::update_text(conn, id, what, zone, now)?;
-                let edits: Vec<(String, String, String)> = summary::summaries(conn, id)?
-                    .into_iter()
-                    .map(|(room, event, body)| {
-                        let amended = summary::amended(&body, what, &plenum, zone, now);
-                        (room, event, amended)
-                    })
-                    .collect();
-                updates.push((id, plenum.starts_at, text, edits));
+                outbox::queue(&tx, kind, id, now)?;
+                queued += 1;
             }
-            Ok((summary, updates))
+            tx.commit()?;
+            Ok(queued)
         })
         .await;
-    let (summary, updates) = match due {
-        Ok(due) => due,
-        Err(error) => {
-            tracing::error!(%error, "Summary clock failed");
-            return;
-        }
-    };
-    let rooms = kk
-        .engine
-        .db
-        .run(|c| checkins::central_rooms(c))
-        .await
-        .unwrap_or_default();
-    if let Some((id, text, Some(starts_at))) = summary {
-        for room in rooms.iter().filter_map(|r| room_of_house(kk, r)) {
-            match dm::post_with_keys(kk, &room, &text, &[dm::ENTRY, dm::RESULTS, dm::IDEAS]).await {
-                Ok(event_id) => {
-                    let (r, e, t) = (
-                        room.room_id().to_string(),
-                        event_id.to_string(),
-                        text.clone(),
-                    );
-                    let _ = kk
-                        .engine
-                        .db
-                        .run(move |c| {
-                            summary::record(c, id, &r, &e, summary::Kind::Summary, &t, starts_at)
-                        })
-                        .await;
-                }
-                Err(error) => tracing::warn!(%error, "Could not post a plenum summary"),
-            }
-        }
-        tracing::info!(plenum = id, "Plenum summary posted");
-    }
-    for (id, starts_at, text, edits) in updates {
-        // Where its summary went (else: the central rooms).
-        let mut targets: Vec<String> = edits.iter().map(|(r, _, _)| r.clone()).collect();
-        targets.dedup();
-        if targets.is_empty() {
-            targets = rooms.clone();
-        }
-        for room in targets.iter().filter_map(|r| room_of_house(kk, r)) {
-            match dm::post_with_keys(kk, &room, &text, &[dm::ENTRY]).await {
-                Ok(event_id) => {
-                    let (r, e, t) = (
-                        room.room_id().to_string(),
-                        event_id.to_string(),
-                        text.clone(),
-                    );
-                    let _ = kk
-                        .engine
-                        .db
-                        .run(move |c| {
-                            summary::record(c, id, &r, &e, summary::Kind::Update, &t, starts_at)
-                        })
-                        .await;
-                }
-                Err(error) => tracing::warn!(%error, "Could not post a plenum update"),
-            }
-        }
-        for (room_id, event_id, amended) in edits {
-            let Some(room) = room_of_house(kk, &room_id) else {
-                continue;
-            };
-            if let Err(error) = dm::edit_notice(&room, &event_id, &amended).await {
-                tracing::debug!(%error, "Could not update a posted summary");
-            }
-        }
-        tracing::info!(plenum = id, "Plenum update posted");
+    if let Err(error) = queued {
+        tracing::error!(%error, "Summary clock failed");
     }
 }
 
-fn room_of_house(kk: &Kk, room_id: &str) -> Option<mxbot_common::matrix_sdk::Room> {
-    room_of(kk, room_id)
-}
-
-/// Close what's over; send what's due (each batch once).
+/// Close what's over; queue what's due (each batch once, in the
+/// transaction that marks it).
 async fn checkin_clock(kk: &Kk) {
-    let due = kk
+    let queued = kk
         .engine
         .db
         .run(|conn| {
             let now = Utc::now();
-            checkins::close_due(conn, now)?;
-            Ok((
-                checkins::take_notices(conn, now)?,
-                checkins::take_reminders(conn, now)?,
-                checkins::take_announcements(conn, now)?,
-            ))
+            let tx = conn.unchecked_transaction()?;
+            checkins::close_due(&tx, now)?;
+            for run in checkins::take_announcements(&tx, now)? {
+                outbox::queue(&tx, outbox::Kind::Announcement, run, now)?;
+            }
+            for run in checkins::take_notices(&tx, now)? {
+                outbox::queue(&tx, outbox::Kind::Notice, run, now)?;
+            }
+            for run in checkins::take_reminders(&tx, now)? {
+                outbox::queue(&tx, outbox::Kind::Reminder, run, now)?;
+            }
+            tx.commit()?;
+            Ok(())
         })
         .await;
-    let (notices, reminders, announcements) = match due {
-        Ok(due) => due,
+    if let Err(error) = queued {
+        tracing::error!(%error, "Check-in clock failed");
+    }
+}
+
+/// 📤 The outbox: decide who gets each new batch (against who is there
+/// now), then send what is due, each with its own transaction ID.
+async fn outbox_clock(kk: &Kk) {
+    let batches = match kk.engine.db.run(|c| outbox::batches(c)).await {
+        Ok(batches) => batches,
         Err(error) => {
-            tracing::error!(%error, "Check-in clock failed");
+            tracing::error!(%error, "Reading the outbox failed");
             return;
         }
     };
-    for run in announcements {
-        dm::announce_checkin(kk, run).await;
+    for (row, kind, ref_id) in batches {
+        let targets = match recipients(kk, kind, ref_id).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::error!(%error, kind = kind.as_str(), "Could not decide who gets a message");
+                continue;
+            }
+        };
+        let now = Utc::now();
+        if let Err(error) = kk
+            .engine
+            .db
+            .run(move |c| outbox::expand(c, row, &targets, now))
+            .await
+        {
+            tracing::error!(%error, "Could not queue the messages of a batch");
+        }
     }
-    for run in notices {
-        dm::send_checkin(kk, run, CheckinText::Notice).await;
+    let due = match kk.engine.db.run(|c| outbox::due(c, Utc::now(), 200)).await {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::error!(%error, "Reading the outbox failed");
+            return;
+        }
+    };
+    let mut told = std::collections::BTreeMap::<(i64, &str), usize>::new();
+    for item in due {
+        let outcome = send_item(kk, &item).await;
+        if outcome == dm::Told::Sent && item.kind.to_chats() {
+            *told.entry((item.ref_id, item.kind.as_str())).or_default() += 1;
+        }
+        let (i, now) = (item.clone(), Utc::now());
+        let saved = kk
+            .engine
+            .db
+            .run(move |c| match outcome {
+                dm::Told::Sent => outbox::sent(c, &i).map(|()| false),
+                dm::Told::NotNeeded => outbox::skipped(c, &i).map(|()| false),
+                dm::Told::Failed => outbox::failed(c, &i, now),
+            })
+            .await;
+        match saved {
+            Ok(true) => tracing::warn!(
+                kind = item.kind.as_str(),
+                "Gave up a message after many tries"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::error!(%error, "Could not update the outbox"),
+        }
     }
-    for run in reminders {
-        dm::send_checkin(kk, run, CheckinText::Reminder).await;
+    // Aggregate counts only (how many were told), never who.
+    for ((run, kind), sent) in told {
+        let batch = if kind == "reminder" {
+            Batch::Reminder
+        } else {
+            Batch::Notice
+        };
+        let _ = kk
+            .engine
+            .db
+            .run(move |c| checkins::count_batch(c, run, batch, 0, sent))
+            .await;
+        tracing::info!(run, kind, sent, "Check-in messages sent");
     }
+}
+
+/// Who gets a batch: residents' chats (Matrix IDs) or house rooms.
+async fn recipients(kk: &Kk, kind: outbox::Kind, ref_id: i64) -> anyhow::Result<Vec<String>> {
+    use outbox::Kind as K;
+    Ok(match kind {
+        K::Notice | K::Reminder => {
+            if kind == K::Notice {
+                // Before the notice, every eligible resident without a chat
+                // gets one (they get the notice when they accept it).
+                let target = kk
+                    .engine
+                    .db
+                    .run(move |c| Ok(checkins::run(c, ref_id)?.target))
+                    .await?;
+                let hs = dm::Matrix { kk, only: None };
+                let eligible = match reconcile::reconcile(&kk.engine.db, &hs, &target).await {
+                    Ok(out) => out.eligible,
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not reconcile chats; telling who has one");
+                        0
+                    }
+                };
+                kk.engine
+                    .db
+                    .run(move |c| checkins::count_batch(c, ref_id, Batch::Notice, eligible, 0))
+                    .await?;
+            }
+            // Access, target and "not answered yet" are checked per person
+            // right before sending.
+            kk.engine
+                .db
+                .run(|c| store::open_chats(c))
+                .await?
+                .into_iter()
+                .map(|(mxid, _)| mxid)
+                .collect()
+        }
+        K::Announcement | K::Summary => kk.engine.db.run(|c| checkins::central_rooms(c)).await?,
+        K::Moved | K::Cancelled => {
+            // Where its summary went, else the central rooms.
+            kk.engine
+                .db
+                .run(move |c| {
+                    let mut rooms: Vec<String> = summary::summaries(c, ref_id)?
+                        .into_iter()
+                        .map(|(room, _, _)| room)
+                        .collect();
+                    rooms.dedup();
+                    if rooms.is_empty() {
+                        rooms = checkins::central_rooms(c)?;
+                    }
+                    Ok(rooms)
+                })
+                .await?
+        }
+    })
+}
+
+/// Send one message of the outbox.
+async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
+    use outbox::Kind as K;
+    let txn: OwnedTransactionId = item.txn.as_str().into();
+    if item.kind.to_chats() {
+        let mxid = item.target.clone();
+        let resident = kk
+            .engine
+            .db
+            .run(move |c| store::resident_by_mxid(c, &mxid))
+            .await;
+        let Ok(Some(store::Resident {
+            dm_room_id: Some(room_id),
+            dm_joined: true,
+            ..
+        })) = resident
+        else {
+            return dm::Told::NotNeeded;
+        };
+        let (Some(room), Ok(user)) = (
+            room_of(kk, &room_id),
+            OwnedUserId::try_from(item.target.as_str()),
+        ) else {
+            return dm::Told::NotNeeded;
+        };
+        let Some(who) = kk.who(&user).await else {
+            return dm::Told::NotNeeded;
+        };
+        let which = if item.kind == K::Reminder {
+            CheckinText::Reminder
+        } else {
+            CheckinText::Notice
+        };
+        return dm::tell_txn(kk, &room, &who, item.ref_id, which, &txn).await;
+    }
+    // Into a house room: not joined (yet) counts as failed, it may come.
+    let Some(room) = room_of(kk, &item.target) else {
+        return dm::Told::Failed;
+    };
+    let (zone, k, id, now) = (kk.engine.zone, kk.engine.k(), item.ref_id, Utc::now());
+    let kind = item.kind;
+    // The text, and the plenum date it tells (None: not needed any more).
+    let text = kk
+        .engine
+        .db
+        .run(move |conn| {
+            Ok(match kind {
+                K::Announcement => None,
+                K::Summary => match plenums::get(conn, id)? {
+                    // Only before the plenum begins.
+                    Some(p) if p.starts_at > now => {
+                        let cat = crate::catalog::Catalog::load(conn)?;
+                        Some((summary::render(conn, &cat, id, k, zone, now)?, p.starts_at))
+                    }
+                    _ => None,
+                },
+                _ => match plenums::get(conn, id)? {
+                    Some(p) => {
+                        let what = if kind == K::Cancelled {
+                            summary::Update::Cancelled
+                        } else {
+                            summary::Update::Moved
+                        };
+                        Some((
+                            summary::update_text(conn, id, what, zone, now)?,
+                            p.starts_at,
+                        ))
+                    }
+                    None => None,
+                },
+            })
+        })
+        .await;
+    if kind == K::Announcement {
+        let text = match kk
+            .engine
+            .checkin_text(id, CheckinText::Announcement, now)
+            .await
+        {
+            Ok((_, text)) => text,
+            Err(error) => {
+                tracing::error!(%error, "Could not write an announcement");
+                return dm::Told::Failed;
+            }
+        };
+        return match dm::post_with_keys_txn(kk, &room, &text, &[dm::ENTRY], &txn).await {
+            Ok(_) => dm::Told::Sent,
+            Err(error) => {
+                tracing::warn!(%error, "Could not announce a check-in");
+                dm::Told::Failed
+            }
+        };
+    }
+    let (text, starts_at) = match text {
+        Ok(Some(text)) => text,
+        Ok(None) => return dm::Told::NotNeeded,
+        Err(error) => {
+            tracing::error!(%error, "Could not write a plenum message");
+            return dm::Told::Failed;
+        }
+    };
+    let keys: &[&str] = if kind == K::Summary {
+        &[dm::ENTRY, dm::RESULTS, dm::IDEAS]
+    } else {
+        &[dm::ENTRY]
+    };
+    let event_id = match dm::post_with_keys_txn(kk, &room, &text, keys, &txn).await {
+        Ok(event_id) => event_id,
+        Err(error) => {
+            tracing::warn!(%error, "Could not post a plenum message");
+            return dm::Told::Failed;
+        }
+    };
+    let (r, e, t) = (room.room_id().to_string(), event_id.to_string(), text);
+    let record_kind = if kind == K::Summary {
+        summary::Kind::Summary
+    } else {
+        summary::Kind::Update
+    };
+    let amend = kk
+        .engine
+        .db
+        .run(move |c| {
+            summary::record(c, id, &r, &e, record_kind, &t, starts_at)?;
+            if kind == K::Summary {
+                return Ok(Vec::new());
+            }
+            // The update also amends the summary posted in this room.
+            let what = if kind == K::Cancelled {
+                summary::Update::Cancelled
+            } else {
+                summary::Update::Moved
+            };
+            let Some(plenum) = plenums::get(c, id)? else {
+                return Ok(Vec::new());
+            };
+            Ok(summary::summaries(c, id)?
+                .into_iter()
+                .filter(|(room, _, _)| *room == r)
+                .map(|(_, event, body)| (event, summary::amended(&body, what, &plenum, zone, now)))
+                .collect())
+        })
+        .await;
+    for (event, amended) in amend.unwrap_or_default() {
+        if let Err(error) = dm::edit_notice(&room, &event, &amended).await {
+            tracing::debug!(%error, "Could not update a posted summary");
+        }
+    }
+    tracing::info!(plenum = id, kind = kind.as_str(), "Plenum message posted");
+    dm::Told::Sent
 }
 
 async fn expire_drafts(kk: &Kk) {
@@ -294,23 +499,30 @@ async fn redact_marked(kk: &Kk) {
                 (Some(room), Ok(id)) => room
                     .redact(&id, Some("🧹 Kummerkasten: cleared"), None)
                     .await
-                    .map(drop)
-                    .map_err(|e| e.to_string()),
+                    .map(drop),
                 // Not in that room any more, or not an event ID: nothing to do.
                 _ => Ok(()),
             };
             let (r, e) = (room_id.clone(), event_id.clone());
             let forget = match outcome {
                 Ok(()) => true,
-                Err(error) if attempts + 1 >= MAX_REDACT_ATTEMPTS => {
-                    tracing::warn!(%error, "Giving up redacting an event");
+                // Not there (any more): nothing is left to redact.
+                Err(error) if is_gone(&error) => {
+                    tracing::debug!(%error, "Nothing to redact: the event is gone");
                     true
                 }
+                // Anything else may pass (a hiccup, power levels fixed later):
+                // tried again later, never forgotten while it stays on the server.
                 Err(error) => {
-                    tracing::debug!(%error, "Redaction failed; will retry");
+                    if attempts + 1 >= store::STUCK_AFTER {
+                        tracing::warn!(%error, attempts = attempts + 1, "A redaction keeps failing; trying again later");
+                    } else {
+                        tracing::debug!(%error, "Redaction failed; will retry");
+                    }
                     false
                 }
             };
+            let now = Utc::now();
             let saved = kk
                 .engine
                 .db
@@ -318,7 +530,7 @@ async fn redact_marked(kk: &Kk) {
                     if forget {
                         store::forget_event(c, &r, &e)
                     } else {
-                        store::retry_event(c, &r, &e)
+                        store::retry_event(c, &r, &e, now)
                     }
                 })
                 .await;
@@ -332,6 +544,36 @@ async fn redact_marked(kk: &Kk) {
         if !progress {
             // Only retries left in this batch: try again next tick.
             return;
+        }
+    }
+}
+
+/// The homeserver says the event doesn't exist (redacting it is pointless).
+fn is_gone(error: &mxbot_common::matrix_sdk::HttpError) -> bool {
+    use mxbot_common::matrix_sdk::ruma::api::error::ErrorKind;
+    matches!(error.client_api_error_kind(), Some(ErrorKind::NotFound))
+}
+
+/// Chats a resident left: once everything tracked there is redacted, the
+/// bot leaves too.
+async fn leave_left_chats(kk: &Kk) {
+    let rooms = match kk.engine.db.run(|c| store::rooms_to_leave(c)).await {
+        Ok(rooms) => rooms,
+        Err(error) => {
+            tracing::error!(%error, "Reading chats to leave failed");
+            return;
+        }
+    };
+    for room_id in rooms {
+        if let Some(room) = room_of(kk, &room_id) {
+            if let Err(error) = room.leave().await {
+                tracing::warn!(%error, "Could not leave a closed chat; trying again later");
+                continue;
+            }
+        }
+        let r = room_id.clone();
+        if let Err(error) = kk.engine.db.run(move |c| store::left_room(c, &r)).await {
+            tracing::error!(%error, "Could not note a left chat");
         }
     }
 }

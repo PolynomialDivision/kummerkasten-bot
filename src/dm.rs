@@ -22,19 +22,19 @@ use mxbot_common::{
                     },
                 },
             },
-            OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId, UserId,
+            OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId, TransactionId, UserId,
         },
         Client, Room, RoomState,
     },
     rooms::DynamicRooms,
-    send::send_with_retry,
+    send::{send_with_retry, send_with_retry_txn},
     settings::Settings,
 };
 use tokio::sync::{Mutex, Notify};
 
 use crate::{
     access,
-    checkins::{self, Batch, Target},
+    checkins::{self, Batch},
     config::Tunables,
     engine::{CheckinText, Engine, Input, Kind, Msg, Who},
     flow::MenuItem,
@@ -142,47 +142,165 @@ impl Kk {
 }
 
 /// Send `msgs` to `mxid`'s chat `room`, tracking every event (edits too:
-/// they carry content). A live message gets its buttons and becomes the
-/// screen whose taps count; an edit changes that screen in place.
+/// they carry content).
+///
+/// A chat has one screen, the message whose buttons work. A new screen
+/// edits it in place while it is still the last message in the chat and
+/// part of the current flow ([`store::screen_is_editable`]); its buttons are
+/// brought in line with the new view. Otherwise (something was said after
+/// it, the flow ended, an older screen) a fresh screen is sent and the old
+/// one is redacted right away. Notes and receipts are messages of their
+/// own; a receipt with buttons (the deletion code) becomes the screen but
+/// is never edited.
 pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
     for msg in msgs {
-        let content = markup::notice(&msg.text);
-        let sent = if msg.kind == Kind::Edit {
-            let live = kk.engine.screen_event(mxid).await.ok().flatten();
-            let original = live
-                .filter(|(r, _)| r == room.room_id().as_str())
-                .and_then(|(_, e)| OwnedEventId::try_from(e).ok());
-            match original {
-                Some(original) => {
-                    let edit = content.make_replacement(ReplacementMetadata::new(original, None));
-                    send_with_retry(room, edit).await
-                }
-                None => continue,
+        if msg.live && msg.kind != Kind::Receipt {
+            if !show_screen(kk, room, mxid, &msg).await {
+                return;
             }
-        } else {
-            send_with_retry(room, content).await
-        };
-        let event_id = match sent {
+            continue;
+        }
+        let event_id = match send_with_retry(room, markup::notice(&msg.text)).await {
             Ok(id) => id,
             Err(error) => {
                 tracing::warn!(%error, "Could not send to a Kummerkasten chat");
                 return;
             }
         };
-        record(
-            kk,
-            room,
-            &event_id,
-            msg.in_session() || msg.kind == Kind::Edit,
-        )
-        .await;
-        if msg.live && msg.kind != Kind::Edit {
+        record(kk, room, &event_id, msg.in_session()).await;
+        if msg.live {
+            // The code receipt: its buttons work, it isn't edited.
             if let Err(error) = kk.engine.set_screen(mxid, event_id.as_str()).await {
                 tracing::error!(%error, "Could not remember the live screen");
             }
             seed(room, &event_id, &msg.buttons).await;
         }
     }
+}
+
+/// Show `msg` as the chat's screen: edit the current one, or send a fresh
+/// one. `false`: nothing could be sent.
+async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) -> bool {
+    let room_id = room.room_id().to_string();
+    let current = kk
+        .engine
+        .screen_event(mxid)
+        .await
+        .ok()
+        .flatten()
+        .filter(|(r, _)| *r == room_id)
+        .map(|(_, e)| e);
+    if let Some(event) = &current {
+        let (r, e) = (room_id.clone(), event.clone());
+        let editable = kk
+            .engine
+            .db
+            .run(move |c| store::screen_is_editable(c, &r, &e))
+            .await
+            .unwrap_or(false);
+        if editable {
+            match edit_screen(kk, room, event, msg).await {
+                Ok(()) => return true,
+                // Gone, or the server refused: a fresh screen instead, so
+                // nobody is left with a dead one.
+                Err(error) => {
+                    tracing::warn!(%error, "Could not edit the screen; sending a fresh one")
+                }
+            }
+        }
+    }
+    let event_id = match send_with_retry(room, markup::notice(&msg.text)).await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "Could not send to a Kummerkasten chat");
+            return false;
+        }
+    };
+    record(kk, room, &event_id, true).await;
+    if let Err(error) = kk.engine.set_screen(mxid, event_id.as_str()).await {
+        tracing::error!(%error, "Could not remember the live screen");
+    }
+    let buttons = add_buttons(room, &event_id, &msg.buttons).await;
+    let (r, e, old) = (room_id, event_id.to_string(), current);
+    let saved = kk
+        .engine
+        .db
+        .run(move |c| {
+            store::set_screen_buttons(c, &r, &e, &buttons)?;
+            // The screen it replaces goes now, not at the end of the flow.
+            Ok(match old {
+                Some(old) if old != e => store::replace_screen(c, &r, &old)?,
+                _ => 0,
+            })
+        })
+        .await;
+    match saved {
+        Ok(replaced) if replaced > 0 => kk.wake.notify_one(),
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "Could not remember the screen's buttons"),
+    }
+    true
+}
+
+/// Edit the screen `event` to show `msg`, then bring its buttons in line:
+/// the bot's reactions that still fit (a common start) stay, the rest are
+/// redacted and the new ones added in order, so every button shown works
+/// and they keep the order of the text.
+async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()> {
+    let original = OwnedEventId::try_from(event).context("not an event ID")?;
+    let edit = markup::notice(&msg.text)
+        .make_replacement(ReplacementMetadata::new(original.clone(), None));
+    let edit_id = send_with_retry(room, edit).await?;
+    let room_id = room.room_id().to_string();
+    let old = {
+        let (r, e, x) = (room_id.clone(), event.to_owned(), edit_id.to_string());
+        kk.engine
+            .db
+            .run(move |c| {
+                store::record_edit(c, &r, &x, &e)?;
+                Ok(store::screen_buttons(c, &r, &e)?.unwrap_or_default())
+            })
+            .await?
+    };
+    let keep = screens::buttons_kept(&old, &msg.buttons);
+    for (_, reaction) in &old[keep..] {
+        if let Ok(reaction) = OwnedEventId::try_from(reaction.as_str()) {
+            if let Err(error) = room.redact(&reaction, None, None).await {
+                tracing::debug!(%error, "Could not take a button away");
+            }
+        }
+    }
+    let mut buttons = old[..keep].to_vec();
+    buttons.extend(add_buttons(room, &original, &msg.buttons[keep..]).await);
+    let (r, e) = (room_id, event.to_owned());
+    kk.engine
+        .db
+        .run(move |c| store::set_screen_buttons(c, &r, &e, &buttons))
+        .await?;
+    Ok(())
+}
+
+/// The bot's reactions under `event_id`, one per key: `(key, reaction)` of
+/// those that could be added.
+async fn add_buttons(
+    room: &Room,
+    event_id: &OwnedEventId,
+    keys: &[String],
+) -> Vec<(String, String)> {
+    let mut added = Vec::new();
+    for key in keys {
+        let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), key.clone()));
+        match send_with_retry(room, reaction).await {
+            Ok(id) => added.push((key.clone(), id.to_string())),
+            Err(error) => tracing::warn!(%error, "Could not add a button"),
+        }
+    }
+    added
+}
+
+/// Track an event in a resident's chat (see [`store::record_event`]).
+pub async fn track(kk: &Kk, room: &Room, event_id: &OwnedEventId, in_session: bool) {
+    record(kk, room, event_id, in_session).await;
 }
 
 async fn record(kk: &Kk, room: &Room, event_id: &OwnedEventId, in_session: bool) {
@@ -280,6 +398,12 @@ pub async fn on_message(
     let msgs = if matches!(body.to_lowercase().as_str(), "!menu" | "!start" | "menu") {
         kk.engine
             .fresh_menu(&who, room.room_id().as_str(), now)
+            .await
+    } else if screens::asks_for_help(&body) {
+        // Before the flow sees it: on a writing step it would become text.
+        let ttl = kk.settings.get().session_ttl();
+        kk.engine
+            .help(&who, room.room_id().as_str(), now, ttl)
             .await
     } else {
         let ttl = kk.settings.get().session_ttl();
@@ -424,9 +548,8 @@ pub async fn on_member(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMemberEvent) {
                 .db
                 .run(move |c| store::drop_dm(c, &mxid, &room_id))
                 .await;
-            if let Err(error) = room.leave().await {
-                tracing::warn!(%error, "Could not leave a closed chat");
-            }
+            // The bot leaves once what it sent there is redacted (scheduler).
+            kk.wake.notify_one();
         }
         _ => {}
     }
@@ -631,11 +754,6 @@ pub async fn post_missing_entries(kk: &Kk) {
     }
 }
 
-/// `text` with a 📮 that opens a private chat (entry message, announcement).
-async fn post_with_entry(kk: &Kk, room: &Room, text: &str) -> Result<()> {
-    post_with_keys(kk, room, text, &[ENTRY]).await.map(drop)
-}
-
 /// `text` with buttons that open a private chat: 📮 (and 📈 / 💡).
 pub async fn post_with_keys(
     kk: &Kk,
@@ -643,7 +761,18 @@ pub async fn post_with_keys(
     text: &str,
     keys: &[&str],
 ) -> Result<OwnedEventId> {
-    let event_id = send_with_retry(room, markup::notice(text))
+    post_with_keys_txn(kk, room, text, keys, &TransactionId::new()).await
+}
+
+/// [`post_with_keys`] with the transaction ID `txn` (the outbox's).
+pub async fn post_with_keys_txn(
+    kk: &Kk,
+    room: &Room,
+    text: &str,
+    keys: &[&str],
+    txn: &TransactionId,
+) -> Result<OwnedEventId> {
+    let event_id = send_with_retry_txn(room, markup::notice(text), txn)
         .await
         .context("Posting into a house room")?;
     seed(
@@ -780,24 +909,47 @@ pub async fn on_authorized_join(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMembe
 /// Send `run`'s notice or reminder into `who`'s chat `room` if they should
 /// hear about it now (open, theirs, unanswered; chat still private).
 /// Returns whether it went out.
+/// What became of one message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Told {
+    Sent,
+    /// Not needed (any more): answered, closed, no chat, not private.
+    NotNeeded,
+    /// Sending failed; it may work later.
+    Failed,
+}
+
 async fn tell(kk: &Kk, room: &Room, who: &Who, run_id: i64, which: CheckinText) -> bool {
+    tell_txn(kk, room, who, run_id, which, &TransactionId::new()).await == Told::Sent
+}
+
+/// Tell `who` about `run` (notice or reminder) in their chat `room`, with
+/// the transaction ID `txn` (the outbox's, so a retry isn't posted twice).
+pub async fn tell_txn(
+    kk: &Kk,
+    room: &Room,
+    who: &Who,
+    run_id: i64,
+    which: CheckinText,
+    txn: &TransactionId,
+) -> Told {
     let now = Utc::now();
     let Ok((run, text)) = kk.engine.checkin_text(run_id, which, now).await else {
-        return false;
+        return Told::Failed;
     };
     let Ok(user) = OwnedUserId::try_from(who.mxid.as_str()) else {
-        return false;
+        return Told::NotNeeded;
     };
     if !kk.engine.should_tell(&run, who, now).await.unwrap_or(false)
         || !kk.chat_is_private(room, &user).await
     {
-        return false;
+        return Told::NotNeeded;
     }
-    let event_id = match send_with_retry(room, markup::notice(&text)).await {
+    let event_id = match send_with_retry_txn(room, markup::notice(&text), txn).await {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "Could not send a check-in message");
-            return false;
+            return Told::Failed;
         }
     };
     record(kk, room, &event_id, false).await;
@@ -808,106 +960,7 @@ async fn tell(kk: &Kk, room: &Room, who: &Who, run_id: i64, which: CheckinText) 
         .run(move |c| checkins::add_message(c, &e, run_id))
         .await;
     seed(room, &event_id, &[screens::START_CHECKIN.to_owned()]).await;
-    true
-}
-
-/// Tell everyone `run` concerns about it: the start notice or the one
-/// reminder. Before the notice, every eligible resident without a chat
-/// gets one (see [`reconcile`]). Access, target and "not answered yet" are
-/// checked for each person right before sending; what is stored is only
-/// the message itself (so its 📊 works) and how many went out.
-pub async fn send_checkin(kk: &Kk, run_id: i64, which: CheckinText) {
-    let target: Option<Target> = kk
-        .engine
-        .db
-        .run(move |c| Ok(checkins::run(c, run_id)?.target))
-        .await
-        .ok();
-    let eligible = match (which, target) {
-        (CheckinText::Notice, Some(target)) => {
-            let hs = Matrix { kk, only: None };
-            match reconcile::reconcile(&kk.engine.db, &hs, &target).await {
-                Ok(out) => out.eligible,
-                Err(error) => {
-                    tracing::warn!(%error, "Could not reconcile chats; telling who has one");
-                    0
-                }
-            }
-        }
-        _ => 0,
-    };
-    let chats = match kk.engine.db.run(|c| store::open_chats(c)).await {
-        Ok(chats) => chats,
-        Err(error) => {
-            tracing::error!(%error, "Could not list chats");
-            return;
-        }
-    };
-    let mut sent = 0;
-    for (mxid, room_id) in chats {
-        let (Ok(user), Ok(room_id)) = (
-            OwnedUserId::try_from(mxid.as_str()),
-            OwnedRoomId::try_from(room_id.as_str()),
-        ) else {
-            continue;
-        };
-        let Some(room) = kk
-            .client
-            .get_room(&room_id)
-            .filter(|r| r.state() == RoomState::Joined)
-        else {
-            continue;
-        };
-        let Some(who) = kk.who(&user).await else {
-            continue;
-        };
-        if tell(kk, &room, &who, run_id, which).await {
-            sent += 1;
-        }
-    }
-    let batch = match which {
-        CheckinText::Reminder => Batch::Reminder,
-        _ => Batch::Notice,
-    };
-    let _ = kk
-        .engine
-        .db
-        .run(move |c| checkins::count_batch(c, run_id, batch, eligible, sent))
-        .await;
-    tracing::info!(run = run_id, kind = ?which, sent, "Check-in messages sent");
-}
-
-/// Announce `run` in the central room(s): only for runs set to.
-pub async fn announce_checkin(kk: &Kk, run_id: i64) {
-    let text = match kk
-        .engine
-        .checkin_text(run_id, CheckinText::Announcement, Utc::now())
-        .await
-    {
-        Ok((_, text)) => text,
-        Err(error) => {
-            tracing::error!(%error, "Could not write an announcement");
-            return;
-        }
-    };
-    let rooms = kk
-        .engine
-        .db
-        .run(|c| checkins::central_rooms(c))
-        .await
-        .unwrap_or_default();
-    for room_id in rooms {
-        let Some(room) = OwnedRoomId::try_from(room_id.as_str())
-            .ok()
-            .and_then(|id| kk.client.get_room(&id))
-            .filter(|r| r.state() == RoomState::Joined)
-        else {
-            continue;
-        };
-        if let Err(error) = post_with_entry(kk, &room, &text).await {
-            tracing::warn!(%error, "Could not announce a check-in");
-        }
-    }
+    Told::Sent
 }
 
 #[cfg(test)]

@@ -23,7 +23,16 @@ What would you like to do? 🌱
 Everything is a tap on a button (a reaction the bot puts under its
 message). Free text is just a message. Every step has ⬅️ Back and ❌ Cancel;
 Cancel throws the draft away, clears the conversation from the chat and
-shows a fresh menu. No "are you sure?".
+shows a fresh menu. No "are you sure?". `!help` explains it in five lines
+(and shows the step you were on again), `!menu` starts over.
+
+**One screen.** The bot's current message is the screen. Each tap changes
+it in place, with its buttons brought in line (new ones added, those that
+no longer fit taken away, in the order of the text), so the chat doesn't
+fill up with old menus. When something was said after it (your text, a
+note, a receipt), the next step comes as a fresh screen at the bottom and
+the old one is removed. Receipts (✅ stored, the deletion code) are never
+edited.
 
 ## For residents
 
@@ -164,6 +173,7 @@ Check-ins:
 !kk survey cleaning add multiple optional How was it?   (then: choice <n> add …)
 !kk survey cleaning add text optional suggestion What would you change?
 !kk survey cleaning choice 2 add problem cleaning.skipped_turns 🙋 Cleaning turns are skipped
+!kk survey cleaning choice 2 emoji 3 🐢              (a choice's button; warns about look-alikes)
 !kk survey cleaning edit 1 How satisfied are you with cleaning?
 !kk survey cleaning move 3 1 · disable 2 · optional 1 · comment 1 on · preview
 !kk metrics · !kk metric add kitchen.tidiness kitchen How tidy the kitchen is (1–5)
@@ -267,9 +277,12 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
   or the round moves on to another plenum. A reminder already sent stays
   sent.
 * Notices, reminders and announcements go out **per run in one batch**,
-  marked sent before sending (a crash means a missed message, never a
-  second one). Each person is checked right before: access, target, not
-  answered yet.
+  queued in the **outbox** in the transaction that marks them due. The
+  outbox decides who gets it when it goes out, checks each person right
+  before (access, target, not answered yet), retries what failed (1, 2, 4 …
+  minutes, 8 times) and sends each message with its own Matrix transaction
+  ID, so a crash neither loses nor doubles it. The plenum summary and its
+  updates go the same way. `!kk round` shows how many are waiting.
 * **One chat per eligible resident.** Before a check-in's notices go out,
   the bot lists who is in the authorized rooms, checks each again with the
   server, keeps those the check-in is for, and creates the encrypted chat
@@ -343,11 +356,17 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
 * **Delivery records are minimal and temporary.** `checkin_messages` maps a
   notice's or reminder's event to its run. No room, so it can't say whose
   chat got a reminder (and so who hadn't answered by then); its rows go
-  when the run closes. Kept for good: only counts on the run (eligible at
+  when the run closes. The outbox has one row per chat (every chat, not
+  only those who haven't answered) only while a batch goes out, and
+  forgets the whole batch once it is sent. Kept for good: only counts on the run (eligible at
   launch, notices sent, reminders sent). Chat events are tracked only to
   redact them after the plenum, with the day (not the time) they were sent.
   The homeserver itself of course still has the messages it delivered until
-  they are redacted.
+  they are redacted. A redaction that fails is tried again with a growing
+  wait (up to 6 hours) and is never given up while the message may still
+  be there; `!kk round` shows how many keep failing. When a resident leaves
+  their chat, the bot redacts what it tracked there first and leaves the
+  room afterwards.
 
 **Results**
 

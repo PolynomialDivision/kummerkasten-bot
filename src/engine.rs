@@ -259,6 +259,40 @@ impl Engine {
             .await
     }
 
+    /// `!help`: the short help, then the screen they were on again (below
+    /// it, so they carry on where they were), or a fresh menu.
+    pub async fn help(
+        &self,
+        who: &Who,
+        room_id: &str,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Vec<Msg>> {
+        let this = self.clone();
+        let (who, room_id) = (who.clone(), room_id.to_owned());
+        self.db
+            .run(move |conn| {
+                let flow = match load(conn, &who.mxid)? {
+                    Some(s)
+                        if s.room == room_id
+                            && !(s.flow.in_progress() && now - s.updated > ttl) =>
+                    {
+                        s.flow
+                    }
+                    _ => {
+                        tidy(conn, &room_id)?;
+                        save(conn, &who.mxid, &room_id, &Flow::default(), now)?;
+                        Flow::default()
+                    }
+                };
+                Ok(vec![
+                    Msg::note(&screens::help()),
+                    Msg::screen(this.render(conn, &who, &flow, now)?),
+                ])
+            })
+            .await
+    }
+
     /// 📊 on a check-in notice or reminder: open that check-in (or carry on
     /// where they were in it).
     pub async fn start_run(
@@ -684,18 +718,22 @@ impl Engine {
                     _ => unreachable!(),
                 };
                 let done = if support {
-                    ideas::support(conn, &self.secrets, id, mxid)
-                        .map(|_| "👍 Thanks. Your support counts.")
+                    ideas::support(conn, &self.secrets, id, mxid).map(drop)
                 } else {
-                    ideas::withdraw(conn, &self.secrets, id, mxid)
-                        .map(|_| "↩️ Your 👍 is taken back.")
+                    ideas::withdraw(conn, &self.secrets, id, mxid).map(drop)
                 };
-                let note = done.unwrap_or("🗄️ That idea is closed. Nothing changed.");
                 save(conn, mxid, room_id, &flow, now)?;
-                return Ok(vec![
-                    Msg::note(note),
-                    Msg::edit(self.render(conn, who, &flow, now)?),
-                ]);
+                let screen = Msg::edit(self.render(conn, who, &flow, now)?);
+                // The screen says it (✅ You support this idea / 👍 again); a
+                // note only when nothing changed, and then after the screen,
+                // so the screen is edited in place.
+                return Ok(match done {
+                    Ok(()) => vec![screen],
+                    Err(_) => vec![
+                        screen,
+                        Msg::note("🗄️ That idea is closed. Nothing changed."),
+                    ],
+                });
             }
             Effect::Comment(id, text) => {
                 let today = self.zone.date(now);
@@ -1439,6 +1477,20 @@ mod tests {
     }
 
     #[test]
+    fn help_shows_the_same_step_again_and_loses_nothing() {
+        let mut chat = Chat::new();
+        chat.menu();
+        let step = screen(&chat.tap("📝")).text.clone();
+        let out =
+            chat.deliver(tokio_block(chat.engine.help(&chat.who, ROOM, chat.now, ttl())).unwrap());
+        assert_eq!(out[0].kind, Kind::Note);
+        assert!(out[0].text.contains("!menu"));
+        // The same step, below the help, its buttons working.
+        assert_eq!(screen(&out).text, step);
+        assert!(chat.tap("🧹").iter().any(|m| m.live));
+    }
+
+    #[test]
     fn taps_of_another_screen_are_ignored_and_text_on_buttons_gets_a_hint() {
         let mut chat = Chat::new();
         chat.menu();
@@ -1787,11 +1839,15 @@ mod tests {
         let page = chat.tap("1️⃣");
         assert!(screen(&page).text.contains("👍 0"));
         let supported = chat.tap("👍");
-        assert!(supported[0].text.contains("Your support counts"));
-        assert!(supported[1].text.contains("✅ You support this idea."));
-        assert!(supported[1].text.contains("👍 1"));
-        // A second 👍 isn't offered (and wouldn't count): only take it back.
-        assert!(!supported[1].buttons.contains(&"👍".to_owned()));
+        // One message: the screen, changed in place, says it (no extra note).
+        assert_eq!(supported.len(), 1);
+        assert_eq!(supported[0].kind, Kind::Edit);
+        assert!(supported[0].text.contains("✅ You support this idea."));
+        assert!(supported[0].text.contains("👍 1"));
+        // A second 👍 isn't offered (and wouldn't count): only take it back,
+        // and that button is there to tap (deliver adds it to the edit).
+        assert!(!supported[0].buttons.contains(&"👍".to_owned()));
+        assert!(supported[0].buttons.contains(&"↩️".to_owned()));
         for msg in &supported {
             assert!(!msg.text.contains(ME));
         }

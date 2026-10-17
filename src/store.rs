@@ -158,6 +158,9 @@ pub fn set_joined(conn: &Connection, mxid: &str) -> Result<()> {
 
 /// They left their chat: forget it (and what was tracked in it, the bot
 /// can't redact there any more). Their floor stays for a next chat.
+/// They left their chat: it is theirs no more, everything the bot tracked
+/// in it is marked for redaction, and the bot leaves once that is done
+/// ([`rooms_to_leave`]); leaving first would leave it all on the server.
 pub fn drop_dm(conn: &Connection, mxid: &str, room_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE residents SET dm_room_id = NULL, dm_joined = 0, pending_notice = NULL
@@ -165,7 +168,30 @@ pub fn drop_dm(conn: &Connection, mxid: &str, room_id: &str) -> Result<()> {
         params![mxid, room_id],
     )?;
     conn.execute("DELETE FROM sessions WHERE mxid = ?1", [mxid])?;
-    conn.execute("DELETE FROM dm_events WHERE room_id = ?1", [room_id])?;
+    conn.execute(
+        "UPDATE dm_events SET doomed = 1 WHERE room_id = ?1",
+        [room_id],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO leaving_rooms (room_id, since) VALUES (?1, ?2)",
+        params![room_id, time::now_text()],
+    )?;
+    Ok(())
+}
+
+/// Left chats with nothing left to redact: the bot may leave them now.
+pub fn rooms_to_leave(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT room_id FROM leaving_rooms l
+         WHERE NOT EXISTS (SELECT 1 FROM dm_events e WHERE e.room_id = l.room_id)
+         ORDER BY since",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn left_room(conn: &Connection, room_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM leaving_rooms WHERE room_id = ?1", [room_id])?;
     Ok(())
 }
 
@@ -204,30 +230,142 @@ pub fn record_event(
     Ok(())
 }
 
-/// Events marked for redaction: `(room_id, event_id, attempts)`.
+/// Track an edit (`m.replace`) of `replaces`: it carries the new content,
+/// so it goes with the screen; it is no message of its own in the timeline.
+pub fn record_edit(conn: &Connection, room_id: &str, event_id: &str, replaces: &str) -> Result<()> {
+    record_event(conn, room_id, event_id, true)?;
+    conn.execute(
+        "UPDATE dm_events SET replaces = ?3 WHERE room_id = ?1 AND event_id = ?2",
+        params![room_id, event_id, replaces],
+    )?;
+    Ok(())
+}
+
+/// Events marked for redaction and due: `(room_id, event_id, attempts)`.
 pub fn doomed(conn: &Connection, limit: usize) -> Result<Vec<(String, String, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT room_id, event_id, attempts FROM dm_events WHERE doomed = 1
+        "SELECT room_id, event_id, attempts FROM dm_events
+         WHERE doomed = 1 AND (retry_at IS NULL OR retry_at <= ?2)
          ORDER BY room_id, sent_at LIMIT ?1",
     )?;
-    let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let rows = stmt.query_map(params![limit as i64, time::now_text()], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Redacted (or nothing left to redact): no longer tracked.
 pub fn forget_event(conn: &Connection, room_id: &str, event_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM dm_events WHERE room_id = ?1 AND event_id = ?2",
         params![room_id, event_id],
     )?;
-    Ok(())
-}
-
-pub fn retry_event(conn: &Connection, room_id: &str, event_id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE dm_events SET attempts = attempts + 1 WHERE room_id = ?1 AND event_id = ?2",
+        "DELETE FROM screens WHERE room_id = ?1 AND event_id = ?2",
         params![room_id, event_id],
     )?;
     Ok(())
+}
+
+/// After this many failed attempts a redaction counts as stuck: it is still
+/// tried (less often), and admins see it in `!kk round`.
+pub const STUCK_AFTER: i64 = 5;
+
+/// A redaction failed: try again later, waiting longer each time (1, 2, 4
+/// … minutes, at most 6 hours). Never given up while it might still work.
+pub fn retry_event(
+    conn: &Connection,
+    room_id: &str,
+    event_id: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT attempts FROM dm_events WHERE room_id = ?1 AND event_id = ?2",
+            params![room_id, event_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let wait = chrono::Duration::minutes((1i64 << attempts.clamp(0, 9)).min(360));
+    conn.execute(
+        "UPDATE dm_events SET attempts = attempts + 1, retry_at = ?3
+         WHERE room_id = ?1 AND event_id = ?2",
+        params![room_id, event_id, time::to_text(now + wait)],
+    )?;
+    Ok(())
+}
+
+/// Redactions that keep failing (see [`STUCK_AFTER`]).
+pub fn stuck_redactions(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM dm_events WHERE doomed = 1 AND attempts >= ?1",
+        [STUCK_AFTER],
+        |r| r.get(0),
+    )?)
+}
+
+// ── Screens ─────────────────────────────────────────────────────────────────
+
+/// The bot's buttons under `event_id`, in order: `(key, reaction event)`.
+/// `None`: not a screen the bot can edit.
+pub fn screen_buttons(
+    conn: &Connection,
+    room_id: &str,
+    event_id: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT buttons FROM screens WHERE room_id = ?1 AND event_id = ?2",
+            params![room_id, event_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(json.map(|j| serde_json::from_str(&j).unwrap_or_default()))
+}
+
+pub fn set_screen_buttons(
+    conn: &Connection,
+    room_id: &str,
+    event_id: &str,
+    buttons: &[(String, String)],
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO screens (room_id, event_id, buttons) VALUES (?1, ?2, ?3)
+         ON CONFLICT (room_id, event_id) DO UPDATE SET buttons = ?3",
+        params![room_id, event_id, serde_json::to_string(buttons)?],
+    )?;
+    Ok(())
+}
+
+/// Whether the screen `event_id` can be edited in place: the bot knows its
+/// buttons, it isn't going away (marked for redaction), it goes with the
+/// flow (not a receipt), and nothing was said after it, so it is still the
+/// last message in the chat (edits don't count; reactions aren't tracked).
+pub fn screen_is_editable(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM dm_events e JOIN screens s
+                ON s.room_id = e.room_id AND s.event_id = e.event_id
+             WHERE e.room_id = ?1 AND e.event_id = ?2 AND e.doomed = 0 AND e.in_session = 1
+               AND NOT EXISTS (SELECT 1 FROM dm_events later
+                               WHERE later.room_id = e.room_id AND later.rowid > e.rowid
+                                 AND later.replaces IS NULL)",
+            params![room_id, event_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// A fresh screen replaces `event_id`: it goes now (with its edits), not at
+/// the end of the flow. A receipt (not part of the flow) stays.
+pub fn replace_screen(conn: &Connection, room_id: &str, event_id: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE dm_events SET doomed = 1
+         WHERE room_id = ?1 AND in_session = 1 AND (event_id = ?2 OR replaces = ?2)",
+        params![room_id, event_id],
+    )?)
 }
 
 // ── Handled events ──────────────────────────────────────────────────────────
@@ -303,6 +441,101 @@ mod tests {
         // An empty list: no room at all.
         sync_rooms(&conn, &[]).unwrap();
         assert!(authorized_rooms(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_left_chat_is_redacted_before_the_bot_leaves() {
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        conn.execute(
+            "INSERT INTO residents (mxid, dm_room_id, dm_joined, created_at) VALUES ('@a:x', '!a:x', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        record_event(&conn, "!a:x", "$receipt", false).unwrap();
+        record_event(&conn, "!a:x", "$screen", true).unwrap();
+        drop_dm(&conn, "@a:x", "!a:x").unwrap();
+        // Everything, receipts too, is to be redacted; nothing is forgotten.
+        let mut doomed: Vec<String> = doomed(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e, _)| e)
+            .collect();
+        doomed.sort();
+        assert_eq!(doomed, ["$receipt", "$screen"]);
+        // Not before both are gone.
+        assert!(rooms_to_leave(&conn).unwrap().is_empty());
+        forget_event(&conn, "!a:x", "$receipt").unwrap();
+        assert!(rooms_to_leave(&conn).unwrap().is_empty());
+        forget_event(&conn, "!a:x", "$screen").unwrap();
+        assert_eq!(rooms_to_leave(&conn).unwrap(), ["!a:x"]);
+        left_room(&conn, "!a:x").unwrap();
+        assert!(rooms_to_leave(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_redactions_back_off_and_are_never_given_up() {
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        record_event(&conn, "!a:x", "$1", true).unwrap();
+        crate::engine::tidy(&conn, "!a:x").unwrap();
+        let now = chrono::Utc::now();
+        for _ in 0..STUCK_AFTER {
+            retry_event(&conn, "!a:x", "$1", now).unwrap();
+        }
+        // Waiting for its next attempt: not due now.
+        assert!(doomed(&conn, 10).unwrap().is_empty());
+        assert_eq!(stuck_redactions(&conn).unwrap(), 1);
+        // Due again later, still tracked.
+        conn.execute("UPDATE dm_events SET retry_at = '2000-01-01T00:00:00Z'", [])
+            .unwrap();
+        assert_eq!(doomed(&conn, 10).unwrap().len(), 1);
+        let attempts: i64 = conn
+            .query_row("SELECT attempts FROM dm_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, STUCK_AFTER);
+    }
+
+    #[test]
+    fn a_screen_is_edited_only_while_it_is_the_last_message() {
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let editable = |e: &str| screen_is_editable(&conn, "!a:x", e).unwrap();
+        record_event(&conn, "!a:x", "$screen", true).unwrap();
+        // Without known buttons (an older screen): never edited.
+        assert!(!editable("$screen"));
+        set_screen_buttons(&conn, "!a:x", "$screen", &[("📝".into(), "$r1".into())]).unwrap();
+        assert!(editable("$screen"));
+        // Its own edits don't count as later messages.
+        record_edit(&conn, "!a:x", "$edit", "$screen").unwrap();
+        assert!(editable("$screen"));
+        assert_eq!(
+            screen_buttons(&conn, "!a:x", "$screen").unwrap().unwrap(),
+            [("📝".to_owned(), "$r1".to_owned())]
+        );
+        // Something said after it (their text, a note): not any more.
+        record_event(&conn, "!a:x", "$their_text", true).unwrap();
+        assert!(!editable("$screen"));
+        // Replacing it dooms it and its edits, not their text.
+        assert_eq!(replace_screen(&conn, "!a:x", "$screen").unwrap(), 2);
+        let doomed: Vec<String> = doomed(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e, _)| e)
+            .collect();
+        assert_eq!(doomed.len(), 2);
+        assert!(!doomed.contains(&"$their_text".to_owned()));
+        // A receipt is never edited or replaced.
+        record_event(&conn, "!a:x", "$receipt", false).unwrap();
+        set_screen_buttons(&conn, "!a:x", "$receipt", &[]).unwrap();
+        assert!(!editable("$receipt"));
+        assert_eq!(replace_screen(&conn, "!a:x", "$receipt").unwrap(), 0);
+        // A doomed screen isn't edited either.
+        record_event(&conn, "!a:x", "$s2", true).unwrap();
+        set_screen_buttons(&conn, "!a:x", "$s2", &[]).unwrap();
+        assert!(editable("$s2"));
+        crate::engine::tidy(&conn, "!a:x").unwrap();
+        assert!(!editable("$s2"));
+        // Forgetting it drops its buttons.
+        forget_event(&conn, "!a:x", "$s2").unwrap();
+        assert!(screen_buttons(&conn, "!a:x", "$s2").unwrap().is_none());
     }
 
     #[test]

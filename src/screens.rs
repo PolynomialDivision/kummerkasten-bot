@@ -113,6 +113,89 @@ pub fn same_key(a: &str, b: &str) -> bool {
     bare(a) == bare(b)
 }
 
+/// Emojis that look alike as reactions (small in a phone's row of them).
+const LOOK_ALIKE: &[&[&str]] = &[
+    &["📅", "📆", "🗓️"],
+    &["⏰", "⏱️", "⏲️", "🕰️", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕"],
+    &["✅", "✔️", "☑️", "🆗"],
+    &["❌", "✖️", "❎"],
+    &["🙂", "😊", "☺️", "😀", "😃", "😄"],
+    &["👍", "👌"],
+    &["⚠️", "🚸"],
+    &["⬆️", "🔼", "⏫"],
+    &["⬇️", "🔽", "⏬"],
+];
+
+/// What would make a question's choice buttons work badly, for admins:
+/// a missing, repeated or reserved emoji (then every choice is shown as
+/// 1️⃣ 2️⃣ …), or two that look alike.
+pub fn choice_key_warnings(emojis: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let reserved: Vec<&String> = emojis
+        .iter()
+        .filter(|e| RESERVED.iter().any(|r| same_key(r, e)))
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut twice: Vec<&str> = Vec::new();
+    for e in emojis.iter().filter(|e| !e.is_empty()) {
+        if seen.iter().any(|s| same_key(s, e)) {
+            if !twice.iter().any(|t| same_key(t, e)) {
+                twice.push(e);
+            }
+        } else {
+            seen.push(e);
+        }
+    }
+    let numbered = if emojis.iter().any(|e| e.is_empty()) {
+        Some("a choice has no emoji".to_owned())
+    } else if !twice.is_empty() {
+        Some(format!("{} is used twice", twice.join(" ")))
+    } else if !reserved.is_empty() {
+        Some(format!(
+            "{} is a navigation button",
+            reserved
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = numbered {
+        out.push(format!(
+            "🔢 The choices are shown as 1️⃣ 2️⃣ … instead of their emojis: {why}."
+        ));
+    }
+    for group in LOOK_ALIKE {
+        let alike: Vec<&str> = seen
+            .iter()
+            .copied()
+            .filter(|e| group.iter().any(|g| same_key(g, e)))
+            .collect();
+        if alike.len() > 1 {
+            out.push(format!(
+                "👀 {} look alike as reactions: pick clearly different ones \
+                 (`choice <n> emoji <c> <emoji>`).",
+                alike.join(" ")
+            ));
+        }
+    }
+    out
+}
+
+/// How many of the bot's buttons under an edited screen stay: the common
+/// start of the old buttons (`(key, reaction)`, in the order they were
+/// added) and the new view's keys. The rest are taken away and added anew,
+/// so clients (which show reactions in the order they came) keep the order
+/// of the text, and every shown button has its reaction.
+pub fn buttons_kept(old: &[(String, String)], new: &[String]) -> usize {
+    old.iter()
+        .zip(new)
+        .take_while(|((had, _), want)| same_key(had, want))
+        .count()
+}
+
 pub fn resolve(view: &View, key: &str) -> Option<Action> {
     view.buttons
         .iter()
@@ -962,7 +1045,28 @@ fn menu(ctx: &Ctx) -> View {
     b.button("📈", "Results", Action::Open(MenuItem::Results));
     b.button("🔑", "Manage submission", Action::Open(MenuItem::Manage));
     b.button("🔐", "Privacy", Action::Open(MenuItem::Privacy));
+    b.gap().line("❓ `!help` · 🏠 `!menu` anytime");
     b.done()
+}
+
+/// `!help`: how to use the chat, short (the privacy details are behind 🔐).
+pub fn help() -> String {
+    "❓ **How this chat works**\n\n\
+     • Tap an emoji under my last message to choose. Where the choices are numbered, \
+     you can also type the number.\n\
+     • ✍️ When I ask you to write, just send a message.\n\
+     • ⬅️ goes back, ❌ cancels: nothing is saved until you confirm with ✅.\n\
+     • 🏠 `!menu` starts over at the menu, any time.\n\
+     • 🔐 *Privacy* in the menu says what is stored and for how long."
+        .to_owned()
+}
+
+/// Whether a message asks for help (never taken as text for a submission).
+pub fn asks_for_help(body: &str) -> bool {
+    matches!(
+        body.trim().to_lowercase().as_str(),
+        "!help" | "!hilfe" | "help" | "hilfe"
+    )
 }
 
 // ── Messages that aren't screens ────────────────────────────────────────────
@@ -1099,6 +1203,59 @@ pub fn checkin_announcement(run: &Run, ctx: &Ctx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choice_emojis_that_work_badly_are_pointed_out() {
+        let e = |keys: &[&str]| -> Vec<String> { keys.iter().map(|k| k.to_string()).collect() };
+        assert!(choice_key_warnings(&e(&["1️⃣", "2️⃣", "4️⃣"])).is_empty());
+        let alike = choice_key_warnings(&e(&["📅", "🗓", "📆"]));
+        assert_eq!(alike.len(), 1);
+        assert!(alike[0].contains("look alike"));
+        assert!(choice_key_warnings(&e(&["🧴", "🧴"]))[0].contains("used twice"));
+        assert!(choice_key_warnings(&e(&["🧴", ""]))[0].contains("no emoji"));
+        assert!(choice_key_warnings(&e(&["⬅️", "🧴"]))[0].contains("navigation"));
+    }
+
+    #[test]
+    fn help_is_asked_for_only_by_these_words() {
+        for ask in ["!help", "Help", " hilfe ", "!HILFE"] {
+            assert!(asks_for_help(ask), "{ask}");
+        }
+        for text in ["help me with the dishes", "?", "helpful", ""] {
+            assert!(!asks_for_help(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_edit_keeps_the_buttons_that_still_fit_in_order() {
+        let had = |keys: &[&str]| -> Vec<(String, String)> {
+            keys.iter()
+                .map(|k| (k.to_string(), format!("${k}")))
+                .collect()
+        };
+        let want = |keys: &[&str]| -> Vec<String> { keys.iter().map(|k| k.to_string()).collect() };
+        // A box ticked: the same buttons, nothing changes.
+        let boxes = ["🙋", "📋", "➡️", "⬅️", "❌"];
+        assert_eq!(buttons_kept(&had(&boxes), &want(&boxes)), 5);
+        // 👍 becomes ↩️ (support taken): from there on, anew.
+        assert_eq!(
+            buttons_kept(
+                &had(&["👍", "💬", "⬅️", "❌"]),
+                &want(&["↩️", "💬", "⬅️", "❌"])
+            ),
+            0
+        );
+        // Results: ⏩ appears after ⏪.
+        assert_eq!(
+            buttons_kept(&had(&["⏪", "🏠", "⬅️"]), &want(&["⏪", "⏩", "🏠", "⬅️"])),
+            1
+        );
+        // Fewer buttons: the common start stays.
+        assert_eq!(buttons_kept(&had(&["😩", "😕", "⬅️"]), &want(&["😩"])), 1);
+        // The emoji variation selector doesn't matter.
+        assert_eq!(buttons_kept(&had(&["➡\u{fe0f}"]), &want(&["➡"])), 1);
+        assert_eq!(buttons_kept(&[], &want(&["📝"])), 0);
+    }
     use crate::db::memory_connection;
 
     #[test]
