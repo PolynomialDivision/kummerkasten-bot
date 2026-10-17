@@ -23,6 +23,15 @@ pub struct KkConfig {
     /// Starting values of the settings admins can change at runtime.
     #[serde(default)]
     pub settings: Tunables,
+    /// `test`: a separate database, nobody but the admins has access, and
+    /// a check-in goes only to the admin who starts it.
+    #[serde(default)]
+    pub mode: Mode,
+    /// The authorized rooms, when the config manages them (`[[kummerkasten.rooms]]`):
+    /// synced at every start, and `!kk rooms add/remove/central` are refused.
+    /// Left out: admins manage them with those commands.
+    #[serde(default)]
+    pub rooms: Option<Vec<RoomConfig>>,
 }
 
 impl Default for KkConfig {
@@ -31,8 +40,75 @@ impl Default for KkConfig {
             timezone: default_timezone(),
             plenum_time: default_plenum_time(),
             settings: Tunables::default(),
+            mode: Mode::default(),
+            rooms: None,
         }
     }
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Live,
+    /// Trying it out: everything as live, but in its own database (the
+    /// live one is never touched), only admins may use it, and check-ins
+    /// go only to the admin who starts them. Messages say 🧪 Test.
+    Test,
+}
+
+impl Mode {
+    /// The bot's own files in the store directory (the Matrix session is
+    /// the same in both modes): database, key, settings.
+    pub fn files(self) -> [&'static str; 3] {
+        match self {
+            Mode::Live => ["kummerkasten.sqlite", "kummerkasten.key", "settings.json"],
+            Mode::Test => [
+                "kummerkasten-test.sqlite",
+                "kummerkasten-test.key",
+                "settings-test.json",
+            ],
+        }
+    }
+}
+
+/// One authorized room from the config.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoomConfig {
+    pub id: String,
+    pub label: String,
+    /// The central house room: the day-before summary, `announce`.
+    #[serde(default)]
+    pub central: bool,
+    /// Post the 📮 entry message here once (when none was posted yet).
+    #[serde(default)]
+    pub entry: bool,
+}
+
+/// Room IDs that parse, each once, and test mode only with admins.
+pub fn check_kummerkasten(kk: &KkConfig, security: &SecurityConfig) -> Result<()> {
+    if let Some(rooms) = &kk.rooms {
+        let mut seen = std::collections::HashSet::new();
+        for room in rooms {
+            if mxbot_common::matrix_sdk::ruma::RoomId::parse(&room.id).is_err() {
+                bail!(
+                    "[[kummerkasten.rooms]] {:?} isn't a room ID (!…:server)",
+                    room.id
+                );
+            }
+            if !seen.insert(room.id.as_str()) {
+                bail!("[[kummerkasten.rooms]] {:?} is listed twice", room.id);
+            }
+            if room.label.trim().is_empty() {
+                bail!("[[kummerkasten.rooms]] {:?} needs a label", room.id);
+            }
+        }
+    }
+    if kk.mode == Mode::Test && security.admin_users.is_empty() {
+        bail!("mode = \"test\" needs [security] admin_users: only they may use it");
+    }
+    Ok(())
 }
 
 fn default_timezone() -> String {
@@ -139,7 +215,44 @@ mod tests {
         crate::time::Zone::parse(&config.kummerkasten.timezone).unwrap();
         crate::time::parse_hm(&config.kummerkasten.plenum_time).unwrap();
         assert!(config.security.admin_dm.require_verified_device);
+        check_kummerkasten(&config.kummerkasten, &config.security).unwrap();
     }
+
+    #[test]
+    fn rooms_from_the_config_and_test_mode_are_checked() {
+        let parse = |s: &str| toml::from_str::<Config>(&format!("{MATRIX}{s}")).unwrap();
+        let ok = parse(
+            "[security]\nadmin_users = [\"@a:x\"]\n[kummerkasten]\nmode = \"test\"\n\
+             [[kummerkasten.rooms]]\nid = \"!h:x\"\nlabel = \"House\"\ncentral = true\nentry = true\n",
+        );
+        check_kummerkasten(&ok.kummerkasten, &ok.security).unwrap();
+        assert_eq!(ok.kummerkasten.mode, Mode::Test);
+        let rooms = ok.kummerkasten.rooms.unwrap();
+        assert!(rooms[0].central && rooms[0].entry);
+        // Room version 12 IDs have no server name.
+        let v12 = parse(
+            "[[kummerkasten.rooms]]\nid = \"!SLkThsL4ZaZ7j9yD75hKGRqdzXOZE8C_wi56tOtnq1M\"\nlabel = \"Testraum\"\n",
+        );
+        check_kummerkasten(&v12.kummerkasten, &v12.security).unwrap();
+        // Not managed unless listed; live by default.
+        let plain = parse("");
+        assert!(plain.kummerkasten.rooms.is_none());
+        assert_eq!(plain.kummerkasten.mode, Mode::Live);
+        assert_ne!(Mode::Live.files(), Mode::Test.files());
+        // Test mode without admins would lock everyone out.
+        let nobody = parse("[kummerkasten]\nmode = \"test\"\n");
+        assert!(check_kummerkasten(&nobody.kummerkasten, &nobody.security).is_err());
+        let twice = parse(
+            "[[kummerkasten.rooms]]\nid = \"!h:x\"\nlabel = \"A\"\n\
+             [[kummerkasten.rooms]]\nid = \"!h:x\"\nlabel = \"B\"\n",
+        );
+        assert!(check_kummerkasten(&twice.kummerkasten, &twice.security).is_err());
+        let bad = parse("[[kummerkasten.rooms]]\nid = \"house\"\nlabel = \"A\"\n");
+        assert!(check_kummerkasten(&bad.kummerkasten, &bad.security).is_err());
+    }
+
+    const MATRIX: &str =
+        "[matrix]\nhomeserver = \"https://m.x\"\nuser_id = \"@k:x\"\ndevice_id = \"D\"\n";
 
     #[test]
     fn open_invite_lists_are_refused() {

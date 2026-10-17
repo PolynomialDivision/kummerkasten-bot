@@ -86,7 +86,7 @@ pub async fn reconcile<H: Homeserver>(db: &Db, hs: &H, target: &Target) -> Resul
             })
             .await?
         };
-        if !target.matches(&rooms, floor) {
+        if !target.matches(&user, &rooms, floor) {
             continue;
         }
         out.eligible += 1;

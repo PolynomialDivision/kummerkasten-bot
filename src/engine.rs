@@ -613,7 +613,7 @@ impl Engine {
                 }
                 if !run
                     .target
-                    .matches(&who.rooms, flow.draft.floor.or(own_floor))
+                    .matches(mxid, &who.rooms, flow.draft.floor.or(own_floor))
                 {
                     return self.reset(conn, who, room_id, Refused::NotAsked.message(), now);
                 }
@@ -826,7 +826,7 @@ impl Engine {
         if !run.is_open(now) {
             return Ok(vec![Msg::note(Refused::Closed.message())]);
         }
-        if !run.target.matches(&who.rooms, floor) {
+        if !run.target.matches(mxid, &who.rooms, floor) {
             return Ok(vec![Msg::note(Refused::NotAsked.message())]);
         }
         if checkins::completed(conn, &self.secrets, run_id, mxid)? {

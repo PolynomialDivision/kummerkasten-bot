@@ -85,6 +85,13 @@ fn split_commands(body: &str) -> Vec<String> {
     commands
 }
 
+/// The answer to changing rooms the config manages.
+pub fn managed() -> anyhow::Error {
+    anyhow::anyhow!(
+        "🔧 The rooms come from the config (`[[kummerkasten.rooms]]`): change them there and restart me."
+    )
+}
+
 /// The command as a short heading for its answer.
 fn heading(command: &str) -> String {
     let words: Vec<&str> = command.split_whitespace().collect();
@@ -153,8 +160,22 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
             if rooms.is_empty() {
                 return Ok("🔐 No rooms yet. `!kk rooms add <!room:server> House`".to_owned());
             }
-            let mut out = vec!["🔐 **Authorized rooms**".to_owned()];
+            let central = kk
+                .engine
+                .db
+                .run(|c| crate::checkins::central_rooms(c))
+                .await?;
+            let mut out = vec![if kk.managed_rooms.is_some() {
+                "🔐 **Authorized rooms** · from the config".to_owned()
+            } else {
+                "🔐 **Authorized rooms**".to_owned()
+            }];
             for (id, label) in rooms {
+                let label = if central.contains(&id) {
+                    format!("{label} 📣")
+                } else {
+                    label
+                };
                 let joined = OwnedRoomId::try_from(id.as_str())
                     .ok()
                     .and_then(|r| kk.client.get_room(&r))
@@ -170,6 +191,7 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
             }
             Ok(out.join("\n"))
         }
+        ["rooms", "add" | "remove", ..] if kk.managed_rooms.is_some() => Err(managed()),
         ["rooms", "add", room, label @ ..] => {
             let room_id =
                 OwnedRoomId::try_from(*room).context("That isn't a room ID (!…:server).")?;

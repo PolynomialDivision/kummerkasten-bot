@@ -28,6 +28,19 @@ timezone = "Europe/Berlin"
 # Time of the starting rhythm: the 1st, 3rd and 5th Sunday of each month.
 # Used once, on first start; afterwards `!kk rule set …` changes it.
 plenum_time = "19:00"
+# "live" (default) or "test": its own database (kummerkasten-test.sqlite;
+# the live one is never touched), only admin_users have access, every
+# check-in goes only to the admin who starts it, messages say 🧪 Test.
+# mode = "test"
+
+# The authorized rooms. Listed here, they are synced at every start (the
+# others deactivated) and `!kk rooms add/remove/central` are refused; left
+# out, admins manage them with those commands.
+# [[kummerkasten.rooms]]
+# id      = "!house:example.org"
+# label   = "House"
+# central = true    # the day-before summary and `announce` go here
+# entry   = true    # post the 📮 entry message once, when I'm in the room
 
 # Starting values; admins change them with `!admin set <key> <value>`.
 [kummerkasten.settings]

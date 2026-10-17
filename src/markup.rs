@@ -4,7 +4,18 @@
 //! shown inside screens (the preview), and an `@user:server` in it must not
 //! ping that person. (`mxbot_common::format::mentionify` would.)
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use mxbot_common::matrix_sdk::ruma::events::{room::message::RoomMessageEventContent, Mentions};
+
+/// Test mode (`[kummerkasten] mode = "test"`): every message says so.
+static TEST_MODE: AtomicBool = AtomicBool::new(false);
+const TEST_BANNER: &str = "🧪 **Test** · not live, only admins see this";
+
+/// Set once at startup.
+pub fn set_test_mode(on: bool) {
+    TEST_MODE.store(on, Ordering::Relaxed);
+}
 
 /// Escape what this markup would interpret, for text from residents.
 pub fn literal(text: &str) -> String {
@@ -90,15 +101,30 @@ fn escape(html: &mut String, c: char) {
 
 /// A notice (no notification sound by default) that mentions nobody.
 pub fn notice(text: &str) -> RoomMessageEventContent {
-    let (plain, html) = render(text);
+    let (plain, html) = if TEST_MODE.load(Ordering::Relaxed) {
+        render(&with_banner(text))
+    } else {
+        render(text)
+    };
     let mut content = RoomMessageEventContent::notice_html(plain, html);
     content.mentions = Some(Mentions::new());
     content
 }
 
+fn with_banner(text: &str) -> String {
+    format!("{TEST_BANNER}\n\n{text}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_test_banner_comes_first() {
+        let (plain, _) = render(&with_banner("📮 **Kummerkasten**"));
+        assert!(plain.starts_with("🧪 Test · not live"));
+        assert!(plain.ends_with("\n\n📮 Kummerkasten"));
+    }
 
     #[test]
     fn markup_renders_and_user_text_stays_literal() {

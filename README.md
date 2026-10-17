@@ -81,6 +81,34 @@ shows a fresh menu. No "are you sure?".
 * If you're no longer in any of the house rooms, the chat shows a friendly
   🔒 and nothing else.
 
+## Test mode and rooms from the config
+
+```toml
+[kummerkasten]
+mode = "test"                 # or "live" (default)
+
+[[kummerkasten.rooms]]
+id = "!house:example.org"
+label = "House"
+central = true                # the day-before summary, `announce`
+entry = true                  # the 📮 entry message, posted once
+```
+
+* **`mode = "test"`** tries everything out without the house noticing:
+  * its own files (`kummerkasten-test.sqlite`, `-test.key`,
+    `settings-test.json`); the live database is never opened. Switching
+    back to `live` starts where live was; the test files can be deleted;
+  * only `admin_users` have access: nobody else gets a chat, whatever room
+    they are in;
+  * **every check-in goes only to the admin who starts it** (`!kk checkin
+    start …` shows the target it would have live);
+  * every message starts with 🧪 **Test**.
+* **`[[kummerkasten.rooms]]`**: the authorized rooms, synced at every start
+  (rooms not listed are deactivated); `!kk rooms add/remove/central` are
+  refused. With `entry = true` the 📮 entry message is posted once into the
+  room, as soon as I'm in it; `!kk entry` posts another. Without the list,
+  admins manage the rooms with the commands below.
+
 ## For admins
 
 Admins are `[security] admin_users`. Admin commands only work in an

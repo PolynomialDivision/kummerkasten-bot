@@ -45,6 +45,7 @@ async fn tick(kk: &Kk) {
     expire_drafts(kk).await;
     redact_marked(kk).await;
     post_notices(kk).await;
+    dm::post_missing_entries(kk).await;
 }
 
 /// Plenums into view, the round invariant, completions that are due.

@@ -45,17 +45,21 @@ pub enum Target {
     Room { room_id: String, label: String },
     /// Residents who told us they live on this floor.
     Floor { location_id: i64, label: String },
+    /// Just one person: the admin who started it, in test mode
+    /// (`[kummerkasten] mode = "test"`).
+    Person { mxid: String },
 }
 
 impl Target {
-    /// `rooms`: the authorized rooms the person is in right now (empty: no
-    /// access at all). `floor`: the floor they told us.
-    pub fn matches(&self, rooms: &[String], floor: Option<i64>) -> bool {
+    /// `mxid`: who is asking. `rooms`: the authorized rooms they are in
+    /// right now (empty: no access at all). `floor`: the floor they told us.
+    pub fn matches(&self, mxid: &str, rooms: &[String], floor: Option<i64>) -> bool {
         !rooms.is_empty()
             && match self {
                 Target::House => true,
                 Target::Room { room_id, .. } => rooms.contains(room_id),
                 Target::Floor { location_id, .. } => floor == Some(*location_id),
+                Target::Person { mxid: only } => only == mxid,
             }
     }
 
@@ -64,6 +68,7 @@ impl Target {
             Target::House => "👥 Whole house".to_owned(),
             Target::Room { label, .. } => format!("👥 Members of {label}"),
             Target::Floor { label, .. } => format!("🏠 {label}"),
+            Target::Person { mxid } => format!("🧪 Only {mxid} (test mode)"),
         }
     }
 }
@@ -447,7 +452,7 @@ pub fn listing(
     let mut out = Vec::new();
     for id in ids {
         let run = run(conn, id)?;
-        if !run.target.matches(rooms, floor) {
+        if !run.target.matches(mxid, rooms, floor) {
             continue;
         }
         let completed = completed(conn, secrets, id, mxid)?;
@@ -478,7 +483,7 @@ pub fn should_tell(
     now: DateTime<Utc>,
 ) -> Result<bool> {
     Ok(run.is_open(now)
-        && run.target.matches(rooms, floor)
+        && run.target.matches(mxid, rooms, floor)
         && !completed(conn, secrets, run.id, mxid)?)
 }
 
@@ -525,7 +530,7 @@ pub fn submit(
     if !run.is_open(now) {
         return Ok(Err(Refused::Closed));
     }
-    if !run.target.matches(s.rooms, s.floor) {
+    if !run.target.matches(s.mxid, s.rooms, s.floor) {
         return Ok(Err(Refused::NotAsked));
     }
     if !run.identities.contains(&s.identity) {
@@ -1054,13 +1059,29 @@ pub(crate) mod tests {
         };
         let none: Vec<String> = vec![];
         let both = vec![HOUSE.to_owned(), "!kitchen2:x".to_owned()];
-        assert!(house.matches(&rooms(), None));
-        assert!(!house.matches(&none, None), "no access, nothing");
-        assert!(kitchen.matches(&both, None));
-        assert!(!kitchen.matches(&rooms(), None));
-        assert!(floor.matches(&rooms(), Some(floor2)));
-        assert!(!floor.matches(&rooms(), Some(floor2 + 1)));
-        assert!(!floor.matches(&none, Some(floor2)));
+        let me = "@a:x";
+        assert!(house.matches(me, &rooms(), None));
+        assert!(!house.matches(me, &none, None), "no access, nothing");
+        assert!(kitchen.matches(me, &both, None));
+        assert!(!kitchen.matches(me, &rooms(), None));
+        assert!(floor.matches(me, &rooms(), Some(floor2)));
+        assert!(!floor.matches(me, &rooms(), Some(floor2 + 1)));
+        assert!(!floor.matches(me, &none, Some(floor2)));
+        // Test mode: only the admin who started it, and only with access.
+        let only_me = Target::Person { mxid: me.into() };
+        assert!(only_me.matches(me, &rooms(), None));
+        assert!(!only_me.matches("@b:x", &rooms(), None));
+        assert!(!only_me.matches(me, &none, None));
+    }
+
+    #[test]
+    fn a_person_target_round_trips_through_the_database_json() {
+        let target = Target::Person {
+            mxid: "@a:x".into(),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        assert_eq!(json, r#"{"kind":"person","mxid":"@a:x"}"#);
+        assert_eq!(serde_json::from_str::<Target>(&json).unwrap(), target);
     }
 
     #[test]

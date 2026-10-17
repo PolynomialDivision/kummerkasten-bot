@@ -33,6 +33,58 @@ pub fn remove_room(conn: &Connection, room_id: &str) -> Result<bool> {
     )? == 1)
 }
 
+/// The config's rooms (`[[kummerkasten.rooms]]`) become exactly the active
+/// ones: missing ones added, labels and `central` set, the others
+/// deactivated (kept, like `!kk rooms remove`). Returns what changed.
+pub fn sync_rooms(conn: &Connection, rooms: &[crate::config::RoomConfig]) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = 0;
+    for room in rooms {
+        changed += tx.execute(
+            "INSERT INTO authorized_rooms (room_id, label, added_by, added_at, active, central)
+             VALUES (?1, ?2, 'config', ?3, 1, ?4)
+             ON CONFLICT (room_id) DO UPDATE SET label = ?2, active = 1, central = ?4
+             WHERE label != ?2 OR active != 1 OR central != ?4",
+            params![room.id, room.label, time::now_text(), room.central],
+        )?;
+    }
+    let listed: Vec<&str> = rooms.iter().map(|r| r.id.as_str()).collect();
+    let active: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT room_id FROM authorized_rooms WHERE active = 1")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for room in active.iter().filter(|r| !listed.contains(&r.as_str())) {
+        changed += tx.execute(
+            "UPDATE authorized_rooms SET active = 0, central = 0 WHERE room_id = ?1",
+            [room],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// Whether a 📮 entry message was ever posted into `room_id`.
+pub fn entry_posted(conn: &Connection, room_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM posted_entries WHERE room_id = ?1",
+            [room_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+pub fn mark_entry_posted(conn: &Connection, room_id: &str, event_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO posted_entries (room_id, event_id, posted_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT (room_id) DO UPDATE SET event_id = ?2, posted_at = ?3",
+        params![room_id, event_id, time::now_text()],
+    )?;
+    Ok(())
+}
+
 // ── Residents ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -220,6 +272,48 @@ pub fn is_entry(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool
 mod tests {
     use super::*;
     use crate::plenums::tests::{at, with_default_rule};
+
+    #[test]
+    fn the_config_rooms_become_exactly_the_active_rooms() {
+        use crate::config::RoomConfig;
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        add_room(&conn, "!old:x", "Old", "@a:x").unwrap();
+        let room = |id: &str, label: &str, central| RoomConfig {
+            id: id.into(),
+            label: label.into(),
+            central,
+            entry: false,
+        };
+        let rooms = [room("!h:x", "House", true), room("!t:x", "Test", false)];
+        assert_eq!(sync_rooms(&conn, &rooms).unwrap(), 3);
+        let active = authorized_rooms(&conn).unwrap();
+        assert_eq!(
+            active,
+            [
+                ("!h:x".to_owned(), "House".to_owned()),
+                ("!t:x".to_owned(), "Test".to_owned())
+            ]
+        );
+        assert_eq!(crate::checkins::central_rooms(&conn).unwrap(), ["!h:x"]);
+        // Unchanged: nothing to do. Changed: only what changed.
+        assert_eq!(sync_rooms(&conn, &rooms).unwrap(), 0);
+        let moved = [room("!h:x", "House", false), room("!t:x", "Test", true)];
+        assert_eq!(sync_rooms(&conn, &moved).unwrap(), 2);
+        assert_eq!(crate::checkins::central_rooms(&conn).unwrap(), ["!t:x"]);
+        // An empty list: no room at all.
+        sync_rooms(&conn, &[]).unwrap();
+        assert!(authorized_rooms(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_posted_entry_is_remembered_per_room() {
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        assert!(!entry_posted(&conn, "!h:x").unwrap());
+        mark_entry_posted(&conn, "!h:x", "$1").unwrap();
+        mark_entry_posted(&conn, "!h:x", "$2").unwrap();
+        assert!(entry_posted(&conn, "!h:x").unwrap());
+        assert!(!entry_posted(&conn, "!t:x").unwrap());
+    }
 
     #[test]
     fn events_are_tracked_per_round_and_redelivery_is_noticed() {

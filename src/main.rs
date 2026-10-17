@@ -85,18 +85,36 @@ async fn main() -> Result<()> {
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
     mxbot_common::logging::init("kummerkasten_bot");
     config::check_security(&config.security)?;
+    config::check_kummerkasten(&config.kummerkasten, &config.security)?;
     let zone = time::Zone::parse(&config.kummerkasten.timezone)?;
+    let mode = config.kummerkasten.mode;
+    let test = mode == config::Mode::Test;
+    if test {
+        tracing::warn!(
+            admins = ?config.security.admin_users,
+            "Test mode: own database, only admins have access, check-ins go only to who starts them"
+        );
+    }
+    markup::set_test_mode(test);
 
+    // The Matrix session (crypto store) is the same in both modes; the
+    // Kummerkasten's own files are not: test mode never touches live data.
     let store_path = mxbot_common::config::store_path_from_env();
     std::fs::create_dir_all(&store_path)
         .with_context(|| format!("Creating {}", store_path.display()))?;
-    let db = db::Db::open(&store_path.join("kummerkasten.sqlite")).await?;
-    let secrets = secrets::Secrets::load_or_create(&store_path.join("kummerkasten.key"))?;
+    let [db_file, key_file, settings_file] = mode.files();
+    let db = db::Db::open(&store_path.join(db_file)).await?;
+    let secrets = secrets::Secrets::load_or_create(&store_path.join(key_file))?;
     let settings = Settings::load(
-        store_path.join("settings.json"),
+        store_path.join(settings_file),
         config.kummerkasten.settings.clone(),
     )
     .await?;
+    if let Some(rooms) = config.kummerkasten.rooms.clone() {
+        let count = rooms.len();
+        let changed = db.run(move |c| store::sync_rooms(c, &rooms)).await?;
+        tracing::info!(rooms = count, changed, "Authorized rooms from the config");
+    }
 
     // First start: the house's rhythm as the starting rule. Then plenums
     // into view and a round open.
@@ -141,6 +159,8 @@ async fn main() -> Result<()> {
         ops: Arc::new(Mutex::new(())),
         wake: Arc::new(Notify::new()),
         pending_starts: Arc::default(),
+        test_users: test.then(|| Arc::new(config.security.admin_users.clone())),
+        managed_rooms: config.kummerkasten.rooms.clone().map(Arc::new),
     };
 
     bot.client.add_event_handler({

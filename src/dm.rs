@@ -70,12 +70,29 @@ pub struct Kk {
     pub wake: Arc<Notify>,
     /// Check-in starts admins planned and haven't confirmed yet.
     pub pending_starts: Arc<std::sync::Mutex<PendingStarts>>,
+    /// Test mode: only these (the admins) have access at all, and check-ins
+    /// go only to the admin who starts them. `None`: live.
+    pub test_users: Option<Arc<Vec<String>>>,
+    /// The rooms from the config (`[[kummerkasten.rooms]]`); `None`: admins
+    /// manage them with `!kk rooms …`.
+    pub managed_rooms: Option<Arc<Vec<crate::config::RoomConfig>>>,
 }
 
 pub type PendingStarts =
     std::collections::HashMap<String, (crate::checkins::Plan, std::time::Instant)>;
 
 impl Kk {
+    pub fn is_test(&self) -> bool {
+        self.test_users.is_some()
+    }
+
+    /// Whether `user` may use the Kummerkasten in this mode at all.
+    pub fn may_use(&self, user: &str) -> bool {
+        self.test_users
+            .as_ref()
+            .is_none_or(|users| users.iter().any(|u| u == user))
+    }
+
     pub async fn authorized_rooms(&self) -> Vec<OwnedRoomId> {
         let rooms = self
             .engine
@@ -92,6 +109,10 @@ impl Kk {
     /// `user` with the authorized rooms they are in right now (asked of
     /// the server); `None` without access.
     pub async fn who(&self, user: &UserId) -> Option<Who> {
+        // Test mode: nobody but the admins, whichever room they are in.
+        if !self.may_use(user.as_str()) {
+            return None;
+        }
         let rooms = self.authorized_rooms().await;
         let joined = access::joined_rooms(&self.client, &rooms, user).await;
         (!joined.is_empty()).then(|| Who {
@@ -569,7 +590,45 @@ pub async fn post_entry(kk: &Kk, room: &Room) -> Result<()> {
                 Something on your mind? A problem, an idea, a thank-you? 🌱\n\
                 Tap 📮 and I'll open a private chat with you.\n\n\
                 🥷 anonymous if you like · 🔐 private · 🧹 tidied up after every plenum";
-    post_with_entry(kk, room, text).await
+    let event_id = post_with_keys(kk, room, text, &[ENTRY]).await?;
+    let (room_id, id) = (room.room_id().to_string(), event_id.to_string());
+    kk.engine
+        .db
+        .run(move |c| store::mark_entry_posted(c, &room_id, &id))
+        .await
+}
+
+/// `entry = true` rooms of the config: post the 📮 entry message where
+/// none was posted yet and the bot is in the room (it may be invited later).
+pub async fn post_missing_entries(kk: &Kk) {
+    let Some(rooms) = &kk.managed_rooms else {
+        return;
+    };
+    for config in rooms.iter().filter(|r| r.entry) {
+        let id = config.id.clone();
+        if kk
+            .engine
+            .db
+            .run(move |c| store::entry_posted(c, &id))
+            .await
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(room) = OwnedRoomId::try_from(config.id.as_str())
+            .ok()
+            .and_then(|id| kk.client.get_room(&id))
+            .filter(|r| r.state() == RoomState::Joined)
+        else {
+            continue;
+        };
+        match post_entry(kk, &room).await {
+            Ok(()) => tracing::info!(room = %config.label, "Posted the entry message"),
+            Err(error) => {
+                tracing::warn!(%error, room = %config.label, "Could not post the entry message")
+            }
+        }
+    }
 }
 
 /// `text` with a 📮 that opens a private chat (entry message, announcement).

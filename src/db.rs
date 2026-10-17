@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         4,
         include_str!("../migrations/004_results_ideas_measures.sql"),
     ),
+    (5, include_str!("../migrations/005_posted_entries.sql")),
 ];
 
 #[derive(Clone)]

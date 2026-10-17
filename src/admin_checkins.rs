@@ -169,6 +169,7 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                 "Which check-in? A number from `!kk checkins`."
             )),
         },
+        ["rooms", "central", ..] if kk.managed_rooms.is_some() => Err(crate::admin::managed()),
         ["rooms", "central", room, rest @ ..] => {
             let on = rest.first() != Some(&"off");
             let room = room.to_string();
@@ -579,6 +580,13 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
         }
         i += 1;
     }
+    // Test mode: whatever the target, only the admin who starts it.
+    let asked_for = kk.is_test().then(|| opts.target.describe());
+    if kk.is_test() {
+        opts.target = Target::Person {
+            mxid: actor.to_owned(),
+        };
+    }
     let remind = kk.settings.get().remind_before();
     let key = key.to_owned();
     let o = opts.clone();
@@ -593,6 +601,11 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
         String::new(),
         format!("{} {}", plan.emoji, literal(&plan.title)),
         plan.target.describe(),
+    ];
+    if let Some(asked_for) = asked_for {
+        out.push(format!("   (live it would go to: {asked_for})"));
+    }
+    out.extend([
         format!("📝 {} question(s)", plan.versions.len()),
         format!(
             "🗓️ Closes {}{}",
@@ -603,7 +616,7 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
                 None => " · fixed".to_owned(),
             }
         ),
-    ];
+    ]);
     if let Some((_, _, at)) = plan.plenum {
         out.push(format!("🗣️ Next plenum ({})", zone.day_label(at, today)));
     }
@@ -649,9 +662,13 @@ async fn go(kk: &Kk, actor: &str) -> Result<String> {
         .run(move |c| checkins::start(c, &plan, &actor, Utc::now()))
         .await?;
     kk.wake.notify_one();
-    Ok(format!(
-        "🚀 Check-in #{id} started. Everyone it's for gets one message in their Kummerkasten chat. 📬"
-    ))
+    Ok(if kk.is_test() {
+        format!("🚀 Check-in #{id} started, 🧪 only for you: the message comes into your Kummerkasten chat. 📬")
+    } else {
+        format!(
+            "🚀 Check-in #{id} started. Everyone it's for gets one message in their Kummerkasten chat. 📬"
+        )
+    })
 }
 
 async fn runs(kk: &Kk) -> Result<String> {
