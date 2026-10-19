@@ -320,7 +320,14 @@ pub struct Env<'a> {
     pub similar: Option<i64>,
     /// On a results topic: how many of its check-ins there are to page.
     pub pages: usize,
+    /// Survey-only mode: no offer to share an answer as an idea, and ⬅️
+    /// never leaves the check-in (its intro is the first screen).
+    pub survey: bool,
 }
+
+/// Survey-only mode: a check-in's flow, `[Menu, CheckinIntro, …]`. The
+/// `Menu` underneath is never shown; ⬅️ stops at the intro.
+pub const SURVEY_DEPTH: usize = 2;
 
 /// `apply_in` without a check-in run.
 #[cfg(test)]
@@ -334,6 +341,7 @@ pub fn apply(flow: &mut Flow, action: Action, cat: &Catalog, own_floor: Option<i
             run: None,
             similar: None,
             pages: 0,
+            survey: false,
         },
     )
 }
@@ -348,7 +356,8 @@ pub fn apply_in(flow: &mut Flow, action: Action, env: &Env) -> Effect {
             return Effect::Cancel;
         }
         Action::Back => {
-            if flow.stack.len() > 1 {
+            let floor = if env.survey { SURVEY_DEPTH } else { 1 };
+            if flow.stack.len() > floor {
                 flow.stack.pop();
             }
             return Effect::Show;
@@ -683,7 +692,7 @@ fn checkin(flow: &mut Flow, screen: Screen, action: Action, run: &Run, env: &Env
                             text: Some(text),
                             ..Answer::default()
                         };
-                        if q.asks_suggestion {
+                        if q.asks_suggestion && !env.survey {
                             // "What would you change?": offer it as an idea.
                             flow.push(S::CheckinShareIdea { index });
                             return Effect::Show;
@@ -1033,6 +1042,7 @@ mod tests {
                 run: Some(run),
                 similar: None,
                 pages: 0,
+                survey: false,
             },
         )
     }

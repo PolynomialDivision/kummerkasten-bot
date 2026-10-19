@@ -32,6 +32,11 @@ plenum_time = "19:00"
 # the live one is never touched), only admin_users have access, every
 # check-in goes only to the admin who starts it, messages say 🧪 Test.
 # mode = "test"
+# What residents see. "survey" (default for now): only the check-ins admins
+# start. They get it as a message, answer it, done. No menu, no entry
+# messages, no plenum summaries. "full": the whole Kummerkasten (feedback,
+# ideas, results). Nothing is deleted either way; switching back is a restart.
+# ui = "full"
 
 # The authorized rooms. Listed here, they are synced at every start (the
 # others deactivated) and `!kk rooms add/remove/central` are refused; left

@@ -48,6 +48,7 @@ mod plenum;
 mod plenums;
 mod reconcile;
 mod results;
+mod run_results;
 mod scheduler;
 mod screens;
 mod secrets;
@@ -90,6 +91,12 @@ async fn main() -> Result<()> {
     let zone = time::Zone::parse(&config.kummerkasten.timezone)?;
     let mode = config.kummerkasten.mode;
     let test = mode == config::Mode::Test;
+    let survey = config.kummerkasten.ui == config::Ui::Survey;
+    if survey {
+        tracing::info!(
+            "Survey-only mode: residents see only the check-ins admins start (ui = \"full\" for everything)"
+        );
+    }
     if test {
         tracing::warn!(
             admins = ?config.security.admin_users,
@@ -151,10 +158,12 @@ async fn main() -> Result<()> {
     let kk = dm::Kk {
         client: bot.client.clone(),
         bot: bot.user_id.clone(),
-        engine: engine::Engine::new(db, secrets, zone).with_threshold({
-            let settings = settings.clone();
-            Arc::new(move || settings.get().privacy_threshold() as i64)
-        }),
+        engine: engine::Engine::new(db, secrets, zone)
+            .with_threshold({
+                let settings = settings.clone();
+                Arc::new(move || settings.get().privacy_threshold() as i64)
+            })
+            .survey_only(survey),
         settings,
         rooms,
         ops: Arc::new(Mutex::new(())),
@@ -171,7 +180,11 @@ async fn main() -> Result<()> {
             let kk = kk.clone();
             let bot = bot.clone();
             async move {
-                if ev.sender == kk.bot || room.state() != RoomState::Joined {
+                if room.state() != RoomState::Joined {
+                    return;
+                }
+                if ev.sender == kk.bot {
+                    dm::on_own_message(&kk, &room, &ev).await;
                     return;
                 }
                 let dispatch = bot.admin.handle(&room, &ev, encryption.as_ref()).await;
@@ -256,6 +269,12 @@ async fn main() -> Result<()> {
 
     bot.initial_sync().await;
     tracing::info!("Initial sync complete");
+    // Survey-only mode: menus and drafts of the full Kummerkasten go.
+    if survey {
+        dm::survey_cleanup(&kk).await;
+    }
+    // Screens a crash left behind, before anyone taps on them.
+    dm::resume_screens(&kk).await;
     tokio::spawn(scheduler::run(kk.clone()));
     bot.run().await
 }

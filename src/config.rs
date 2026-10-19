@@ -32,6 +32,23 @@ pub struct KkConfig {
     /// Left out: admins manage them with those commands.
     #[serde(default)]
     pub rooms: Option<Vec<RoomConfig>>,
+    /// What residents see: only the check-ins admins start (`survey`, the
+    /// default for now), or the whole Kummerkasten (`full`).
+    #[serde(default)]
+    pub ui: Ui,
+}
+
+/// What residents get to see. Everything stays in the code and the
+/// database either way; `survey` only keeps it out of their sight.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ui {
+    /// Only the check-ins (surveys) admins start: no menu, no entry
+    /// messages, no summaries. A resident gets the survey, answers it, done.
+    #[default]
+    Survey,
+    /// The whole Kummerkasten: menu, feedback, ideas, results, summaries.
+    Full,
 }
 
 impl Default for KkConfig {
@@ -42,6 +59,7 @@ impl Default for KkConfig {
             settings: Tunables::default(),
             mode: Mode::default(),
             rooms: None,
+            ui: Ui::default(),
         }
     }
 }

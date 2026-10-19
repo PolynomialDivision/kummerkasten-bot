@@ -21,6 +21,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (5, include_str!("../migrations/005_posted_entries.sql")),
     (6, include_str!("../migrations/006_screens_outbox.sql")),
+    (7, include_str!("../migrations/007_pending_screens.sql")),
+    (8, include_str!("../migrations/008_echoed_screens.sql")),
 ];
 
 #[derive(Clone)]

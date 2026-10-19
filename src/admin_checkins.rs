@@ -35,6 +35,29 @@ pub const HELP: &str = "📊 **Check-ins**
 `!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin close <n>`
 `!kk rooms central <!room> [off]`: where `announce` posts";
 
+/// `!kk help` in survey-only mode: the whole way, nothing else.
+pub const SURVEY_HELP: &str = "📊 **Survey-only mode**
+Residents see nothing but the check-in you start. They get it as a message, answer it question by question, and are done.
+
+1️⃣ **Look at it**
+`!kk survey cleaning`: the questions, numbered
+`!kk survey cleaning preview`: each question as residents see it
+
+2️⃣ **Start it**
+`!kk checkin start cleaning`: shows what would happen, then
+`!kk checkin go` to start it (or `!kk checkin drop`)
+   options: `closes 2026-11-14 [18:00]` · `closes 1d-before` · `only anonymous` · `no-reminder` · `room <!room>` · `floor <location>`
+   by default it closes when the next plenum starts, with one reminder a day before
+
+3️⃣ **Follow it**
+`!kk checkins`: open and closed ones, how many answered
+
+4️⃣ **Close and read it**
+`!kk checkin close <n>`: end it now (otherwise it closes by itself)
+`!kk checkin results <n>`: the answers, once it is closed
+
+✏️ Change questions: `!kk survey cleaning edit <n> <question>` and more in `!kk help all`";
+
 /// Handles the check-in commands; `None` for anything else.
 pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<String>> {
     let reply = match args {
@@ -152,6 +175,41 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
             Ok("❌ Dropped. Nothing was started.".to_owned())
         }
         ["checkins"] => runs(kk).await,
+        ["checkin", "results" | "result", n] | ["results", n] => {
+            match n.trim_start_matches('#').parse::<i64>() {
+                Ok(id) => {
+                    let (k, zone) = (kk.engine.k(), kk.engine.zone);
+                    let exists = kk
+                        .engine
+                        .db
+                        .run(move |c| {
+                            Ok(c.query_row(
+                                "SELECT count(*) FROM survey_runs WHERE id = ?1",
+                                [id],
+                                |r| r.get::<_, i64>(0),
+                            )? > 0)
+                        })
+                        .await;
+                    match exists {
+                        Ok(true) => {
+                            kk.engine
+                                .db
+                                .run(move |c| {
+                                    crate::run_results::render(c, id, k, zone, Utc::now())
+                                })
+                                .await
+                        }
+                        Ok(false) => Err(anyhow::anyhow!(
+                            "There's no check-in #{id}. See `!kk checkins`."
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "Which check-in? A number from `!kk checkins`."
+                )),
+            }
+        }
         ["checkin", "close", n] => match n.trim_start_matches('#').parse::<i64>() {
             Ok(id) => kk
                 .engine
@@ -612,6 +670,22 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
             mxid: actor.to_owned(),
         };
     }
+    // The same survey for the same people twice at once would ask them
+    // twice (and split the answers): close the open one first.
+    {
+        let (key, target) = (key.to_owned(), opts.target.clone());
+        let open = kk
+            .engine
+            .db
+            .run(move |c| checkins::open_run_of(c, &key, &target, Utc::now()))
+            .await?;
+        if let Some(id) = open {
+            bail!(
+                "#{id} of this survey is still open for the same people. \
+                 Close it first with `!kk checkin close {id}`."
+            );
+        }
+    }
     let remind = kk.settings.get().remind_before();
     let key = key.to_owned();
     let o = opts.clone();
@@ -711,6 +785,7 @@ async fn runs(kk: &Kk) -> Result<String> {
         open,
         closes_at,
         responses,
+        eligible,
     } in list
     {
         let state = if open {
@@ -718,11 +793,15 @@ async fn runs(kk: &Kk) -> Result<String> {
         } else {
             "🔒 closed".to_owned()
         };
-        out.push(format!(
-            "#{id} {emoji} {} · {state} · 💬 {responses} answer(s)",
-            literal(&title)
-        ));
+        let answered = match eligible.filter(|e| *e > 0) {
+            Some(e) => format!("💬 {responses} of {e} answered"),
+            None => format!("💬 {responses} answered"),
+        };
+        out.push(format!("#{id} {emoji} {}", literal(&title)));
+        out.push(format!("   {state} · {answered}"));
     }
+    out.push(String::new());
+    out.push("📈 `!kk checkin results <n>` · 🔒 `!kk checkin close <n>`".to_owned());
     Ok(out.join("\n"))
 }
 

@@ -9,9 +9,12 @@
 //! *then*. Each row is sent with its own Matrix transaction ID (`kk-out-<id>`,
 //! ids are never reused), so a send that succeeded just before a crash is
 //! not posted twice when it is retried. A failed send is tried again with a
-//! growing wait, [`MAX_ATTEMPTS`] times. Once nothing of a batch is left to
-//! send, all its rows are deleted: who was told is kept only while a batch is
-//! going out (the counts on the run stay).
+//! growing wait (up to six hours between tries) and never given up: after
+//! [`STUCK_AFTER`] tries it counts as stuck and admins see it in `!kk round`.
+//! What isn't needed any more (a check-in closed meanwhile, no chat) is
+//! dropped on purpose, by the sender, not by the retry count. Once nothing of
+//! a batch is left to send, all its rows are deleted: who was told is kept
+//! only while a batch is going out (the counts on the run stay).
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -19,8 +22,9 @@ use rusqlite::{params, Connection};
 
 use crate::time;
 
-/// Tries per message before it is given up (the waits add up to ~4 hours).
-pub const MAX_ATTEMPTS: i64 = 8;
+/// After this many failed tries a message counts as stuck: still tried
+/// (every six hours), and shown to admins.
+pub const STUCK_AFTER: i64 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -172,33 +176,30 @@ pub fn skipped(conn: &Connection, item: &Item) -> Result<()> {
     finish(conn, item.kind.as_str(), item.ref_id)
 }
 
-/// Sending failed: try again after 1, 2, 4 … minutes (at most an hour), or
-/// give it up after [`MAX_ATTEMPTS`]. Returns `true` when given up.
+/// Sending failed: try again after 1, 2, 4 … minutes, at most six hours,
+/// for as long as it takes. Returns `true` when the message just became
+/// stuck (see [`STUCK_AFTER`]), so it is logged once.
 pub fn failed(conn: &Connection, item: &Item, now: DateTime<Utc>) -> Result<bool> {
     let attempts: i64 = conn.query_row(
         "SELECT attempts FROM outbox WHERE id = ?1",
         [item.id],
         |r| r.get(0),
     )?;
-    if attempts + 1 >= MAX_ATTEMPTS {
-        skipped(conn, item)?;
-        return Ok(true);
-    }
-    let wait = Duration::minutes((1i64 << attempts.clamp(0, 6)).min(60));
+    let wait = Duration::minutes((1i64 << attempts.clamp(0, 9)).min(360));
     conn.execute(
         "UPDATE outbox SET attempts = attempts + 1, retry_at = ?2 WHERE id = ?1",
         params![item.id, time::to_text(now + wait)],
     )?;
-    Ok(false)
+    Ok(attempts + 1 == STUCK_AFTER)
 }
 
-/// Messages still waiting (for `!kk round`).
-pub fn waiting(conn: &Connection) -> Result<i64> {
-    Ok(
-        conn.query_row("SELECT count(*) FROM outbox WHERE sent = 0", [], |r| {
-            r.get(0)
-        })?,
-    )
+/// Messages still waiting, and how many of them are stuck (for `!kk round`).
+pub fn waiting(conn: &Connection) -> Result<(i64, i64)> {
+    Ok(conn.query_row(
+        "SELECT count(*), coalesce(sum(attempts >= ?1), 0) FROM outbox WHERE sent = 0",
+        [STUCK_AFTER],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
 }
 
 /// Nothing of the batch left to send: forget it, and with it who was told.
@@ -248,11 +249,11 @@ mod tests {
         skipped(&conn, &items[1]).unwrap();
         // …and forgotten once it is done.
         assert!(rows(&conn).is_empty());
-        assert_eq!(waiting(&conn).unwrap(), 0);
+        assert_eq!(waiting(&conn).unwrap(), (0, 0));
     }
 
     #[test]
-    fn a_failed_message_waits_longer_each_time_then_is_given_up() {
+    fn a_failed_message_waits_longer_each_time_and_is_never_given_up() {
         let now = at(2026, 11, 2, 12);
         let conn = with_default_rule(now);
         queue(&conn, Kind::Summary, 3, now).unwrap();
@@ -263,11 +264,24 @@ mod tests {
         // Not due again right away; a minute later it is.
         assert!(due(&conn, now, 10).unwrap().is_empty());
         assert_eq!(due(&conn, now + Duration::minutes(1), 10).unwrap().len(), 1);
-        let mut given_up = false;
-        for i in 1..MAX_ATTEMPTS {
-            given_up = failed(&conn, &item, now + Duration::hours(i)).unwrap();
+        // Stuck after STUCK_AFTER tries (said once), still waiting, still due
+        // later: six hours at most between tries.
+        let mut became_stuck = 0;
+        for i in 1..=STUCK_AFTER + 2 {
+            if failed(&conn, &item, now + Duration::hours(i)).unwrap() {
+                became_stuck += 1;
+            }
         }
-        assert!(given_up);
+        assert_eq!(became_stuck, 1);
+        assert_eq!(rows(&conn), [("!house:x".into(), 0)]);
+        assert_eq!(waiting(&conn).unwrap(), (1, 1));
+        let last = now + Duration::hours(STUCK_AFTER + 2);
+        assert!(due(&conn, last + Duration::hours(5), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(due(&conn, last + Duration::hours(6), 10).unwrap().len(), 1);
+        // Sent in the end: forgotten like any other.
+        sent(&conn, &item).unwrap();
         assert!(rows(&conn).is_empty());
     }
 

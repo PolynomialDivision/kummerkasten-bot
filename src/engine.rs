@@ -133,7 +133,14 @@ impl Msg {
 struct Memory {
     managing: HashMap<String, (i64, Instant)>,
     attempts: HashMap<String, Vec<Instant>>,
+    /// The bot's own screen events seen coming back through sync, newest
+    /// last: an echo can arrive before the sender has noted the event as
+    /// the screen (a send from the scheduler runs beside sync).
+    echoes: std::collections::VecDeque<String>,
 }
+
+/// How many recent echoes are remembered.
+const ECHOES: usize = 64;
 
 /// Which check-in message to write.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,6 +155,18 @@ struct Session {
     updated: DateTime<Utc>,
     room: String,
     screen_event: Option<String>,
+    /// The saved flow's view isn't confirmed on Matrix (see migration 7).
+    pending: bool,
+    /// The bot's event showing this view came back through sync (migration 8).
+    echoed: bool,
+}
+
+impl Session {
+    /// The chat may not be showing this flow's view yet: a tap now may be
+    /// meant for the view before, and must not act on this one.
+    fn stale(&self) -> bool {
+        self.pending || !self.echoed
+    }
 }
 
 /// The privacy threshold in force (admins can change it at runtime).
@@ -160,6 +179,9 @@ pub struct Engine {
     pub zone: Zone,
     memory: Arc<Mutex<Memory>>,
     threshold: Threshold,
+    /// Survey-only mode (`ui = "survey"`): residents see nothing but the
+    /// check-ins admins start. See [`Engine::survey_home`].
+    survey: bool,
 }
 
 impl Engine {
@@ -170,7 +192,18 @@ impl Engine {
             zone,
             memory: Arc::default(),
             threshold: Arc::new(|| 3),
+            survey: false,
         }
+    }
+
+    /// Survey-only mode on or off.
+    pub fn survey_only(mut self, on: bool) -> Self {
+        self.survey = on;
+        self
+    }
+
+    pub fn is_survey(&self) -> bool {
+        self.survey
     }
 
     /// Read the privacy threshold from `threshold` (the live settings).
@@ -197,6 +230,10 @@ impl Engine {
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
             .run(move |conn| {
+                if this.survey {
+                    let msgs = this.survey_home(conn, &who, &room_id, now, false)?;
+                    return finish(conn, &who.mxid, msgs);
+                }
                 this.forget(&who.mxid);
                 tidy(conn, &room_id)?;
                 let mut flow = Flow::default();
@@ -210,10 +247,12 @@ impl Engine {
                         run: None,
                         similar: None,
                         pages: 0,
+                        survey: false,
                     },
                 );
                 save(conn, &who.mxid, &room_id, &flow, now)?;
-                Ok(vec![Msg::screen(this.render(conn, &who, &flow, now)?)])
+                let msgs = vec![Msg::screen(this.render(conn, &who, &flow, now)?)];
+                finish(conn, &who.mxid, msgs)
             })
             .await
     }
@@ -232,16 +271,65 @@ impl Engine {
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
             .run(move |conn| {
+                let was_pending =
+                    load(conn, &who.mxid)?.is_some_and(|s| s.room == room_id && s.stale());
                 let msgs = this.handle_sync(conn, &who, &room_id, input, now, ttl)?;
-                this.with_screen(conn, &who, &room_id, now, msgs)
+                let msgs = this.with_screen(conn, &who, &room_id, now, msgs, was_pending)?;
+                finish(conn, &who.mxid, msgs)
+            })
+            .await
+    }
+
+    /// The screen the chat should be showing right now, to show it again:
+    /// after a restart, or when the last one wasn't confirmed as shown. An
+    /// unfinished flow older than `ttl` is thrown away first, as a tap
+    /// would.
+    pub async fn current_screen(
+        &self,
+        who: &Who,
+        room_id: &str,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Vec<Msg>> {
+        let this = self.clone();
+        let (who, room_id) = (who.clone(), room_id.to_owned());
+        self.db
+            .run(move |conn| {
+                let session = load(conn, &who.mxid)?.filter(|s| s.room == room_id);
+                if this.survey {
+                    let msgs = match session {
+                        Some(s)
+                            if in_checkin(&s.flow)
+                                && !this.draft_over(conn, &s.flow, s.updated, now, ttl)? =>
+                        {
+                            vec![Msg::screen(this.render(conn, &who, &s.flow, now)?)]
+                        }
+                        _ => this.survey_home(conn, &who, &room_id, now, false)?,
+                    };
+                    return finish(conn, &who.mxid, msgs);
+                }
+                let flow = match session {
+                    Some(s) if this.draft_over(conn, &s.flow, s.updated, now, ttl)? => {
+                        return this.reset(conn, &who, &room_id, screens::expired(), now);
+                    }
+                    Some(s) => s.flow,
+                    _ => {
+                        tidy(conn, &room_id)?;
+                        save(conn, &who.mxid, &room_id, &Flow::default(), now)?;
+                        Flow::default()
+                    }
+                };
+                let msgs = vec![Msg::screen(this.render(conn, &who, &flow, now)?)];
+                finish(conn, &who.mxid, msgs)
             })
             .await
     }
 
     /// `msgs` with a screen added when they hold none and the chat has no
     /// live screen to tap on (never had one, or it was redacted: the flow
-    /// ended, a restart in the middle of a step). A note alone would leave
-    /// them with nothing but `!menu`.
+    /// ended, a restart in the middle of a step), or when `stale`: the
+    /// screen shown may not be the one the flow is at. A note alone would
+    /// leave them with nothing but `!menu`, or with a screen that lies.
     fn with_screen(
         &self,
         conn: &Connection,
@@ -249,6 +337,7 @@ impl Engine {
         room_id: &str,
         now: DateTime<Utc>,
         mut msgs: Vec<Msg>,
+        stale: bool,
     ) -> Result<Vec<Msg>> {
         if msgs.iter().any(|m| m.live) {
             return Ok(msgs);
@@ -258,7 +347,12 @@ impl Engine {
             Some(event) => screen_alive(conn, room_id, event)?,
             None => false,
         };
-        if alive {
+        if alive && !stale {
+            return Ok(msgs);
+        }
+        // Survey-only mode: a screen only while answering a check-in; with
+        // none waiting, the chat stays quiet.
+        if self.survey && !session.as_ref().is_some_and(|s| in_checkin(&s.flow)) {
             return Ok(msgs);
         }
         let flow = match session {
@@ -283,15 +377,20 @@ impl Engine {
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
             .run(move |conn| {
+                if this.survey {
+                    let msgs = this.survey_home(conn, &who, &room_id, now, false)?;
+                    return finish(conn, &who.mxid, msgs);
+                }
                 this.forget(&who.mxid);
                 tidy(conn, &room_id)?;
                 save(conn, &who.mxid, &room_id, &Flow::default(), now)?;
-                Ok(vec![Msg::screen(this.render(
+                let msgs = vec![Msg::screen(this.render(
                     conn,
                     &who,
                     &Flow::default(),
                     now,
-                )?)])
+                )?)];
+                finish(conn, &who.mxid, msgs)
             })
             .await
     }
@@ -309,23 +408,42 @@ impl Engine {
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
             .run(move |conn| {
-                let flow = match load(conn, &who.mxid)? {
-                    Some(s)
-                        if s.room == room_id
-                            && !(s.flow.in_progress() && now - s.updated > ttl) =>
-                    {
-                        s.flow
-                    }
+                let session = load(conn, &who.mxid)?.filter(|s| s.room == room_id);
+                if this.survey {
+                    let msgs = match session {
+                        Some(s)
+                            if in_checkin(&s.flow)
+                                && !this.draft_over(conn, &s.flow, s.updated, now, ttl)? =>
+                        {
+                            vec![
+                                Msg::note(&screens::survey_help()),
+                                Msg::screen(this.render(conn, &who, &s.flow, now)?),
+                            ]
+                        }
+                        _ => match this.survey_home(conn, &who, &room_id, now, false)? {
+                            msgs if msgs.is_empty() => vec![Msg::note(screens::nothing_open())],
+                            msgs => {
+                                let mut out = vec![Msg::note(&screens::survey_help())];
+                                out.extend(msgs);
+                                out
+                            }
+                        },
+                    };
+                    return finish(conn, &who.mxid, msgs);
+                }
+                let flow = match session {
+                    Some(s) if !this.draft_over(conn, &s.flow, s.updated, now, ttl)? => s.flow,
                     _ => {
                         tidy(conn, &room_id)?;
                         save(conn, &who.mxid, &room_id, &Flow::default(), now)?;
                         Flow::default()
                     }
                 };
-                Ok(vec![
+                let msgs = vec![
                     Msg::note(&screens::help()),
                     Msg::screen(this.render(conn, &who, &flow, now)?),
-                ])
+                ];
+                finish(conn, &who.mxid, msgs)
             })
             .await
     }
@@ -345,7 +463,8 @@ impl Engine {
         self.db
             .run(move |conn| {
                 let msgs = this.start_run_sync(conn, &who, &room_id, run_id, now, ttl)?;
-                this.with_screen(conn, &who, &room_id, now, msgs)
+                let msgs = this.with_screen(conn, &who, &room_id, now, msgs, false)?;
+                finish(conn, &who.mxid, msgs)
             })
             .await
     }
@@ -367,14 +486,50 @@ impl Engine {
             .await
     }
 
-    pub async fn set_screen(&self, mxid: &str, event_id: &str) -> Result<()> {
+    /// The bot saw its own event showing `screen_event` (or an edit of it)
+    /// come back through sync: taps from here on were made with the view
+    /// in sight.
+    pub async fn screen_echoed(&self, room_id: &str, screen_event: &str) -> Result<()> {
+        {
+            let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+            memory.echoes.push_back(screen_event.to_owned());
+            while memory.echoes.len() > ECHOES {
+                memory.echoes.pop_front();
+            }
+        }
+        let (room_id, screen_event) = (room_id.to_owned(), screen_event.to_owned());
+        self.db
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET echoed = 1 WHERE room_id = ?1 AND screen_event_id = ?2",
+                    params![room_id, screen_event],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The screen `event_id` shows the saved flow now. `complete`: with all
+    /// its buttons; if not, it stays pending and is brought in line at the
+    /// next tap (or start).
+    pub async fn screen_shown(&self, mxid: &str, event_id: &str, complete: bool) -> Result<()> {
+        let echoed_already = self
+            .memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .echoes
+            .iter()
+            .any(|e| e == event_id);
         let (mxid, event_id) = (mxid.to_owned(), event_id.to_owned());
         self.db
             .run(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET screen_event_id = ?2 WHERE mxid = ?1",
-                    params![mxid, event_id],
+                    "UPDATE sessions SET screen_event_id = ?2, pending = ?3 WHERE mxid = ?1",
+                    params![mxid, event_id, !complete],
                 )?;
+                if echoed_already {
+                    conn.execute("UPDATE sessions SET echoed = 1 WHERE mxid = ?1", [&mxid])?;
+                }
                 Ok(())
             })
             .await
@@ -391,19 +546,18 @@ impl Engine {
         let this = self.clone();
         self.db
             .run(move |conn| {
-                let stale: Vec<(String, String, String)> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT mxid, room_id, flow FROM sessions WHERE updated_at < ?1",
-                    )?;
-                    let rows = stmt.query_map([time::to_text(now - ttl)], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                    })?;
+                let sessions: Vec<(String, String, String, String)> = {
+                    let mut stmt =
+                        conn.prepare("SELECT mxid, room_id, flow, updated_at FROM sessions")?;
+                    let rows =
+                        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
                     rows.collect::<rusqlite::Result<_>>()?
                 };
                 let mut out = Vec::new();
-                for (mxid, room_id, json) in stale {
+                for (mxid, room_id, json, updated) in sessions {
                     let flow: Flow = serde_json::from_str(&json).unwrap_or_default();
-                    if !flow.in_progress() {
+                    let updated = time::parse_text(&updated)?;
+                    if !this.draft_over(conn, &flow, updated, now, ttl)? {
                         continue;
                     }
                     this.forget(&mxid);
@@ -530,7 +684,226 @@ impl Engine {
             today: Some(today),
             prepared,
         };
-        Ok(screens::view(flow, &ctx))
+        let view = screens::view(flow, &ctx);
+        Ok(if self.survey && in_checkin(flow) {
+            screens::survey_view(view, flow.screen())
+        } else {
+            view
+        })
+    }
+
+    /// Whether an unfinished flow is to be thrown away: one older than
+    /// `ttl`. In survey-only mode a check-in waits for them until it
+    /// closes, however long they pause.
+    fn draft_over(
+        &self,
+        conn: &Connection,
+        flow: &Flow,
+        updated: DateTime<Utc>,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<bool> {
+        if !flow.in_progress() {
+            return Ok(false);
+        }
+        if let (true, Some(id)) = (self.survey, flow.run()) {
+            // Gone altogether counts as closed.
+            return Ok(checkins::run(conn, id).map_or(true, |run| !run.is_open(now)));
+        }
+        Ok(now - updated > ttl)
+    }
+
+    /// Survey-only mode: the check-in waiting for `who` (open, theirs, not
+    /// answered yet), the one closing first.
+    fn next_survey(&self, conn: &Connection, who: &Who, now: DateTime<Utc>) -> Result<Option<i64>> {
+        let floor = own_floor(conn, &who.mxid)?;
+        Ok(
+            checkins::listing(conn, &self.secrets, &who.mxid, &who.rooms, floor, now)?
+                .into_iter()
+                .find(|l| l.open && !l.completed)
+                .map(|l| l.id),
+        )
+    }
+
+    /// Survey-only mode: whether a check-in is waiting for `who`.
+    pub async fn has_survey_for(&self, who: &Who, now: DateTime<Utc>) -> Result<bool> {
+        let (this, who) = (self.clone(), who.clone());
+        self.db
+            .run(move |conn| Ok(this.next_survey(conn, &who, now)?.is_some()))
+            .await
+    }
+
+    /// Survey-only mode: check-in `run_id` from its intro, whatever was in
+    /// the chat before tidied away. Its flow is `[Menu, CheckinIntro]`: the
+    /// menu underneath is never shown (see [`flow::SURVEY_DEPTH`]).
+    fn begin_survey(
+        &self,
+        conn: &Connection,
+        who: &Who,
+        room_id: &str,
+        run_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Msg>> {
+        self.forget(&who.mxid);
+        tidy(conn, room_id)?;
+        let mut flow = Flow::default();
+        flow.draft.checkin = Some(CheckinDraft {
+            run: run_id,
+            answers: Default::default(),
+            identity: None,
+            ideas: Default::default(),
+        });
+        flow.push(Screen::CheckinIntro);
+        save(conn, &who.mxid, room_id, &flow, now)?;
+        Ok(vec![Msg::screen(self.render(conn, who, &flow, now)?)])
+    }
+
+    /// Survey-only mode, where residents are when not answering one: the
+    /// next check-in waiting for them, from its intro. With none, the chat
+    /// is tidied and stays quiet, or says so (`say_nothing`) when they
+    /// wrote something.
+    fn survey_home(
+        &self,
+        conn: &Connection,
+        who: &Who,
+        room_id: &str,
+        now: DateTime<Utc>,
+        say_nothing: bool,
+    ) -> Result<Vec<Msg>> {
+        if let Some(run_id) = self.next_survey(conn, who, now)? {
+            return self.begin_survey(conn, who, room_id, run_id, now);
+        }
+        self.forget(&who.mxid);
+        tidy(conn, room_id)?;
+        save(conn, &who.mxid, room_id, &Flow::default(), now)?;
+        // No screen: nothing to tap on any more.
+        conn.execute(
+            "UPDATE sessions SET screen_event_id = NULL, pending = 0, echoed = 1 WHERE mxid = ?1",
+            [&who.mxid],
+        )?;
+        Ok(if say_nothing {
+            vec![Msg::note(screens::nothing_open())]
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// Survey-only mode: what a check-in's notice or reminder puts into
+    /// `who`'s chat (they were checked to be asked and not done). `None`:
+    /// nothing now. Either they are answering another check-in (this one
+    /// comes up when that is done or closes), or the notice is on their
+    /// screen already.
+    ///
+    /// The notice is the check-in itself: its intro, a message of its own
+    /// (so it notifies). The reminder is a short note with the screen they
+    /// are on right below it, fresh at the bottom.
+    pub async fn survey_message(
+        &self,
+        who: &Who,
+        room_id: &str,
+        run_id: i64,
+        which: CheckinText,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Option<Vec<Msg>>> {
+        let this = self.clone();
+        let (who, room_id) = (who.clone(), room_id.to_owned());
+        self.db
+            .run(move |conn| {
+                let session = load(conn, &who.mxid)?.filter(|s| s.room == room_id);
+                let current = match session {
+                    Some(s)
+                        if in_checkin(&s.flow)
+                            && !this.draft_over(conn, &s.flow, s.updated, now, ttl)? =>
+                    {
+                        Some(s)
+                    }
+                    _ => None,
+                };
+                let run = checkins::run(conn, run_id)?;
+                // Answered (or closed) meanwhile: never asked again.
+                if !run.is_open(now) || checkins::completed(conn, &this.secrets, run_id, &who.mxid)?
+                {
+                    return Ok(None);
+                }
+                let reminder = || {
+                    let ctx = screens::Ctx {
+                        zone: Some(this.zone),
+                        today: Some(this.zone.date(now)),
+                        ..Default::default()
+                    };
+                    Msg::note(&screens::survey_reminder(&run, &ctx))
+                };
+                let msgs = match (current, which) {
+                    (_, CheckinText::Announcement) => return Ok(None),
+                    (Some(s), _) if s.flow.run() != Some(run_id) => return Ok(None),
+                    // Shown already; only re-sent if that never got through.
+                    (Some(s), CheckinText::Notice) if !s.pending => return Ok(None),
+                    (Some(s), CheckinText::Notice) => {
+                        vec![Msg::screen(this.render(conn, &who, &s.flow, now)?)]
+                    }
+                    (Some(s), CheckinText::Reminder) => vec![
+                        reminder(),
+                        Msg::screen(this.render(conn, &who, &s.flow, now)?),
+                    ],
+                    (None, CheckinText::Notice) => {
+                        this.begin_survey(conn, &who, &room_id, run_id, now)?
+                    }
+                    (None, CheckinText::Reminder) => {
+                        let mut msgs = vec![reminder()];
+                        msgs.extend(this.begin_survey(conn, &who, &room_id, run_id, now)?);
+                        msgs
+                    }
+                };
+                Ok(Some(finish(conn, &who.mxid, msgs)?))
+            })
+            .await
+    }
+
+    /// Survey-only mode, at startup: every chat not answering a check-in
+    /// loses what the full Kummerkasten left there (a menu, an unfinished
+    /// feedback draft, notes): tidied, its session dropped. Returns
+    /// `(room, receipt)` of deletion-code receipts that were the live
+    /// screen: the message stays (it holds their code), its buttons go.
+    pub async fn survey_cleanup(
+        &self,
+        now: DateTime<Utc>,
+        ttl: chrono::Duration,
+    ) -> Result<Vec<(String, String)>> {
+        let this = self.clone();
+        self.db
+            .run(move |conn| {
+                let sessions: Vec<(String, String, String, String, Option<String>)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT mxid, room_id, flow, updated_at, screen_event_id FROM sessions",
+                    )?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    })?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                let mut receipts = Vec::new();
+                for (mxid, room_id, json, updated, screen) in sessions {
+                    let flow: Flow = serde_json::from_str(&json).unwrap_or_default();
+                    let updated = time::parse_text(&updated)?;
+                    if in_checkin(&flow) && !this.draft_over(conn, &flow, updated, now, ttl)? {
+                        continue;
+                    }
+                    if let (Screen::CodeSaved, Some(receipt)) = (flow.screen(), screen) {
+                        // Its buttons only (tracked with `replaces`).
+                        conn.execute(
+                            "UPDATE dm_events SET doomed = 1 WHERE room_id = ?1 AND replaces = ?2",
+                            params![room_id, receipt],
+                        )?;
+                        receipts.push((room_id.clone(), receipt));
+                    }
+                    this.forget(&mxid);
+                    tidy(conn, &room_id)?;
+                    conn.execute("DELETE FROM sessions WHERE mxid = ?1", [&mxid])?;
+                }
+                Ok(receipts)
+            })
+            .await
     }
 
     /// What a results, ideas or sharing screen shows (through the privacy
@@ -648,6 +1021,11 @@ impl Engine {
         note: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<Msg>> {
+        if self.survey {
+            let mut msgs = vec![Msg::note(note)];
+            msgs.extend(self.survey_home(conn, who, room_id, now, false)?);
+            return Ok(msgs);
+        }
         self.forget(&who.mxid);
         tidy(conn, room_id)?;
         save(conn, &who.mxid, room_id, &Flow::default(), now)?;
@@ -669,14 +1047,40 @@ impl Engine {
         let mxid = who.mxid.as_str();
         let (mut flow, screen_event) = match load(conn, mxid)? {
             Some(session) if session.room == room_id => {
-                if session.flow.in_progress() && now - session.updated > ttl {
-                    // Stale: tidy up and start over, ignoring the input.
-                    return self.reset(conn, who, room_id, screens::expired(), now);
+                if self.draft_over(conn, &session.flow, session.updated, now, ttl)? {
+                    // Stale: tidy up and start over, ignoring the input. (In
+                    // survey-only mode only a check-in that closed meanwhile.)
+                    let note = match session.flow.run() {
+                        Some(_) if self.survey => Refused::Closed.message(),
+                        _ => screens::expired(),
+                    };
+                    return self.reset(conn, who, room_id, note, now);
+                }
+                if session.stale() && matches!(input, Input::Tap(_)) {
+                    // The chat may still show the view before this one (a
+                    // crash or a failed edit in between; the edit not yet
+                    // delivered when a second device tapped): a tap meant
+                    // for that view must not act on this one. Show this one.
+                    return Ok(vec![Msg::screen(self.render(
+                        conn,
+                        who,
+                        &session.flow,
+                        now,
+                    )?)]);
                 }
                 (session.flow, session.screen_event)
             }
             _ => (Flow::default(), None),
         };
+        if self.survey && !in_checkin(&flow) {
+            // Nothing being answered: a message brings up the check-in
+            // waiting for them (or says there is none); a tap on whatever
+            // is left over does nothing.
+            return match input {
+                Input::Text { .. } => self.survey_home(conn, who, room_id, now, true),
+                Input::Tap(_) => Ok(Vec::new()),
+            };
+        }
         let own_floor = own_floor(conn, mxid)?;
         // A check-in in progress: still open, and still meant for them?
         let run = match flow.run() {
@@ -699,13 +1103,33 @@ impl Engine {
         let (action, secret_event) = match input {
             Input::Tap(key) => match screens::resolve(&view, &key) {
                 Some(action) => (action, None),
-                None => return Ok(Vec::new()),
+                None => {
+                    // Not a button of this view. One the bot had put there
+                    // (an option retired meanwhile) is cleared by showing
+                    // the view again; anything else (a 🦄) is left alone.
+                    let was_button = match &screen_event {
+                        Some(event) => crate::store::screen_buttons(conn, room_id, event)?
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|(k, _)| screens::same_key(k, &key)),
+                        None => false,
+                    };
+                    return Ok(if was_button {
+                        vec![Msg::edit(view)]
+                    } else {
+                        Vec::new()
+                    });
+                }
             },
             Input::Text { body, event_id } => {
                 // A deletion code they type is a secret: off the screen now.
                 let secret = (flow.screen() == &Screen::ManageEnter).then_some(event_id);
+                // Survey-only mode has no ❌: "stop" or "cancel" is an
+                // answer there (or a hint on a button step), never a reset.
+                let typed =
+                    screens::typed(&view, &body).filter(|a| !(self.survey && *a == Action::Cancel));
                 if flow.wants_text(run.as_ref()) {
-                    match screens::typed(&view, &body) {
+                    match typed {
                         // "cancel"/"back" typed, but never on a text step
                         // where it might be the actual answer.
                         Some(a @ (Action::Back | Action::Cancel)) if body.trim().len() < 12 => {
@@ -715,10 +1139,7 @@ impl Engine {
                         _ => (Action::Text(body), secret),
                     }
                 } else {
-                    (
-                        screens::typed(&view, &body).unwrap_or(Action::Text(body)),
-                        secret,
-                    )
+                    (typed.unwrap_or(Action::Text(body)), secret)
                 }
             }
         };
@@ -739,6 +1160,7 @@ impl Engine {
             run: run.as_ref(),
             similar,
             pages,
+            survey: self.survey,
         };
         let mut out = Vec::new();
         match flow::apply_in(&mut flow, action, &step_env) {
@@ -877,6 +1299,12 @@ impl Engine {
                 }
             }
         }
+        if self.survey && !in_checkin(&flow) {
+            // Done (submitted): the receipt, then the next check-in waiting
+            // for them if there is one. Never a menu.
+            out.extend(self.survey_home(conn, who, room_id, now, false)?);
+            return Ok(out);
+        }
         save(conn, mxid, room_id, &flow, now)?;
         out.push(Msg::screen(self.render(conn, who, &flow, now)?));
         Ok(out)
@@ -893,10 +1321,22 @@ impl Engine {
     ) -> Result<Vec<Msg>> {
         let mxid = who.mxid.as_str();
         let session = load(conn, mxid)?.filter(|s| s.room == room_id);
-        // Already answering it: show where they are.
         if let Some(s) = &session {
-            if s.flow.run() == Some(run_id) && s.flow.in_progress() && now - s.updated <= ttl {
+            let open =
+                in_checkin(&s.flow) && !self.draft_over(conn, &s.flow, s.updated, now, ttl)?;
+            // Already answering it: show where they are.
+            if open && s.flow.run() == Some(run_id) {
                 return Ok(vec![Msg::screen(self.render(conn, who, &s.flow, now)?)]);
+            }
+            // Survey-only mode: one at a time, the half-done one first.
+            if open && self.survey {
+                if let Some(other) = s.flow.run() {
+                    let other = checkins::run(conn, other)?;
+                    return Ok(vec![
+                        Msg::note(&screens::finish_first(&other)),
+                        Msg::screen(self.render(conn, who, &s.flow, now)?),
+                    ]);
+                }
             }
         }
         let run = checkins::run(conn, run_id)?;
@@ -909,6 +1349,9 @@ impl Engine {
         }
         if checkins::completed(conn, &self.secrets, run_id, mxid)? {
             return Ok(vec![Msg::note(Refused::AlreadyAnswered.message())]);
+        }
+        if self.survey {
+            return self.begin_survey(conn, who, room_id, run_id, now);
         }
         self.forget(mxid);
         tidy(conn, room_id)?;
@@ -1156,6 +1599,18 @@ fn run_context(conn: &Connection, run: &Run, index: usize) -> Result<(Option<i64
     Ok((topic, problem))
 }
 
+/// The check-in `mxid`'s chat is answering, if any.
+pub fn session_run(conn: &Connection, mxid: &str) -> Result<Option<i64>> {
+    Ok(load(conn, mxid)?
+        .filter(|s| in_checkin(&s.flow))
+        .and_then(|s| s.flow.run()))
+}
+
+/// The flow is answering a check-in (somewhere past the menu).
+fn in_checkin(flow: &Flow) -> bool {
+    flow.run().is_some() && flow.in_progress()
+}
+
 /// Whether the screen `event_id` is still in the chat: tracked and not
 /// marked for redaction.
 fn screen_alive(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool> {
@@ -1169,13 +1624,9 @@ fn screen_alive(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool
         .is_some())
 }
 
-/// Mark one event in `room_id` for redaction.
+/// Mark one message in `room_id` for redaction, with its edits and buttons.
 fn doom(conn: &Connection, room_id: &str, event_id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE dm_events SET doomed = 1 WHERE room_id = ?1 AND event_id = ?2",
-        params![room_id, event_id],
-    )?;
-    Ok(())
+    crate::store::doom_event(conn, room_id, event_id).map(drop)
 }
 
 /// A submission `mxid` may manage right now: one they named, or one with
@@ -1200,22 +1651,55 @@ fn own_floor(conn: &Connection, mxid: &str) -> Result<Option<i64>> {
 }
 
 fn load(conn: &Connection, mxid: &str) -> Result<Option<Session>> {
-    let row: Option<(String, String, String, Option<String>)> = conn
+    let row: Option<(String, String, String, Option<String>, bool, bool)> = conn
         .query_row(
-            "SELECT flow, updated_at, room_id, screen_event_id FROM sessions WHERE mxid = ?1",
+            "SELECT flow, updated_at, room_id, screen_event_id, pending, echoed FROM sessions
+             WHERE mxid = ?1",
             [mxid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()?;
     Ok(match row {
-        Some((json, updated, room, screen_event)) => Some(Session {
+        Some((json, updated, room, screen_event, pending, echoed)) => Some(Session {
             flow: serde_json::from_str(&json).unwrap_or_default(),
             updated: time::parse_text(&updated)?,
             room,
             screen_event,
+            pending,
+            echoed,
         }),
         None => None,
     })
+}
+
+/// `msgs` as the answer to an interaction: when they hold a screen, the
+/// session is marked pending until `dm` confirms it was shown, and not
+/// echoed until the bot sees its own event showing it (same transaction as
+/// the flow it shows).
+fn finish(conn: &Connection, mxid: &str, msgs: Vec<Msg>) -> Result<Vec<Msg>> {
+    if msgs.iter().any(|m| m.live) {
+        conn.execute(
+            "UPDATE sessions SET pending = 1, echoed = 0 WHERE mxid = ?1",
+            [mxid],
+        )?;
+    }
+    Ok(msgs)
+}
+
+/// Chats whose screen is not confirmed as shown: `(mxid, room_id)`.
+pub fn pending_screens(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT mxid, room_id FROM sessions WHERE pending = 1")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn save(
@@ -1282,6 +1766,8 @@ mod tests {
         now: DateTime<Utc>,
         n: usize,
         who: Who,
+        /// The live screen's event, as `dm` would know it.
+        screen: Option<String>,
     }
 
     impl Chat {
@@ -1295,6 +1781,7 @@ mod tests {
                     mxid: ME.to_owned(),
                     rooms: vec![crate::checkins::tests::HOUSE.to_owned()],
                 },
+                screen: None,
             }
         }
 
@@ -1315,15 +1802,63 @@ mod tests {
             id
         }
 
+        /// As `dm::deliver` does: an edit confirms the screen it changes,
+        /// anything else is a new event, a live one becoming the screen.
         fn deliver(&mut self, msgs: Vec<Msg>) -> Vec<Msg> {
-            for m in msgs.iter().filter(|m| m.kind != Kind::Edit) {
-                let id = self.record(m.in_session());
+            for m in &msgs {
+                let id = match (m.kind, &self.screen) {
+                    (Kind::Edit, Some(screen)) => screen.clone(),
+                    _ => self.record(m.in_session()),
+                };
                 if m.live {
                     let e = self.engine.clone();
-                    tokio_block(e.set_screen(ME, &id)).unwrap();
+                    tokio_block(e.screen_shown(&self.who.mxid, &id, true)).unwrap();
+                    tokio_block(e.screen_echoed(ROOM, &id)).unwrap();
+                    self.screen = Some(id);
                 }
             }
             msgs
+        }
+
+        /// Like `deliver`, but the bot's own event hasn't come back through
+        /// sync yet (what the room sees before the edit arrives).
+        fn deliver_unechoed(&mut self, msgs: Vec<Msg>) -> Vec<Msg> {
+            for m in &msgs {
+                let id = match (m.kind, &self.screen) {
+                    (Kind::Edit, Some(screen)) => screen.clone(),
+                    _ => self.record(m.in_session()),
+                };
+                if m.live {
+                    let e = self.engine.clone();
+                    tokio_block(e.screen_shown(&self.who.mxid, &id, true)).unwrap();
+                    self.screen = Some(id);
+                }
+            }
+            msgs
+        }
+
+        fn echo(&self) {
+            let e = self.engine.clone();
+            tokio_block(e.screen_echoed(ROOM, self.screen.as_deref().unwrap())).unwrap();
+        }
+
+        /// A tap whose answer never reaches Matrix (a crash in between).
+        fn tap_undelivered(&mut self, key: &str) -> Vec<Msg> {
+            tokio_block(self.engine.handle(
+                &self.who,
+                ROOM,
+                Input::Tap(key.into()),
+                self.now,
+                ttl(),
+            ))
+            .unwrap()
+        }
+
+        fn pending(&self) -> bool {
+            self.count(&format!(
+                "SELECT pending FROM sessions WHERE mxid = '{}'",
+                self.who.mxid
+            )) == 1
         }
 
         fn tap(&mut self, key: &str) -> Vec<Msg> {
@@ -1618,6 +2153,517 @@ mod tests {
         .unwrap();
         assert!(out[0].text.contains("closed"), "{}", out[0].text);
         assert!(screen(&out).text.starts_with("📮 **Kummerkasten**"));
+    }
+
+    #[test]
+    fn a_screen_not_confirmed_as_shown_is_shown_again_before_a_tap_counts() {
+        let mut chat = Chat::new();
+        chat.menu();
+        assert!(!chat.pending());
+        // 📝 is handled, the flow is at the topics, but the chat never saw
+        // the topic list (the bot crashed before the edit).
+        let out = chat.tap_undelivered("📝");
+        assert!(screen(&out).text.contains("What is this about?"));
+        assert!(chat.pending());
+        // The person still sees the menu and taps 💡 (Ideas there, but a
+        // topic in the list they can't see): nothing is chosen, the topic
+        // list is shown instead.
+        let out = chat.tap("💡");
+        assert_eq!(out.len(), 1);
+        assert!(screen(&out).text.contains("What is this about?"));
+        assert_eq!(
+            chat.count(r#"SELECT count(*) FROM sessions WHERE flow LIKE '%"screen":"location"%'"#),
+            0
+        );
+        // Delivered now: taps count again.
+        assert!(!chat.pending());
+        let out = chat.tap("💡");
+        assert!(screen(&out).text.contains("📍 **Where?**"));
+        let out = chat.tap("⏭️");
+        assert!(screen(&out).text.contains("What's your idea"));
+        // ⬅️ handled but not shown: the chat still asks for the idea, the
+        // flow is back at the place. Their text is answered as the flow
+        // stands (a hint here), and the screen the flow is at comes along,
+        // so the chat stops lying.
+        chat.tap_undelivered("⬅️");
+        assert!(chat.pending());
+        let out = chat.say("A quiet hour after 22:00");
+        assert_eq!(out[0].kind, Kind::Note);
+        assert!(screen(&out).text.contains("📍 **Where?**"));
+        assert!(!chat.pending());
+        assert_eq!(chat.count("SELECT count(*) FROM submissions"), 0);
+    }
+
+    #[test]
+    fn a_tap_from_before_the_view_was_in_sight_only_shows_it_again() {
+        let mut chat = Chat::new();
+        chat.menu();
+        // 📝 handled and sent, but the edit hasn't come back through sync:
+        // whatever arrives before it was tapped on the menu.
+        let msgs = chat.tap_undelivered("📝");
+        chat.deliver_unechoed(msgs);
+        let out = chat.tap("💡");
+        assert_eq!(out.len(), 1);
+        assert!(screen(&out).text.contains("What is this about?"));
+        // The echo came (the re-show's, in the real room): taps act.
+        chat.echo();
+        let out = chat.tap("💡");
+        assert!(screen(&out).text.contains("📍 **Where?**"));
+    }
+
+    #[test]
+    fn a_button_retired_meanwhile_refreshes_the_screen_instead_of_acting() {
+        let mut chat = Chat::new();
+        chat.menu();
+        chat.tap("📝");
+        let screen_event = chat.screen.clone().unwrap();
+        // The bot's buttons under the topic list, as the ledger knows them.
+        chat.engine
+            .db
+            .with(|c| {
+                crate::store::set_screen_buttons(
+                    c,
+                    ROOM,
+                    &screen_event,
+                    &[("🧹".into(), "$r1".into()), ("🍳".into(), "$r2".into())],
+                )?;
+                crate::catalog::set_active(c, crate::catalog::Kind::Topic, "cleaning", false)
+            })
+            .unwrap();
+        // 🧹 is still under the message, but no longer a topic.
+        let out = chat.tap("🧹");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, Kind::Edit);
+        assert!(out[0].text.contains("What is this about?"));
+        assert!(!out[0].buttons.contains(&"🧹".to_owned()));
+        assert_eq!(
+            chat.count(r#"SELECT count(*) FROM sessions WHERE flow LIKE '%"screen":"location"%'"#),
+            0
+        );
+        // A reaction that never was a button does nothing at all.
+        let out = chat.tap("🦄");
+        assert!(out.is_empty(), "{:?}", out);
+    }
+
+    #[test]
+    fn pending_screens_are_listed_and_shown_again_at_start() {
+        let mut chat = Chat::new();
+        chat.menu();
+        chat.tap_undelivered("📝");
+        let listed = chat.engine.db.with(|c| pending_screens(c)).unwrap();
+        assert_eq!(listed, [(ME.to_owned(), ROOM.to_owned())]);
+        // What the chat should show: the same step, nothing else.
+        let out =
+            tokio_block(chat.engine.current_screen(&chat.who, ROOM, chat.now, ttl())).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(screen(&out).text.contains("What is this about?"));
+        chat.deliver(out);
+        assert!(chat
+            .engine
+            .db
+            .with(|c| pending_screens(c))
+            .unwrap()
+            .is_empty());
+        // A screen shown without all its buttons stays pending.
+        tokio_block(chat.engine.screen_shown(ME, "$e9", false)).unwrap();
+        assert!(chat.pending());
+        // An old unfinished draft isn't resumed at start: tidied, menu.
+        chat.now += chrono::Duration::hours(2);
+        let out =
+            tokio_block(chat.engine.current_screen(&chat.who, ROOM, chat.now, ttl())).unwrap();
+        assert_eq!(out[0].text, screens::expired());
+        assert!(screen(&out).text.starts_with("📮 **Kummerkasten**"));
+    }
+
+    // ── Survey-only mode ───────────────────────────────────────────────────
+
+    impl Chat {
+        fn survey() -> Self {
+            let mut chat = Chat::new();
+            chat.engine = chat.engine.clone().survey_only(true);
+            chat
+        }
+
+        /// The check-in's notice (or reminder) as the outbox would send it.
+        fn told(&mut self, run: i64, which: CheckinText) -> Vec<Msg> {
+            let msgs = tokio_block(self.engine.survey_message(
+                &self.who,
+                ROOM,
+                run,
+                which,
+                self.now,
+                ttl(),
+            ))
+            .unwrap();
+            match msgs {
+                Some(msgs) => self.deliver(msgs),
+                None => Vec::new(),
+            }
+        }
+    }
+
+    fn keys(msg: &Msg) -> Vec<&str> {
+        msg.buttons.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_survey_is_a_message_answered_step_by_step_and_then_done() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        // The notice is the check-in itself: no menu, no introduction.
+        let intro = chat.told(run.id, CheckinText::Notice);
+        assert_eq!(intro.len(), 1);
+        assert!(
+            intro[0].text.contains("Cleaning check-in"),
+            "{}",
+            intro[0].text
+        );
+        assert!(intro[0].text.contains("🔐 Just you and me here"));
+        // …above ▶️ Start, the last line.
+        assert!(
+            intro[0].text.ends_with("tap ✅.\n\n▶️ **Start**"),
+            "{}",
+            intro[0].text
+        );
+        assert_eq!(keys(&intro[0]), ["▶️"]);
+        assert!(!intro[0].text.contains("Cancel"));
+        // Questions: answers, ⬅️ and (optional ones) ⏭️, never ❌.
+        let q1 = chat.tap("▶️");
+        assert!(screen(&q1).text.contains("1/3"));
+        assert!(keys(screen(&q1)).contains(&"⬅️"));
+        assert!(!keys(screen(&q1)).contains(&"❌"));
+        assert!(screen(&q1).text.contains("⬅️ Back") && !screen(&q1).text.contains("Cancel"));
+        let q2 = chat.tap("😐");
+        assert!(screen(&q2).text.contains("2/3"));
+        let ticked = chat.tap("🙋");
+        assert_eq!(ticked[0].kind, Kind::Edit);
+        let q3 = chat.tap("➡️");
+        assert!(screen(&q3).text.contains("What would you change?"));
+        // No offer to share it as an idea: straight on.
+        let identity = chat.say("Fewer, clearer tasks per person.");
+        assert!(
+            screen(&identity).text.contains("submit your answers"),
+            "{}",
+            screen(&identity).text
+        );
+        let preview = chat.tap("🥷");
+        assert!(screen(&preview).text.contains("📊 **Ready to submit**"));
+        assert_eq!(keys(screen(&preview)), ["✅", "⬅️"]);
+        // ✅: the short receipt and nothing else (no menu).
+        let done = chat.tap("✅");
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].kind, Kind::Receipt);
+        assert!(done[0]
+            .text
+            .contains("Thanks! Your answers were submitted."));
+        assert_eq!(
+            chat.count("SELECT count(*) FROM responses WHERE identity = 'anonymous' AND respondent_mxid IS NULL"),
+            1
+        );
+        assert_eq!(chat.count("SELECT count(*) FROM ideas"), 0);
+        // Afterwards: a message gets a short word, taps do nothing.
+        let later = chat.say("hello?");
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].text, screens::nothing_open());
+        assert!(chat.tap("📝").is_empty());
+        assert!(chat.tap("✅").is_empty());
+        // Never asked again: no notice, no reminder, 📊 says so.
+        assert!(chat.told(run.id, CheckinText::Notice).is_empty());
+        assert!(chat.told(run.id, CheckinText::Reminder).is_empty());
+        let again = tokio_block(
+            chat.engine
+                .start_run(&chat.who, ROOM, run.id, chat.now, ttl()),
+        )
+        .unwrap();
+        assert_eq!(again.len(), 1);
+        assert!(again[0].text.contains("already answered"));
+        assert_eq!(chat.count("SELECT count(*) FROM responses"), 1);
+    }
+
+    #[test]
+    fn an_anonymous_only_survey_says_so_and_skips_the_choice() {
+        let mut chat = Chat::survey();
+        let run = with_run(
+            &mut chat,
+            crate::checkins::StartOptions {
+                identities: vec![crate::submissions::Identity::Anonymous],
+                ..Default::default()
+            },
+        );
+        let intro = chat.told(run.id, CheckinText::Notice);
+        assert!(intro[0]
+            .text
+            .contains("🥷 Anonymous: your answers aren't stored"));
+        assert!(!intro[0].text.contains("you choose"));
+        chat.tap("▶️");
+        chat.tap("😐");
+        chat.tap("➡️");
+        // Straight from the last question to the preview: nothing to choose.
+        let preview = chat.tap("⏭️");
+        assert!(screen(&preview).text.contains("📊 **Ready to submit**"));
+        assert!(screen(&preview).text.contains("🥷 Anonymous"));
+    }
+
+    #[test]
+    fn back_skip_and_typed_words_behave_in_a_survey() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        chat.told(run.id, CheckinText::Notice);
+        // ⬅️ on the intro (typed: there is no button) stays on the intro.
+        let intro = chat.say("back");
+        assert!(screen(&intro).text.contains("questions"), "{intro:?}");
+        chat.tap("▶️");
+        chat.tap("🙂");
+        // Typed "back" goes to question 1, the answer still there.
+        let q1 = chat.say("back");
+        assert!(screen(&q1).text.contains("Your answer so far: 🙂 4"));
+        // "cancel" / "stop" on a button step is no reset: a hint.
+        let hint = chat.say("stop");
+        assert_eq!(hint[0].kind, Kind::Note);
+        assert!(hint[0].text.contains("Tap one of the buttons"));
+        assert!(chat.count("SELECT count(*) FROM sessions WHERE flow LIKE '%\"value\":4%'") == 1);
+        // On a written step it is the answer.
+        chat.tap("🙂");
+        chat.tap("⏭️");
+        let identity = chat.say("stop");
+        assert!(screen(&identity).text.contains("submit your answers"));
+        let preview = chat.tap("🥷");
+        assert!(screen(&preview).text.contains("“stop”"));
+        assert!(screen(&preview).text.contains("⏭️ skipped"));
+    }
+
+    #[test]
+    fn a_paused_survey_waits_until_it_closes() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        chat.told(run.id, CheckinText::Notice);
+        chat.tap("▶️");
+        chat.tap("😄");
+        // Two days later (far past the draft timeout) it carries on.
+        chat.now += chrono::Duration::days(2);
+        assert!(chat.now < run.closes_at);
+        assert!(tokio_block(chat.engine.expire(chat.now, ttl()))
+            .unwrap()
+            .is_empty());
+        let q2 = chat.tap("➡️");
+        assert!(screen(&q2).text.contains("3/3"), "{}", screen(&q2).text);
+        // `!menu` / restart: the same step again.
+        let again =
+            tokio_block(chat.engine.current_screen(&chat.who, ROOM, chat.now, ttl())).unwrap();
+        assert!(screen(&again).text.contains("3/3"));
+        // A reminder: a note, the step they're on right below.
+        let reminder = chat.told(run.id, CheckinText::Reminder);
+        assert_eq!(reminder.len(), 2);
+        assert!(reminder[0].text.contains("Quick reminder"));
+        assert!(screen(&reminder).text.contains("3/3"));
+        // Closed: the draft goes; a tap says so, without a menu.
+        chat.now = run.closes_at + chrono::Duration::minutes(1);
+        let closed = chat.tap("⏭️");
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert!(closed[0].text.contains("closed"));
+        assert_eq!(chat.count("SELECT count(*) FROM responses"), 0);
+        assert_eq!(
+            chat.count(r#"SELECT count(*) FROM sessions WHERE flow LIKE '%"checkin":{%'"#),
+            0
+        );
+    }
+
+    #[test]
+    fn the_scheduler_tidies_a_survey_that_closed_unanswered() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        chat.told(run.id, CheckinText::Notice);
+        chat.tap("▶️");
+        let later = run.closes_at + chrono::Duration::minutes(1);
+        let swept = tokio_block(chat.engine.expire(later, ttl())).unwrap();
+        assert_eq!(swept, [(ME.to_owned(), ROOM.to_owned())]);
+        // What follows is the next survey, or (none) nothing at all.
+        let next = tokio_block(chat.engine.fresh_menu(&chat.who, ROOM, later)).unwrap();
+        assert!(next.is_empty(), "{next:?}");
+        assert_eq!(
+            chat.count("SELECT count(*) FROM dm_events WHERE doomed = 0 AND in_session = 1"),
+            0
+        );
+    }
+
+    #[test]
+    fn one_survey_at_a_time_the_next_comes_after() {
+        let mut chat = Chat::survey();
+        let first = with_run(&mut chat, Default::default());
+        let second = with_run(&mut chat, Default::default());
+        chat.told(first.id, CheckinText::Notice);
+        chat.tap("▶️");
+        // The second one's notice waits while the first is half done…
+        assert!(chat.told(second.id, CheckinText::Notice).is_empty());
+        // …and 📊 on an old notice of it points back to the first.
+        let busy = chat.deliver(
+            tokio_block(
+                chat.engine
+                    .start_run(&chat.who, ROOM, second.id, chat.now, ttl()),
+            )
+            .unwrap(),
+        );
+        assert!(busy[0].text.contains("First the"));
+        assert!(screen(&busy).text.contains("1/3"));
+        chat.tap("😐");
+        chat.tap("➡️");
+        chat.tap("⏭️");
+        chat.tap("🥷");
+        // Done with the first: its receipt, then the second, from its intro.
+        let done = chat.tap("✅");
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done[0].kind, Kind::Receipt);
+        assert!(screen(&done).text.contains("questions"));
+        assert_eq!(keys(screen(&done)), ["▶️"]);
+        let q1 = chat.tap("▶️");
+        assert!(screen(&q1).text.contains("1/3"));
+    }
+
+    #[test]
+    fn writing_while_idle_brings_up_a_waiting_survey() {
+        let mut chat = Chat::survey();
+        assert_eq!(chat.say("hi")[0].text, screens::nothing_open());
+        with_run(&mut chat, Default::default());
+        // Missed the notice (no chat back then): a message brings it up.
+        let out = chat.say("hi");
+        assert_eq!(out.len(), 1);
+        assert_eq!(keys(screen(&out)), ["▶️"]);
+        // `!help` there: the short survey help and the same step.
+        let help =
+            chat.deliver(tokio_block(chat.engine.help(&chat.who, ROOM, chat.now, ttl())).unwrap());
+        assert!(help[0].text.contains("How this works"));
+        assert!(!help[0].text.contains("!menu"));
+        assert_eq!(keys(screen(&help)), ["▶️"]);
+    }
+
+    #[test]
+    fn switching_to_survey_only_clears_what_the_full_bot_left() {
+        let mut chat = Chat::new();
+        chat.menu();
+        chat.tap("📝");
+        chat.tap("🧹");
+        // Restarted in survey-only mode.
+        chat.engine = chat.engine.clone().survey_only(true);
+        let receipts = tokio_block(chat.engine.survey_cleanup(chat.now, ttl())).unwrap();
+        assert!(receipts.is_empty());
+        assert_eq!(chat.count("SELECT count(*) FROM sessions"), 0);
+        assert_eq!(
+            chat.count("SELECT count(*) FROM dm_events WHERE doomed = 0 AND in_session = 1"),
+            0
+        );
+        // A tap on the old menu does nothing now.
+        assert!(chat.tap("📝").is_empty());
+        // A deletion code's receipt stays; its buttons go.
+        let mut full = Chat::new();
+        share(&mut full, "🥷", "♾️");
+        let receipt = full.screen.clone().unwrap();
+        full.engine
+            .db
+            .with(|c| crate::store::record_button(c, ROOM, "$btn", &receipt, false))
+            .unwrap();
+        full.engine = full.engine.clone().survey_only(true);
+        let receipts = tokio_block(full.engine.survey_cleanup(full.now, ttl())).unwrap();
+        assert_eq!(receipts, [(ROOM.to_owned(), receipt.clone())]);
+        assert_eq!(
+            full.count(&format!(
+                "SELECT doomed FROM dm_events WHERE event_id = '{receipt}'"
+            )),
+            0
+        );
+        assert_eq!(
+            full.count("SELECT doomed FROM dm_events WHERE event_id = '$btn'"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_survey_in_progress_survives_the_switch_and_a_restart() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        chat.told(run.id, CheckinText::Notice);
+        chat.tap("▶️");
+        chat.tap("🙂");
+        assert!(tokio_block(chat.engine.survey_cleanup(chat.now, ttl()))
+            .unwrap()
+            .is_empty());
+        chat.engine = Engine::new(
+            chat.engine.db.clone(),
+            Secrets::from_master(&[5; 32]),
+            chat.engine.zone,
+        )
+        .survey_only(true);
+        let q2 = chat.tap("➡️");
+        assert!(screen(&q2).text.contains("3/3"));
+    }
+
+    #[test]
+    fn results_show_numbers_and_sorted_words_only_once_closed() {
+        let mut chat = Chat::survey();
+        let run = with_run(&mut chat, Default::default());
+        for (who, face, text) in [
+            ("@alice:example.org", "😐", "Zebra stripes on the bins"),
+            ("@bob:example.org", "😄", "a clearer plan"),
+        ] {
+            if who != ME {
+                chat.engine
+                    .db
+                    .with(|c| {
+                        c.execute(
+                            "INSERT OR IGNORE INTO residents (mxid, created_at) VALUES (?1, 'x')",
+                            [who],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            chat.who.mxid = who.into();
+            chat.screen = None;
+            chat.told(run.id, CheckinText::Notice);
+            chat.tap("▶️");
+            chat.tap(face);
+            chat.tap("🙋");
+            chat.tap("➡️");
+            chat.say(text);
+            chat.tap("🥷");
+            chat.tap("✅");
+        }
+        let (k, zone, id, now) = (2, chat.engine.zone, run.id, chat.now);
+        let open = chat
+            .engine
+            .db
+            .with(|c| crate::run_results::render(c, id, k, zone, now))
+            .unwrap();
+        assert!(open.contains("2 answered"), "{open}");
+        assert!(open.contains("once it has closed"));
+        assert!(!open.contains("Zebra"));
+        chat.engine
+            .db
+            .with(|c| crate::checkins::close(c, id, now).map(drop))
+            .unwrap();
+        let closed = chat
+            .engine
+            .db
+            .with(|c| crate::run_results::render(c, id, k, zone, now))
+            .unwrap();
+        assert!(closed.contains("⌀ **4.0**"), "{closed}");
+        assert!(
+            closed.contains("🙋 Cleaning turns are skipped: 2×"),
+            "{closed}"
+        );
+        let (a, z) = (
+            closed.find("a clearer plan").unwrap(),
+            closed.find("Zebra stripes").unwrap(),
+        );
+        assert!(a < z, "sorted");
+        assert!(!closed.contains("alice") && !closed.contains("bob"));
+        // Below the threshold: nothing but the count.
+        let few = chat
+            .engine
+            .db
+            .with(|c| crate::run_results::render(c, id, 3, zone, now))
+            .unwrap();
+        assert!(few.contains("Fewer than 3 answers"));
+        assert!(!few.contains("⌀"));
     }
 
     #[test]

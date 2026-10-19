@@ -241,6 +241,33 @@ pub fn record_edit(conn: &Connection, room_id: &str, event_id: &str, replaces: &
     Ok(())
 }
 
+/// Track one of the bot's button reactions under `screen`: like an edit it
+/// is no message of its own (`replaces`), it goes when the screen goes, and
+/// it is redacted with it.
+pub fn record_button(
+    conn: &Connection,
+    room_id: &str,
+    reaction: &str,
+    screen: &str,
+    in_session: bool,
+) -> Result<()> {
+    record_event(conn, room_id, reaction, in_session)?;
+    conn.execute(
+        "UPDATE dm_events SET replaces = ?3 WHERE room_id = ?1 AND event_id = ?2",
+        params![room_id, reaction, screen],
+    )?;
+    Ok(())
+}
+
+/// Mark `event_id` for redaction, with its edits and buttons.
+pub fn doom_event(conn: &Connection, room_id: &str, event_id: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE dm_events SET doomed = 1
+         WHERE room_id = ?1 AND (event_id = ?2 OR replaces = ?2)",
+        params![room_id, event_id],
+    )?)
+}
+
 /// Events marked for redaction and due: `(room_id, event_id, attempts)`.
 pub fn doomed(conn: &Connection, limit: usize) -> Result<Vec<(String, String, i64)>> {
     let mut stmt = conn.prepare(
@@ -527,6 +554,9 @@ mod tests {
         set_screen_buttons(&conn, "!a:x", "$receipt", &[]).unwrap();
         assert!(!editable("$receipt"));
         assert_eq!(replace_screen(&conn, "!a:x", "$receipt").unwrap(), 0);
+        // Its buttons go with it when it is removed on request.
+        record_button(&conn, "!a:x", "$r_ok", "$receipt", false).unwrap();
+        assert_eq!(doom_event(&conn, "!a:x", "$receipt").unwrap(), 2);
         // A doomed screen isn't edited either.
         record_event(&conn, "!a:x", "$s2", true).unwrap();
         set_screen_buttons(&conn, "!a:x", "$s2", &[]).unwrap();
@@ -536,6 +566,31 @@ mod tests {
         // Forgetting it drops its buttons.
         forget_event(&conn, "!a:x", "$s2").unwrap();
         assert!(screen_buttons(&conn, "!a:x", "$s2").unwrap().is_none());
+    }
+
+    #[test]
+    fn buttons_are_tracked_with_their_screen_and_go_with_it() {
+        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let editable = |e: &str| screen_is_editable(&conn, "!a:x", e).unwrap();
+        record_event(&conn, "!a:x", "$screen", true).unwrap();
+        set_screen_buttons(&conn, "!a:x", "$screen", &[("📝".into(), "$r1".into())]).unwrap();
+        record_button(&conn, "!a:x", "$r1", "$screen", true).unwrap();
+        record_button(&conn, "!a:x", "$r2", "$screen", true).unwrap();
+        // Buttons don't make the screen "not the last message".
+        assert!(editable("$screen"));
+        // Replacing the screen dooms its buttons too…
+        assert_eq!(replace_screen(&conn, "!a:x", "$screen").unwrap(), 3);
+        let mut doomed: Vec<String> = doomed(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e, _)| e)
+            .collect();
+        doomed.sort();
+        assert_eq!(doomed, ["$r1", "$r2", "$screen"]);
+        // …and so does the end of the flow (in_session).
+        record_event(&conn, "!b:x", "$s", true).unwrap();
+        record_button(&conn, "!b:x", "$b", "$s", true).unwrap();
+        assert_eq!(crate::engine::tidy(&conn, "!b:x").unwrap(), 2);
     }
 
     #[test]

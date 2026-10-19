@@ -279,7 +279,7 @@ impl Builder {
     /// ⬅️ Back · ❌ Cancel, under every screen but the menu.
     fn nav(&mut self) -> View {
         self.gap();
-        self.lines.push(format!("{BACK} Back · {CANCEL} Cancel"));
+        self.lines.push(nav_line());
         self.buttons.push((BACK.to_owned(), Action::Back));
         self.buttons.push((CANCEL.to_owned(), Action::Cancel));
         self.done()
@@ -291,6 +291,85 @@ impl Builder {
             buttons: std::mem::take(&mut self.buttons),
         }
     }
+}
+
+/// The navigation line [`Builder::nav`] puts under a screen.
+fn nav_line() -> String {
+    format!("{BACK} Back · {CANCEL} Cancel")
+}
+
+/// A check-in screen as survey-only mode shows it: no ❌ Cancel (stopping
+/// is simply not answering; the answers so far wait until it closes), and
+/// on the intro no navigation at all (there is nothing before it). A
+/// privacy line on the intro, which is the first thing they see.
+pub fn survey_view(mut view: View, screen: &Screen) -> View {
+    let intro = matches!(screen, Screen::CheckinIntro);
+    view.buttons
+        .retain(|(key, _)| !same_key(key, CANCEL) && !(intro && same_key(key, BACK)));
+    let nav = nav_line();
+    view.text = if intro {
+        // The privacy line just above ▶️ Start (after the gap before it).
+        let mut lines: Vec<String> = view
+            .text
+            .replace(&format!("\n\n{nav}"), "")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let start = lines
+            .iter()
+            .rposition(|l| l.starts_with(BEGIN))
+            .unwrap_or(lines.len());
+        let at = if start > 0 && lines[start - 1].is_empty() {
+            start - 1
+        } else {
+            start
+        };
+        lines.insert(at, SURVEY_PRIVACY.to_owned());
+        lines.join("\n")
+    } else {
+        view.text.replace(&nav, &format!("{BACK} Back"))
+    };
+    view
+}
+
+/// On a check-in's intro in survey-only mode, the first thing they read.
+const SURVEY_PRIVACY: &str = "🔐 Just you and me here. Nothing is stored before you tap ✅.";
+
+/// `!help` in survey-only mode.
+pub fn survey_help() -> String {
+    "❓ **How this works**\n\n\
+     • Tap an emoji under my message to answer. Where the choices are numbered, \
+     you can also type the number.\n\
+     • ✍️ When I ask you to write, just send a message.\n\
+     • ⬅️ goes back to the question before. Nothing is stored before you tap ✅.\n\
+     • ⏸️ No time? Just stop. Your answers wait here until the check-in closes."
+        .to_owned()
+}
+
+/// The reminder in survey-only mode: the screen they are on comes right
+/// below it.
+pub fn survey_reminder(run: &Run, ctx: &Ctx) -> String {
+    format!(
+        "🔔 **Quick reminder**\n\nThe {} {} check-in is open until {}. It takes {}. 🌱",
+        run.emoji,
+        crate::markup::literal(&run.title),
+        ctx.day(run.closes_at),
+        run.duration_hint()
+    )
+}
+
+/// Survey-only mode, a message while no check-in is waiting for them.
+pub fn nothing_open() -> &'static str {
+    "🌱 Nothing to answer right now. I'll message you when the next check-in starts."
+}
+
+/// Survey-only mode: 📊 on another check-in while one is half done.
+pub fn finish_first(run: &Run) -> String {
+    format!(
+        "👉 First the {} {} check-in you started, then this one comes up.",
+        run.emoji,
+        crate::markup::literal(&run.title)
+    )
 }
 
 /// `(button key, line, action)` per option; no key beyond ten numbers.
@@ -577,8 +656,14 @@ pub fn view(flow: &Flow, ctx: &Ctx) -> View {
                 if run.plenum_id.is_some() {
                     b.line("🗣️ For the next plenum");
                 }
-                b.line("👀 At the end you choose how to submit, anonymously if you like.")
-                    .gap();
+                b.line(match run.identities.as_slice() {
+                    [Identity::Anonymous] => {
+                        "🥷 Anonymous: your answers aren't stored with your account."
+                    }
+                    [_] => "👀 How your answers are stored is shown before you submit.",
+                    _ => "👀 At the end you choose how to submit, anonymously if you like.",
+                })
+                .gap();
                 b.button(BEGIN, "**Start**", Action::Begin);
                 b.nav()
             }

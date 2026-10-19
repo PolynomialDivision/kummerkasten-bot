@@ -114,6 +114,10 @@ pub async fn run(kk: &Kk, sender: &OwnedUserId, body: &str) -> String {
     if let [command] = commands.as_slice() {
         return match dispatch(kk, sender, command).await {
             Ok(reply) => reply,
+            Err(error) if error.is::<Unknown>() && kk.engine.is_survey() => format!(
+                "🤔 I don't know that one.\n\n{}",
+                crate::admin_checkins::SURVEY_HELP
+            ),
             Err(error) if error.is::<Unknown>() => format!("🤔 I don't know that one.\n\n{HELP}"),
             Err(error) => format!("😕 {error:#}"),
         };
@@ -150,10 +154,16 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
     let zone = kk.engine.zone;
     let now = Utc::now();
     match args.as_slice() {
-        [] | ["help"] => Ok(format!(
+        [] | ["help"] if kk.engine.is_survey() => Ok(crate::admin_checkins::SURVEY_HELP.to_owned()),
+        [] | ["help"] | ["help", "all"] => Ok(format!(
             "{HELP}\n\n{}\n\n{}",
             crate::admin_checkins::HELP,
             crate::admin_results::HELP
+        )),
+        ["entry", _] | ["invite-all"] if kk.engine.is_survey() => Err(anyhow::anyhow!(
+            "📊 Survey-only mode: there's nothing for residents to open. Their chat opens by \
+             itself when a check-in starts for them. (`ui = \"full\"` in the config brings the \
+             rest of the Kummerkasten back.)"
         )),
         ["rooms"] => {
             let rooms = kk.engine.db.run(|c| store::authorized_rooms(c)).await?;
@@ -419,7 +429,8 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )?;
                     let stuck = store::stuck_redactions(c)?;
-                    let pending = crate::outbox::waiting(c)?;
+                    let (pending, stuck_out) = crate::outbox::waiting(c)?;
+                    let unshown = crate::engine::pending_screens(c)?.len();
                     let mut out = format!(
                         "🌱 **Round #{}** · for plenum #{} on {}\n💬 {total} submission(s), \
                          {delete_after} to be deleted after it",
@@ -435,6 +446,16 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                     }
                     if pending > 0 {
                         out.push_str(&format!("\n📤 {pending} message(s) waiting to go out"));
+                        if stuck_out > 0 {
+                            out.push_str(&format!(
+                                ", {stuck_out} of them failing for hours (I keep trying; the log says why)"
+                            ));
+                        }
+                    }
+                    if unshown > 0 {
+                        out.push_str(&format!(
+                            "\n🖥️ {unshown} chat screen(s) not confirmed as shown; re-shown at the next tap or start"
+                        ));
                     }
                     Ok(out)
                 })

@@ -44,7 +44,10 @@ pub async fn run(kk: Kk) {
 
 async fn tick(kk: &Kk) {
     plenum_clock(kk).await;
-    summary_clock(kk).await;
+    // Survey-only mode: no plenum summaries (they invite to 📈 and 💡).
+    if !kk.engine.is_survey() {
+        summary_clock(kk).await;
+    }
     checkin_clock(kk).await;
     outbox_clock(kk).await;
     expire_drafts(kk).await;
@@ -211,7 +214,7 @@ async fn outbox_clock(kk: &Kk) {
         match saved {
             Ok(true) => tracing::warn!(
                 kind = item.kind.as_str(),
-                "Gave up a message after many tries"
+                "A message keeps failing to send; trying again every few hours"
             ),
             Ok(false) => {}
             Err(error) => tracing::error!(%error, "Could not update the outbox"),
@@ -462,7 +465,13 @@ async fn expire_drafts(kk: &Kk) {
         let Some(who) = kk.who(&user).await else {
             continue;
         };
-        let mut msgs = vec![Msg::note(screens::expired())];
+        // Survey-only mode: a check-in that closed unanswered just goes
+        // (tidied away); the next one waiting comes up, if any.
+        let mut msgs = if kk.engine.is_survey() {
+            Vec::new()
+        } else {
+            vec![Msg::note(screens::expired())]
+        };
         match kk.engine.fresh_menu(&who, &room_id, Utc::now()).await {
             Ok(menu) => msgs.extend(menu),
             Err(error) => tracing::error!(%error, "No fresh menu after expiry"),
@@ -607,7 +616,13 @@ async fn post_notices(kk: &Kk) {
         if !kk.chat_is_private(&room, &user).await {
             continue;
         }
-        let mut msgs = vec![Msg::receipt(screens::round_cleared())];
+        // Survey-only mode: cleared quietly; a check-in still waiting for
+        // them comes up again.
+        let mut msgs = if kk.engine.is_survey() {
+            Vec::new()
+        } else {
+            vec![Msg::receipt(screens::round_cleared())]
+        };
         match kk
             .engine
             .fresh_menu(&who, room.room_id().as_str(), Utc::now())

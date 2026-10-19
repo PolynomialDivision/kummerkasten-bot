@@ -10,19 +10,23 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use mxbot_common::{
     matrix_sdk::{
+        self,
         deserialized_responses::EncryptionInfo,
+        room::{IncludeRelations, RelationsOptions},
         ruma::{
+            api::error::ErrorKind,
             events::{
-                reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-                relation::Annotation,
+                reaction::{OriginalSyncReactionEvent, ReactionEventContent, SyncReactionEvent},
+                relation::{Annotation, RelationType},
                 room::{
                     member::{MembershipState, OriginalSyncRoomMemberEvent},
                     message::{
                         MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
                     },
                 },
+                AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             },
-            OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId, TransactionId, UserId,
+            OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId, TransactionId, UInt, UserId,
         },
         Client, Room, RoomState,
     },
@@ -153,29 +157,57 @@ impl Kk {
 /// own; a receipt with buttons (the deletion code) becomes the screen but
 /// is never edited.
 pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
+    deliver_txn(kk, room, mxid, msgs, None).await;
+}
+
+/// [`deliver`], the first new message sent with `txn` (the outbox's, so a
+/// retry after a crash isn't posted twice). Returns whether that first
+/// message went out (nothing to send counts as out).
+pub async fn deliver_txn(
+    kk: &Kk,
+    room: &Room,
+    mxid: &str,
+    msgs: Vec<Msg>,
+    mut txn: Option<&TransactionId>,
+) -> bool {
+    let mut first = None;
     for msg in msgs {
         if msg.live && msg.kind != Kind::Receipt {
-            show_screen(kk, room, mxid, &msg).await;
+            let shown = show_screen(kk, room, mxid, &msg, txn.take()).await;
+            first.get_or_insert(shown);
             continue;
         }
-        let event_id = match send_with_retry(room, markup::notice(&msg.text)).await {
+        let content = markup::notice(&msg.text);
+        let sent = match txn.take() {
+            Some(txn) => send_with_retry_txn(room, content, txn).await,
+            None => send_with_retry(room, content).await,
+        };
+        let event_id = match sent {
             Ok(id) => id,
             Err(error) => {
                 // Carry on: a screen after a lost note is what keeps the
                 // chat usable; the flow has moved on already.
                 tracing::warn!(%error, "Could not send to a Kummerkasten chat");
+                first.get_or_insert(false);
                 continue;
             }
         };
+        first.get_or_insert(true);
         record(kk, room, &event_id, msg.in_session()).await;
         if msg.live {
             // The code receipt: its buttons work, it isn't edited.
-            if let Err(error) = kk.engine.set_screen(mxid, event_id.as_str()).await {
+            let buttons = add_buttons(kk, room, &event_id, &msg.buttons, false).await;
+            let complete = buttons.len() == msg.buttons.len();
+            if let Err(error) = kk
+                .engine
+                .screen_shown(mxid, event_id.as_str(), complete)
+                .await
+            {
                 tracing::error!(%error, "Could not remember the live screen");
             }
-            add_buttons(room, &event_id, &msg.buttons).await;
         }
     }
+    first.unwrap_or(true)
 }
 
 /// Said when handling a tap or message failed on the bot's side. Nothing
@@ -183,8 +215,14 @@ pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
 const SORRY: &str = "😕 Something went wrong on my side. Please try that again, or send `!menu`.";
 
 /// Show `msg` as the chat's screen: edit the current one, or send a fresh
-/// one.
-async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
+/// one (with `txn` if given). Returns whether it is shown.
+async fn show_screen(
+    kk: &Kk,
+    room: &Room,
+    mxid: &str,
+    msg: &Msg,
+    txn: Option<&TransactionId>,
+) -> bool {
     let room_id = room.room_id().to_string();
     let current = kk
         .engine
@@ -204,7 +242,12 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
             .unwrap_or(false);
         if editable {
             match edit_screen(kk, room, event, msg).await {
-                Ok(()) => return,
+                Ok(complete) => {
+                    if let Err(error) = kk.engine.screen_shown(mxid, event, complete).await {
+                        tracing::error!(%error, "Could not confirm the screen");
+                    }
+                    return true;
+                }
                 // Gone, or the server refused: a fresh screen instead, so
                 // nobody is left with a dead one.
                 Err(error) => {
@@ -213,18 +256,30 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
             }
         }
     }
-    let event_id = match send_with_retry(room, markup::notice(&msg.text)).await {
+    let content = markup::notice(&msg.text);
+    let sent = match txn {
+        Some(txn) => send_with_retry_txn(room, content, txn).await,
+        None => send_with_retry(room, content).await,
+    };
+    let event_id = match sent {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "Could not send to a Kummerkasten chat");
-            return;
+            return false;
         }
     };
     record(kk, room, &event_id, true).await;
-    if let Err(error) = kk.engine.set_screen(mxid, event_id.as_str()).await {
+    // Known as the screen before its buttons arrive: a tap meanwhile is
+    // handled, and the screen stays pending until they are all there.
+    if let Err(error) = kk.engine.screen_shown(mxid, event_id.as_str(), false).await {
         tracing::error!(%error, "Could not remember the live screen");
     }
-    let buttons = add_buttons(room, &event_id, &msg.buttons).await;
+    let buttons = add_buttons(kk, room, &event_id, &msg.buttons, true).await;
+    if buttons.len() == msg.buttons.len() {
+        if let Err(error) = kk.engine.screen_shown(mxid, event_id.as_str(), true).await {
+            tracing::error!(%error, "Could not confirm the screen");
+        }
+    }
     let (r, e, old) = (room_id, event_id.to_string(), current);
     let saved = kk
         .engine
@@ -243,6 +298,7 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
         Ok(_) => {}
         Err(error) => tracing::error!(%error, "Could not remember the screen's buttons"),
     }
+    true
 }
 
 /// Edit the screen `event` to show `msg`, then bring its buttons in line:
@@ -253,13 +309,14 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
 /// An error means the edit itself did not go out (the caller sends a fresh
 /// screen then). Once it is out, trouble with the bookkeeping is logged:
 /// a second screen would be worse than a button ledger that is behind.
-async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()> {
+/// Returns whether every button of the new view is in place.
+async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<bool> {
     let original = OwnedEventId::try_from(event).context("not an event ID")?;
     let edit = markup::notice(&msg.text)
         .make_replacement(ReplacementMetadata::new(original.clone(), None));
     let edit_id = send_with_retry(room, edit).await?;
     let room_id = room.room_id().to_string();
-    let old = {
+    let ledger = {
         let (r, e, x) = (room_id.clone(), event.to_owned(), edit_id.to_string());
         kk.engine
             .db
@@ -273,16 +330,57 @@ async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()>
                 Vec::new()
             })
     };
+    // What is really under the message, asked of the server: a reaction
+    // whose redaction is still waiting, or one a crash kept out of the
+    // ledger, is seen (and tracked) instead of fought with.
+    let old = match server_buttons(kk, room, &original).await {
+        Ok(found) => {
+            for (_, reaction) in &found {
+                let (r, x, e) = (room_id.clone(), reaction.clone(), event.to_owned());
+                let _ = kk
+                    .engine
+                    .db
+                    .run(move |c| store::record_button(c, &r, &x, &e, true))
+                    .await;
+            }
+            found
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Could not list the buttons; going by the ledger");
+            ledger
+        }
+    };
     let keep = screens::buttons_kept(&old, &msg.buttons);
     for (_, reaction) in &old[keep..] {
-        if let Ok(reaction) = OwnedEventId::try_from(reaction.as_str()) {
-            if let Err(error) = room.redact(&reaction, None, None).await {
-                tracing::debug!(%error, "Could not take a button away");
-            }
+        // Taken away now; when that fails, it is marked for the redaction
+        // worker (retried with backoff) instead of being forgotten.
+        let gone = match OwnedEventId::try_from(reaction.as_str()) {
+            Ok(id) => room.redact(&id, None, None).await.is_ok(),
+            Err(_) => false,
+        };
+        let (r, x) = (room_id.clone(), reaction.clone());
+        let saved = kk
+            .engine
+            .db
+            .run(move |c| {
+                if gone {
+                    store::forget_event(c, &r, &x)
+                } else {
+                    store::doom_event(c, &r, &x).map(drop)
+                }
+            })
+            .await;
+        if let Err(error) = saved {
+            tracing::error!(%error, "Could not note a removed button");
+        }
+        if !gone {
+            tracing::warn!("Could not take a button away; it is queued for redaction");
+            kk.wake.notify_one();
         }
     }
     let mut buttons = old[..keep].to_vec();
-    buttons.extend(add_buttons(room, &original, &msg.buttons[keep..]).await);
+    buttons.extend(add_buttons(kk, room, &original, &msg.buttons[keep..], true).await);
+    let complete = buttons.len() == msg.buttons.len();
     let (r, e) = (room_id, event.to_owned());
     if let Err(error) = kk
         .engine
@@ -292,25 +390,175 @@ async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()>
     {
         tracing::error!(%error, "Could not remember the screen's buttons");
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// The bot's reactions under `event_id`, one per key: `(key, reaction)` of
-/// those that could be added.
+/// those that could be added. Each is tracked with the message (it goes,
+/// and is redacted, when the message is); a missing one is logged, and the
+/// caller leaves the screen pending so it is brought in line later.
 async fn add_buttons(
+    kk: &Kk,
     room: &Room,
     event_id: &OwnedEventId,
     keys: &[String],
+    in_session: bool,
 ) -> Vec<(String, String)> {
     let mut added = Vec::new();
     for key in keys {
         let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), key.clone()));
-        match send_with_retry(room, reaction).await {
-            Ok(id) => added.push((key.clone(), id.to_string())),
-            Err(error) => tracing::warn!(%error, "Could not add a button"),
+        let id = match send_with_retry(room, reaction).await {
+            Ok(id) => Some(id),
+            // Already there (its redaction still waiting, or a crash kept
+            // it out of the ledger): use that one.
+            Err(error) if is_duplicate(&error) => server_buttons(kk, room, event_id)
+                .await
+                .ok()
+                .and_then(|found| {
+                    found
+                        .into_iter()
+                        .find(|(k, _)| screens::same_key(k, key))
+                        .and_then(|(_, id)| OwnedEventId::try_from(id).ok())
+                }),
+            Err(error) => {
+                tracing::warn!(%error, "Could not add a button");
+                None
+            }
+        };
+        let Some(id) = id else {
+            continue;
+        };
+        let (r, x, e) = (
+            room.room_id().to_string(),
+            id.to_string(),
+            event_id.to_string(),
+        );
+        if let Err(error) = kk
+            .engine
+            .db
+            .run(move |c| store::record_button(c, &r, &x, &e, in_session))
+            .await
+        {
+            tracing::error!(%error, "Could not record a button");
         }
+        added.push((key.clone(), id.to_string()));
     }
     added
+}
+
+/// The homeserver refused a reaction because the same one is already there.
+fn is_duplicate(error: &matrix_sdk::Error) -> bool {
+    matches!(
+        error,
+        matrix_sdk::Error::Http(http)
+            if matches!(http.client_api_error_kind(), Some(ErrorKind::DuplicateAnnotation))
+    )
+}
+
+/// The bot's own reactions under `event`, as the server has them, oldest
+/// first: `(key, reaction event)`.
+async fn server_buttons(
+    kk: &Kk,
+    room: &Room,
+    event: &OwnedEventId,
+) -> Result<Vec<(String, String)>> {
+    let mut opts = RelationsOptions {
+        include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
+        limit: UInt::new(100),
+        ..Default::default()
+    };
+    let mut found: Vec<(u64, String, String)> = Vec::new();
+    loop {
+        let relations = room.relations(event.clone(), opts.clone()).await?;
+        for item in relations.chunk {
+            let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
+                SyncReactionEvent::Original(reaction),
+            ))) = item.raw().deserialize()
+            else {
+                continue;
+            };
+            if reaction.sender != kk.bot {
+                continue;
+            }
+            found.push((
+                u64::from(reaction.origin_server_ts.get()),
+                reaction.content.relates_to.key,
+                reaction.event_id.to_string(),
+            ));
+        }
+        match relations.next_batch_token {
+            Some(next) => opts.from = Some(next),
+            None => break,
+        }
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, key, id)| (key, id)).collect())
+}
+
+/// One of the bot's own messages in a chat came back through sync: the
+/// screen it shows (the message, or the one it edits) is in sight now.
+pub async fn on_own_message(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMessageEvent) {
+    if !kk.is_chat(room).await {
+        return;
+    }
+    let screen = match &ev.content.relates_to {
+        Some(Relation::Replacement(replacement)) => replacement.event_id.to_string(),
+        _ => ev.event_id.to_string(),
+    };
+    if let Err(error) = kk
+        .engine
+        .screen_echoed(room.room_id().as_str(), &screen)
+        .await
+    {
+        tracing::error!(%error, "Could not note an echoed screen");
+    }
+}
+
+/// Screens whose last view wasn't confirmed as shown (a crash between
+/// saving a step and showing it, a button that could not be added): show
+/// them again. At startup; between starts the next tap does the same.
+pub async fn resume_screens(kk: &Kk) {
+    let pending = match kk
+        .engine
+        .db
+        .run(|c| crate::engine::pending_screens(c))
+        .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::error!(%error, "Reading pending screens failed");
+            return;
+        }
+    };
+    let ttl = kk.settings.get().session_ttl();
+    for (mxid, room_id) in pending {
+        let Some(room) = OwnedRoomId::try_from(room_id.as_str())
+            .ok()
+            .and_then(|id| kk.client.get_room(&id))
+            .filter(|r| r.state() == RoomState::Joined)
+        else {
+            continue;
+        };
+        let Ok(user) = OwnedUserId::try_from(mxid.as_str()) else {
+            continue;
+        };
+        let _op = kk.ops.lock().await;
+        let Some(who) = kk.who(&user).await else {
+            continue;
+        };
+        if !kk.chat_is_private(&room, &user).await {
+            continue;
+        }
+        match kk
+            .engine
+            .current_screen(&who, &room_id, Utc::now(), ttl)
+            .await
+        {
+            Ok(msgs) => deliver(kk, &room, &mxid, msgs).await,
+            Err(error) => tracing::error!(%error, "Could not show a pending screen"),
+        }
+    }
+    kk.wake.notify_one();
 }
 
 /// Track an event in a resident's chat (see [`store::record_event`]).
@@ -330,10 +578,15 @@ async fn record(kk: &Kk, room: &Room, event_id: &OwnedEventId, in_session: bool)
     }
 }
 
-/// Buttons under a message that is never edited (entry messages, check-in
-/// notices): added once, not tracked.
+/// Buttons under a message in a house room (📮 and friends): not tracked,
+/// the bot redacts nothing there.
 async fn seed(room: &Room, event_id: &OwnedEventId, keys: &[String]) {
-    add_buttons(room, event_id, keys).await;
+    for key in keys {
+        let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), key.clone()));
+        if let Err(error) = send_with_retry(room, reaction).await {
+            tracing::warn!(%error, "Could not add a button");
+        }
+    }
 }
 
 /// Take a tap away again, so the same button can be pressed next time.
@@ -408,9 +661,24 @@ pub async fn on_message(
     let body = text.body.trim().to_owned();
     let now = Utc::now();
     let msgs = if matches!(body.to_lowercase().as_str(), "!menu" | "!start" | "menu") {
-        kk.engine
-            .fresh_menu(&who, room.room_id().as_str(), now)
-            .await
+        if kk.engine.is_survey() {
+            // No menu: where they are in the check-in, again at the bottom.
+            let ttl = kk.settings.get().session_ttl();
+            kk.engine
+                .current_screen(&who, room.room_id().as_str(), now, ttl)
+                .await
+                .map(|msgs| {
+                    if msgs.is_empty() {
+                        vec![Msg::note(screens::nothing_open())]
+                    } else {
+                        msgs
+                    }
+                })
+        } else {
+            kk.engine
+                .fresh_menu(&who, room.room_id().as_str(), now)
+                .await
+        }
     } else if screens::asks_for_help(&body) {
         // Before the flow sees it: on a writing step it would become text.
         let ttl = kk.settings.get().session_ttl();
@@ -512,7 +780,7 @@ pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
                 .await
         }
     };
-    // A reaction that isn't a button of this screen (a ❤️ for the bot) is
+    // A reaction that isn't a button of this screen (a 🦄 for the bot) is
     // left alone: it did nothing and is theirs.
     let pressed = match result {
         Ok(msgs) if msgs.is_empty() => false,
@@ -550,6 +818,12 @@ pub async fn on_member(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMemberEvent) {
                 lock(kk, room, &mxid).await;
                 return;
             };
+            if kk.engine.is_survey() {
+                // No introduction, no menu: the check-in waiting for them.
+                join_survey(kk, room, &who).await;
+                tracing::info!("A resident opened their Kummerkasten chat");
+                return;
+            }
             deliver(kk, room, &mxid, vec![Msg::receipt(screens::intro())]).await;
             if let Ok(menu) = kk
                 .engine
@@ -612,6 +886,8 @@ pub enum Opened {
     Invited,
     /// Not in an authorized room.
     Locked,
+    /// Survey-only mode: no check-in waiting for them, so no chat to open.
+    Nothing,
 }
 
 /// Open (or bring up) `user`'s Kummerkasten chat.
@@ -624,6 +900,9 @@ pub async fn open_chat_at(kk: &Kk, user: &UserId, at: Option<MenuItem>) -> Resul
     let Some(who) = kk.who(user).await else {
         return Ok(Opened::Locked);
     };
+    if kk.engine.is_survey() && !kk.engine.has_survey_for(&who, Utc::now()).await? {
+        return Ok(Opened::Nothing);
+    }
     let mxid = user.to_string();
     let resident = {
         let m = mxid.clone();
@@ -702,7 +981,7 @@ pub async fn on_room_message(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMessageE
         return;
     }
     match open_chat(kk, &ev.sender).await {
-        Ok(Opened::Locked) => {}
+        Ok(Opened::Locked | Opened::Nothing) => {}
         Ok(_) => {
             let nod =
                 ReactionEventContent::new(Annotation::new(ev.event_id.clone(), "📬".to_owned()));
@@ -760,6 +1039,10 @@ pub async fn post_entry(kk: &Kk, room: &Room) -> Result<()> {
 /// `entry = true` rooms of the config: post the 📮 entry message where
 /// none was posted yet and the bot is in the room (it may be invited later).
 pub async fn post_missing_entries(kk: &Kk) {
+    // Survey-only mode: residents are asked; there is nothing to open.
+    if kk.engine.is_survey() {
+        return;
+    }
     let Some(rooms) = &kk.managed_rooms else {
         return;
     };
@@ -981,6 +1264,9 @@ pub async fn tell_txn(
     {
         return Told::NotNeeded;
     }
+    if kk.engine.is_survey() {
+        return tell_survey(kk, room, who, run_id, which, txn).await;
+    }
     let event_id = match send_with_retry_txn(room, markup::notice(&text), txn).await {
         Ok(id) => id,
         Err(error) => {
@@ -995,8 +1281,122 @@ pub async fn tell_txn(
         .db
         .run(move |c| checkins::add_message(c, &e, run_id))
         .await;
-    seed(room, &event_id, &[screens::START_CHECKIN.to_owned()]).await;
+    add_buttons(
+        kk,
+        room,
+        &event_id,
+        &[screens::START_CHECKIN.to_owned()],
+        false,
+    )
+    .await;
     Told::Sent
+}
+
+/// Survey-only mode: the notice is the check-in itself (its intro, a new
+/// message, so it notifies); the reminder a note with their screen below.
+/// Nothing while they answer another one: this one comes up after it.
+async fn tell_survey(
+    kk: &Kk,
+    room: &Room,
+    who: &Who,
+    run_id: i64,
+    which: CheckinText,
+    txn: &TransactionId,
+) -> Told {
+    // The outbox doesn't hold `ops`; this changes the conversation.
+    let _op = kk.ops.lock().await;
+    let ttl = kk.settings.get().session_ttl();
+    let msgs = match kk
+        .engine
+        .survey_message(who, room.room_id().as_str(), run_id, which, Utc::now(), ttl)
+        .await
+    {
+        Ok(Some(msgs)) => msgs,
+        Ok(None) => return Told::NotNeeded,
+        Err(error) => {
+            tracing::warn!(%error, "Could not prepare a check-in message");
+            return Told::Failed;
+        }
+    };
+    let sent = deliver_txn(kk, room, &who.mxid, msgs, Some(txn)).await;
+    kk.wake.notify_one();
+    if sent {
+        Told::Sent
+    } else {
+        Told::Failed
+    }
+}
+
+/// Survey-only mode: someone accepted their chat. The check-in waiting for
+/// them, if any (counted as its notice); else nothing at all. The caller
+/// holds `ops`.
+async fn join_survey(kk: &Kk, room: &Room, who: &Who) {
+    let now = Utc::now();
+    let msgs = match kk
+        .engine
+        .fresh_menu(who, room.room_id().as_str(), now)
+        .await
+    {
+        Ok(msgs) => msgs,
+        Err(error) => {
+            tracing::error!(%error, "Could not open a check-in for a new chat");
+            return;
+        }
+    };
+    let run = kk
+        .engine
+        .db
+        .run({
+            let mxid = who.mxid.clone();
+            move |c| crate::engine::session_run(c, &mxid)
+        })
+        .await
+        .ok()
+        .flatten();
+    let shown = !msgs.is_empty();
+    deliver(kk, room, &who.mxid, msgs).await;
+    if let (true, Some(run_id)) = (shown, run) {
+        let _ = kk
+            .engine
+            .db
+            .run(move |c| checkins::count_batch(c, run_id, Batch::Notice, 0, 1))
+            .await;
+    }
+    kk.wake.notify_one();
+}
+
+/// Survey-only mode, at startup: what the full Kummerkasten left in the
+/// chats (menus, drafts, notes) is tidied away, and buttons under a
+/// deletion-code receipt are taken off (the receipt stays: it holds their
+/// code). Old 📊 notices keep working: they open their check-in.
+pub async fn survey_cleanup(kk: &Kk) {
+    let ttl = kk.settings.get().session_ttl();
+    let receipts = match kk.engine.survey_cleanup(Utc::now(), ttl).await {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            tracing::error!(%error, "Survey-only cleanup failed");
+            return;
+        }
+    };
+    for (room_id, receipt) in receipts {
+        let (Some(room), Ok(receipt)) = (
+            OwnedRoomId::try_from(room_id.as_str())
+                .ok()
+                .and_then(|id| kk.client.get_room(&id)),
+            OwnedEventId::try_from(receipt.as_str()),
+        ) else {
+            continue;
+        };
+        // Also buttons the ledger never knew (from before it tracked them).
+        if let Ok(buttons) = server_buttons(kk, &room, &receipt).await {
+            for (_, reaction) in buttons {
+                if let Ok(reaction) = OwnedEventId::try_from(reaction.as_str()) {
+                    let _ = room.redact(&reaction, None, None).await;
+                }
+            }
+        }
+    }
+    kk.wake.notify_one();
 }
 
 #[cfg(test)]

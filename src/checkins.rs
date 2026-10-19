@@ -880,13 +880,37 @@ pub struct RunRow {
     pub open: bool,
     pub closes_at: DateTime<Utc>,
     pub responses: i64,
+    /// Asked when it started (counted then), if known.
+    pub eligible: Option<i64>,
+}
+
+/// An open run of `template` for exactly `target`, if there is one.
+pub fn open_run_of(
+    conn: &Connection,
+    template: &str,
+    target: &Target,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id FROM survey_runs r JOIN survey_templates t ON t.id = r.template_id
+         WHERE t.key = ?1 AND r.status = 'open' AND r.closes_at > ?2 ORDER BY r.id",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![template, time::to_text(now)], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        if &run(conn, id)?.target == target {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// For admins: the latest runs.
 pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.emoji, r.title, r.status = 'open', r.closes_at,
-                (SELECT count(*) FROM responses s WHERE s.run_id = r.id)
+                (SELECT count(*) FROM responses s WHERE s.run_id = r.id), r.eligible_at_launch
          FROM survey_runs r ORDER BY r.id DESC LIMIT 10",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -897,11 +921,12 @@ pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
             r.get(3)?,
             r.get::<_, String>(4)?,
             r.get(5)?,
+            r.get(6)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, emoji, title, open, closes, responses) = row?;
+        let (id, emoji, title, open, closes, responses, eligible) = row?;
         out.push(RunRow {
             id,
             emoji,
@@ -909,6 +934,7 @@ pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
             open,
             closes_at: time::parse_text(&closes)?,
             responses,
+            eligible,
         });
     }
     Ok(out)

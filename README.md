@@ -41,6 +41,80 @@ of staying silent. And if the screen is ever gone (removed by a tidy-up or
 a restart in the middle of a step), the next message or tap brings it
 back, below the answer, so there is always something to tap on.
 
+**The screen is confirmed, not assumed.** A step is saved together with a
+"not shown yet" mark that is cleared once the screen was edited or sent
+with all its buttons. If the bot crashed or the edit failed in between,
+the chat may still show the step before. Then the first tap doesn't act on
+the step you can't see: it shows the current one. A typed message is
+answered as the flow stands, with the current screen below it. At startup
+every unconfirmed screen is shown again, and `!kk round` counts them. The
+bot's own buttons (its reactions) are tracked like edits: they go with the
+screen when it is removed, and a button that couldn't be taken away is
+queued for the redaction worker instead of being forgotten.
+
+A tap also only counts once the bot has seen its own message (or edit)
+showing the current step come back through sync. Matrix delivers a room's
+events in order, so a tap that arrives before that echo was made before
+the step could be seen: a second device, a very fast double tap. It shows
+the step again instead of acting on it. When a step is edited, the bot asks
+the server which of its reactions are really under the message, rather
+than trusting its own ledger, so a reaction whose removal is still waiting
+or one a crash left untracked is seen and dealt with, never fought with.
+And a button an admin retired while you were looking at the list (a topic
+taken away) refreshes the list when tapped instead of doing nothing.
+
+## Survey-only mode (the default for now)
+
+`[kummerkasten] ui = "survey"` keeps the bot to one thing: the check-ins
+(surveys) admins start. Everything else stays in the code and the database
+and comes back with `ui = "full"` and a restart.
+
+**What a resident sees.** When a check-in starts, one message from the bot:
+the check-in itself (title, what it is about, how many questions, open
+until when, a privacy line, ▶️ *Start*). Then one question at a time, in
+place: tap an answer (or type its number), write when asked, ⬅️ to go back,
+⏭️ to skip an optional one. At the end 🥷 / 🏠 / 👤 as everywhere, a preview,
+✅. Then a short *Thanks!* and nothing more. No menu, no introduction, no
+offer to share an answer as an idea, no ❌ (stopping is simply not
+answering).
+
+* **Pausing is fine.** A half-answered check-in waits until it closes, also
+  across restarts; there is no 60-minute timeout here. The one reminder is a
+  short note with their current step right below it.
+* **One at a time.** While one check-in is half done, another one's message
+  waits; it comes up right after the first is submitted (or has closed).
+* **Never twice.** Answered is answered: no notice, no reminder, and 📊 on an
+  old notice says so.
+* **Quiet otherwise.** A message while nothing is open gets one line
+  (*Nothing to answer right now*); a tap on something old does nothing.
+  `!help` explains the four rules; `!menu` shows the current step again.
+* **Switching on.** At the first start in this mode, what the full
+  Kummerkasten left in the chats (menus, unfinished feedback drafts, notes)
+  is tidied away. A deletion-code receipt stays (it holds their code), its
+  buttons go. Check-ins already being answered carry on.
+* **Turned off for now:** the 📮 entry message and `!kummerkasten` (they only
+  open a chat when a check-in is waiting), the menu with feedback, ideas and
+  results, plenum summaries, and `!kk entry` / `!kk invite-all`.
+
+**For admins** `!kk help` shows just this:
+
+```
+!kk survey cleaning                 the questions, numbered
+!kk survey cleaning preview         each question as residents see it
+!kk checkin start cleaning          what would happen; then
+!kk checkin go                      start it (or !kk checkin drop)
+!kk checkins                        open and closed ones, how many answered
+!kk checkin close 4                 end it now (otherwise it closes by itself)
+!kk checkin results 4               the answers, once it is closed
+```
+
+Starting the same survey for the same people while it is still open is
+refused. `!kk checkin results` shows nothing but the count while a check-in
+is open (watching answers arrive one by one could tell whose is whose),
+nothing below `privacy_threshold` answers, and written answers only from
+that many on, sorted, never in the order they came, never with a name.
+`!kk help all` lists every command.
+
 ## For residents
 
 * **Getting your chat**: write `!kummerkasten` in the house room, or tap
@@ -287,9 +361,11 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
   queued in the **outbox** in the transaction that marks them due. The
   outbox decides who gets it when it goes out, checks each person right
   before (access, target, not answered yet), retries what failed (1, 2, 4 …
-  minutes, 8 times) and sends each message with its own Matrix transaction
-  ID, so a crash neither loses nor doubles it. The plenum summary and its
-  updates go the same way. `!kk round` shows how many are waiting.
+  minutes, then every 6 hours, never given up: only the sender drops what
+  isn't needed any more) and sends each message with its own Matrix
+  transaction ID, so a crash neither loses nor doubles it. The plenum
+  summary and its updates go the same way. `!kk round` shows how many are
+  waiting and how many have been failing for hours.
 * **One chat per eligible resident.** Before a check-in's notices go out,
   the bot lists who is in the authorized rooms, checks each again with the
   server, keeps those the check-in is for, and creates the encrypted chat
