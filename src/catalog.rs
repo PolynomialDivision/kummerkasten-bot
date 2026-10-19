@@ -161,6 +161,22 @@ pub(crate) fn check_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// An insert whose key is taken: just "exists already" (`taken`), not the
+/// database's own words. Other errors stay as they are.
+pub(crate) fn new_key(
+    inserted: rusqlite::Result<usize>,
+    taken: impl FnOnce() -> String,
+) -> Result<()> {
+    match inserted {
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            Err(anyhow::anyhow!(taken()))
+        }
+        other => other.map(drop).map_err(Into::into),
+    }
+}
+
 /// Sort position after the last sibling (topics and locations).
 fn next_sort(conn: &Connection, kind: Kind, parent: Option<i64>) -> Result<i64> {
     let sql = format!(
@@ -183,12 +199,14 @@ pub fn add_topic(
     let parent_id = parent.map(|p| id_of(conn, Kind::Topic, p)).transpose()?;
     let problem_id = problem.map(|p| id_of(conn, Kind::Problem, p)).transpose()?;
     let sort = next_sort(conn, Kind::Topic, parent_id)?;
-    conn.execute(
-        "INSERT INTO topics (key, parent_id, emoji, label, problem_id, sort)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![key, parent_id, emoji, label, problem_id, sort],
-    )
-    .with_context(|| format!("«{key}» exists already."))?;
+    new_key(
+        conn.execute(
+            "INSERT INTO topics (key, parent_id, emoji, label, problem_id, sort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![key, parent_id, emoji, label, problem_id, sort],
+        ),
+        || format!("«{key}» exists already."),
+    )?;
     Ok(())
 }
 
@@ -203,23 +221,27 @@ pub fn add_location(
     check_key(key)?;
     let parent_id = parent.map(|p| id_of(conn, Kind::Location, p)).transpose()?;
     let sort = next_sort(conn, Kind::Location, parent_id)?;
-    conn.execute(
-        "INSERT INTO locations (key, parent_id, emoji, label, is_floor, sort)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![key, parent_id, emoji, label, is_floor, sort],
-    )
-    .with_context(|| format!("«{key}» exists already."))?;
+    new_key(
+        conn.execute(
+            "INSERT INTO locations (key, parent_id, emoji, label, is_floor, sort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![key, parent_id, emoji, label, is_floor, sort],
+        ),
+        || format!("«{key}» exists already."),
+    )?;
     Ok(())
 }
 
 pub fn add_problem(conn: &Connection, key: &str, topic: &str, label: &str) -> Result<()> {
     check_key(key)?;
     let topic_id = id_of(conn, Kind::Topic, topic)?;
-    conn.execute(
-        "INSERT INTO problems (key, topic_id, label, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![key, topic_id, label, crate::time::now_text()],
-    )
-    .with_context(|| format!("«{key}» exists already."))?;
+    new_key(
+        conn.execute(
+            "INSERT INTO problems (key, topic_id, label, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![key, topic_id, label, crate::time::now_text()],
+        ),
+        || format!("«{key}» exists already."),
+    )?;
     Ok(())
 }
 

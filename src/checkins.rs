@@ -279,8 +279,40 @@ pub struct Plan {
 /// Work out a start: the template's active questions (current versions),
 /// the next plenum, a closing time (default: when that plenum starts, else
 /// in a week) and one reminder `remind_before` the close, if that is still
-/// at least an hour after the start.
+/// at least an hour after the start. Refused if it would close within the
+/// hour.
 pub fn plan(
+    conn: &Connection,
+    template: &str,
+    opts: &StartOptions,
+    now: DateTime<Utc>,
+    remind_before: Duration,
+) -> Result<Plan> {
+    let plan = draft(conn, template, opts, now, remind_before)?;
+    if closes_too_soon(&plan, now) {
+        match plan.plenum_offset {
+            Some(o) if o.is_zero() => bail!(
+                "The next plenum starts within the hour (or already has), and without `closes` \
+                 the check-in ends when it starts. Add `closes 2026-11-14 18:00` or `no-plenum`."
+            ),
+            Some(o) => bail!(
+                "{}h before the plenum is less than an hour from now. \
+                 Give a date instead, like `closes 2026-11-14 18:00`.",
+                -o.num_hours()
+            ),
+            None => bail!("It would close too soon. Give people at least an hour."),
+        }
+    }
+    Ok(plan)
+}
+
+/// Less than an hour to answer: `plan` refuses it, a preview only warns.
+pub fn closes_too_soon(plan: &Plan, now: DateTime<Utc>) -> bool {
+    plan.closes_at <= now + Duration::hours(1)
+}
+
+/// `plan` without the closing time check: what the preview shows.
+pub fn draft(
     conn: &Connection,
     template: &str,
     opts: &StartOptions,
@@ -327,9 +359,6 @@ pub fn plan(
             bail!("A deadline before the plenum needs a plenum. Leave out `no-plenum`.")
         }
     };
-    if closes_at <= now + Duration::hours(1) {
-        bail!("It would close too soon. Give people at least an hour.");
-    }
     let reminder_at = Some(closes_at - remind_before)
         .filter(|at| opts.reminder && *at >= now + Duration::hours(1));
     if opts.announce && central_rooms(conn)?.is_empty() {
@@ -1083,6 +1112,29 @@ pub(crate) mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn a_plenum_within_the_hour_needs_a_closing_date_but_the_preview_still_works() {
+        let plenum = at(2026, 11, 1, 19);
+        let now = plenum - Duration::minutes(30);
+        let conn = with_default_rule(now);
+        let remind = Duration::hours(24);
+        let opts = StartOptions::default();
+        let err = plan(&conn, "cleaning", &opts, now, remind).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`closes 2026-11-14 18:00`"),
+            "{err:#}"
+        );
+        let shown = draft(&conn, "cleaning", &opts, now, remind).unwrap();
+        assert_eq!(shown.closes_at, plenum);
+        assert!(closes_too_soon(&shown, now));
+        let dated = StartOptions {
+            deadline: Deadline::Fixed(now + Duration::days(2)),
+            ..Default::default()
+        };
+        let planned = plan(&conn, "cleaning", &dated, now, remind).unwrap();
+        assert!(!closes_too_soon(&planned, now));
     }
 
     #[test]

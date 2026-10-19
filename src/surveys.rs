@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::time;
+use crate::{catalog::new_key, time};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -154,12 +154,19 @@ pub fn create_template(
             .with_context(|| format!("There's no topic «{t}»."))
         })
         .transpose()?;
-    conn.execute(
-        "INSERT INTO survey_templates (key, topic_id, emoji, title, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![key, topic_id, emoji, title, time::now_text()],
-    )
-    .with_context(|| format!("«{key}» exists already."))?;
+    new_key(
+        conn.execute(
+            "INSERT INTO survey_templates (key, topic_id, emoji, title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key, topic_id, emoji, title, time::now_text()],
+        ),
+        || {
+            format!(
+                "«{key}» exists already. 👀 `!kk survey {key}` shows it, \
+                 a new one needs another key."
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -641,11 +648,13 @@ pub fn move_question(conn: &mut Connection, key: &str, n: usize, to: usize) -> R
 pub fn add_metric(conn: &Connection, key: &str, topic: &str, label: &str) -> Result<()> {
     crate::catalog::check_key(key)?;
     let topic_id = id_of(conn, "topics", topic)?;
-    conn.execute(
-        "INSERT INTO metrics (key, topic_id, label, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![key, topic_id, label, time::now_text()],
-    )
-    .with_context(|| format!("«{key}» exists already."))?;
+    new_key(
+        conn.execute(
+            "INSERT INTO metrics (key, topic_id, label, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![key, topic_id, label, time::now_text()],
+        ),
+        || format!("«{key}» exists already."),
+    )?;
     Ok(())
 }
 
@@ -713,6 +722,21 @@ pub(crate) mod tests {
         assert!(qs[2].current.asks_suggestion);
         assert!(!qs[2].current.required);
         assert!(qs.iter().all(|q| !q.used));
+    }
+
+    #[test]
+    fn a_taken_key_says_so_without_the_database_words() {
+        let conn = memory_connection();
+        let err = create_template(&conn, "cleaning", "🧹", "Again", None).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.starts_with("«cleaning» exists already."), "{text}");
+        assert!(!text.contains("UNIQUE"), "{text}");
+        let err =
+            add_metric(&conn, "cleaning.overall_satisfaction", "cleaning", "Again").unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "«cleaning.overall_satisfaction» exists already."
+        );
     }
 
     #[test]

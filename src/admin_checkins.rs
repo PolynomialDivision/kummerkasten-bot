@@ -473,17 +473,20 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
     kk.engine
         .db
         .run(move |c| {
-            let plan = checkins::plan(
+            let now = Utc::now();
+            // Only what residents see: a start too close to the plenum is
+            // refused at `checkin start`, here it is a note.
+            let plan = checkins::draft(
                 c,
                 &key,
                 &StartOptions {
                     reminder: false,
                     ..Default::default()
                 },
-                Utc::now(),
+                now,
                 chrono::Duration::hours(1),
-            );
-            let plan = plan?;
+            )?;
+            let too_soon = checkins::closes_too_soon(&plan, now);
             let run = checkins::Run {
                 id: 0,
                 emoji: plan.emoji.clone(),
@@ -504,14 +507,21 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
             };
             let ctx = screens::Ctx {
                 zone: Some(zone),
-                today: Some(zone.date(Utc::now())),
+                today: Some(zone.date(now)),
                 ..Default::default()
             };
             let mut out = vec![
                 "👀 **Preview**: what residents will see".to_owned(),
                 String::new(),
-                screens::checkin_notice(&run, &ctx),
             ];
+            if too_soon {
+                out.push(format!(
+                    "⚠️ The next plenum starts within the hour, so `!kk checkin start {key}` \
+                     needs a `closes` date, like `closes 2026-11-14 18:00`."
+                ));
+                out.push(String::new());
+            }
+            out.push(screens::checkin_notice(&run, &ctx));
             for i in 0..run.questions.len() {
                 out.push("· · ·".to_owned());
                 out.push(screens::question_preview(&run, i));
