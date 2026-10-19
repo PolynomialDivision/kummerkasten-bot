@@ -125,7 +125,7 @@ impl Msg {
 
     /// Whether it goes when the current flow ends.
     pub fn in_session(&self) -> bool {
-        matches!(self.kind, Kind::Screen | Kind::Note)
+        matches!(self.kind, Kind::Screen | Kind::Edit | Kind::Note)
     }
 }
 
@@ -231,8 +231,45 @@ impl Engine {
         let this = self.clone();
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
-            .run(move |conn| this.handle_sync(conn, &who, &room_id, input, now, ttl))
+            .run(move |conn| {
+                let msgs = this.handle_sync(conn, &who, &room_id, input, now, ttl)?;
+                this.with_screen(conn, &who, &room_id, now, msgs)
+            })
             .await
+    }
+
+    /// `msgs` with a screen added when they hold none and the chat has no
+    /// live screen to tap on (never had one, or it was redacted: the flow
+    /// ended, a restart in the middle of a step). A note alone would leave
+    /// them with nothing but `!menu`.
+    fn with_screen(
+        &self,
+        conn: &Connection,
+        who: &Who,
+        room_id: &str,
+        now: DateTime<Utc>,
+        mut msgs: Vec<Msg>,
+    ) -> Result<Vec<Msg>> {
+        if msgs.iter().any(|m| m.live) {
+            return Ok(msgs);
+        }
+        let session = load(conn, &who.mxid)?.filter(|s| s.room == room_id);
+        let alive = match session.as_ref().and_then(|s| s.screen_event.as_deref()) {
+            Some(event) => screen_alive(conn, room_id, event)?,
+            None => false,
+        };
+        if alive {
+            return Ok(msgs);
+        }
+        let flow = match session {
+            Some(s) => s.flow,
+            None => {
+                save(conn, &who.mxid, room_id, &Flow::default(), now)?;
+                Flow::default()
+            }
+        };
+        msgs.push(Msg::screen(self.render(conn, who, &flow, now)?));
+        Ok(msgs)
     }
 
     /// Throw away whatever was going on and show a fresh menu.
@@ -306,7 +343,10 @@ impl Engine {
         let this = self.clone();
         let (who, room_id) = (who.clone(), room_id.to_owned());
         self.db
-            .run(move |conn| this.start_run_sync(conn, &who, &room_id, run_id, now, ttl))
+            .run(move |conn| {
+                let msgs = this.start_run_sync(conn, &who, &room_id, run_id, now, ttl)?;
+                this.with_screen(conn, &who, &room_id, now, msgs)
+            })
             .await
     }
 
@@ -1116,6 +1156,19 @@ fn run_context(conn: &Connection, run: &Run, index: usize) -> Result<(Option<i64
     Ok((topic, problem))
 }
 
+/// Whether the screen `event_id` is still in the chat: tracked and not
+/// marked for redaction.
+fn screen_alive(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM dm_events WHERE room_id = ?1 AND event_id = ?2 AND doomed = 0",
+            params![room_id, event_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 /// Mark one event in `room_id` for redaction.
 fn doom(conn: &Connection, room_id: &str, event_id: &str) -> Result<()> {
     conn.execute(
@@ -1495,8 +1548,86 @@ mod tests {
         let mut chat = Chat::new();
         chat.menu();
         assert!(chat.tap("🍳").is_empty());
+        // The menu is there to tap on: the hint is all that is needed.
+        let out = chat.say("hello?");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, Kind::Note);
+    }
+
+    #[test]
+    fn a_hint_brings_the_screen_back_when_the_live_one_is_gone() {
+        let mut chat = Chat::new();
+        chat.menu();
+        chat.tap("📝");
+        let screen_event = format!("$e{}", chat.n);
+        // The screen was redacted (a restart between tidying and showing,
+        // a client, an admin): the session still points at it.
+        chat.engine
+            .db
+            .with(|c| {
+                c.execute("DELETE FROM dm_events WHERE event_id = ?1", [&screen_event])?;
+                Ok(())
+            })
+            .unwrap();
         let out = chat.say("hello?");
         assert_eq!(out[0].kind, Kind::Note);
+        // The same step again, below the hint, so there is something to tap.
+        assert!(screen(&out).text.contains("What is this about?"));
+        assert!(screen(&out).live);
+        // Marked for redaction counts as gone too.
+        let screen_event = format!("$e{}", chat.n);
+        chat.engine
+            .db
+            .with(|c| {
+                c.execute(
+                    "UPDATE dm_events SET doomed = 1 WHERE event_id = ?1",
+                    [&screen_event],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let out = chat.say("hello?");
+        assert!(screen(&out).text.contains("What is this about?"));
+        // With the screen in place: the hint alone, nothing is re-sent.
+        let out = chat.say("hello?");
+        assert_eq!(out.len(), 1);
+        // No session at all (locked out, then back): a fresh menu.
+        chat.engine
+            .db
+            .with(|c| {
+                c.execute("DELETE FROM sessions", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let out = chat.say("hello?");
+        assert!(screen(&out).text.starts_with("📮 **Kummerkasten**"));
+    }
+
+    #[test]
+    fn a_check_in_notice_tapped_too_late_still_leaves_a_screen() {
+        let mut chat = Chat::new();
+        let run = with_run(&mut chat, Default::default());
+        // 📊 on the notice, weeks later, no screen ever shown in this chat.
+        let out = tokio_block(chat.engine.start_run(
+            &chat.who,
+            ROOM,
+            run.id,
+            run.closes_at + chrono::Duration::days(1),
+            ttl(),
+        ))
+        .unwrap();
+        assert!(out[0].text.contains("closed"), "{}", out[0].text);
+        assert!(screen(&out).text.starts_with("📮 **Kummerkasten**"));
+    }
+
+    #[test]
+    fn edits_go_with_the_flow_like_screens() {
+        let view = screens::View {
+            text: String::new(),
+            buttons: Vec::new(),
+        };
+        assert!(Msg::edit(view).in_session());
+        assert!(!Msg::receipt(String::new()).in_session());
     }
 
     #[test]

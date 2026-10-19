@@ -155,16 +155,16 @@ impl Kk {
 pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
     for msg in msgs {
         if msg.live && msg.kind != Kind::Receipt {
-            if !show_screen(kk, room, mxid, &msg).await {
-                return;
-            }
+            show_screen(kk, room, mxid, &msg).await;
             continue;
         }
         let event_id = match send_with_retry(room, markup::notice(&msg.text)).await {
             Ok(id) => id,
             Err(error) => {
+                // Carry on: a screen after a lost note is what keeps the
+                // chat usable; the flow has moved on already.
                 tracing::warn!(%error, "Could not send to a Kummerkasten chat");
-                return;
+                continue;
             }
         };
         record(kk, room, &event_id, msg.in_session()).await;
@@ -173,14 +173,18 @@ pub async fn deliver(kk: &Kk, room: &Room, mxid: &str, msgs: Vec<Msg>) {
             if let Err(error) = kk.engine.set_screen(mxid, event_id.as_str()).await {
                 tracing::error!(%error, "Could not remember the live screen");
             }
-            seed(room, &event_id, &msg.buttons).await;
+            add_buttons(room, &event_id, &msg.buttons).await;
         }
     }
 }
 
+/// Said when handling a tap or message failed on the bot's side. Nothing
+/// about what went wrong: the chat holds private text, logs hold the error.
+const SORRY: &str = "😕 Something went wrong on my side. Please try that again, or send `!menu`.";
+
 /// Show `msg` as the chat's screen: edit the current one, or send a fresh
-/// one. `false`: nothing could be sent.
-async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) -> bool {
+/// one.
+async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) {
     let room_id = room.room_id().to_string();
     let current = kk
         .engine
@@ -200,7 +204,7 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) -> bool {
             .unwrap_or(false);
         if editable {
             match edit_screen(kk, room, event, msg).await {
-                Ok(()) => return true,
+                Ok(()) => return,
                 // Gone, or the server refused: a fresh screen instead, so
                 // nobody is left with a dead one.
                 Err(error) => {
@@ -213,7 +217,7 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) -> bool {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "Could not send to a Kummerkasten chat");
-            return false;
+            return;
         }
     };
     record(kk, room, &event_id, true).await;
@@ -239,13 +243,16 @@ async fn show_screen(kk: &Kk, room: &Room, mxid: &str, msg: &Msg) -> bool {
         Ok(_) => {}
         Err(error) => tracing::error!(%error, "Could not remember the screen's buttons"),
     }
-    true
 }
 
 /// Edit the screen `event` to show `msg`, then bring its buttons in line:
 /// the bot's reactions that still fit (a common start) stay, the rest are
 /// redacted and the new ones added in order, so every button shown works
 /// and they keep the order of the text.
+///
+/// An error means the edit itself did not go out (the caller sends a fresh
+/// screen then). Once it is out, trouble with the bookkeeping is logged:
+/// a second screen would be worse than a button ledger that is behind.
 async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()> {
     let original = OwnedEventId::try_from(event).context("not an event ID")?;
     let edit = markup::notice(&msg.text)
@@ -260,7 +267,11 @@ async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()>
                 store::record_edit(c, &r, &x, &e)?;
                 Ok(store::screen_buttons(c, &r, &e)?.unwrap_or_default())
             })
-            .await?
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "Could not record a screen edit");
+                Vec::new()
+            })
     };
     let keep = screens::buttons_kept(&old, &msg.buttons);
     for (_, reaction) in &old[keep..] {
@@ -273,10 +284,14 @@ async fn edit_screen(kk: &Kk, room: &Room, event: &str, msg: &Msg) -> Result<()>
     let mut buttons = old[..keep].to_vec();
     buttons.extend(add_buttons(room, &original, &msg.buttons[keep..]).await);
     let (r, e) = (room_id, event.to_owned());
-    kk.engine
+    if let Err(error) = kk
+        .engine
         .db
         .run(move |c| store::set_screen_buttons(c, &r, &e, &buttons))
-        .await?;
+        .await
+    {
+        tracing::error!(%error, "Could not remember the screen's buttons");
+    }
     Ok(())
 }
 
@@ -315,13 +330,10 @@ async fn record(kk: &Kk, room: &Room, event_id: &OwnedEventId, in_session: bool)
     }
 }
 
+/// Buttons under a message that is never edited (entry messages, check-in
+/// notices): added once, not tracked.
 async fn seed(room: &Room, event_id: &OwnedEventId, keys: &[String]) {
-    for key in keys {
-        let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), key.clone()));
-        if let Err(error) = room.send(reaction).await {
-            tracing::warn!(%error, "Could not add a button");
-        }
-    }
+    add_buttons(room, event_id, keys).await;
 }
 
 /// Take a tap away again, so the same button can be pressed next time.
@@ -419,17 +431,29 @@ pub async fn on_message(
     };
     match msgs {
         Ok(msgs) => deliver(kk, room, &resident.mxid, msgs).await,
-        Err(error) => tracing::error!(%error, "A Kummerkasten message failed"),
+        Err(error) => {
+            tracing::error!(%error, "A Kummerkasten message failed");
+            deliver(kk, room, &resident.mxid, vec![Msg::note(SORRY)]).await;
+        }
     }
     kk.wake.notify_one();
 }
 
-/// A tap in a resident's chat: counted only on their live screen.
-/// A tap in a resident's chat. Unlike messages, reactions needn't arrive
-/// encrypted: Element Web and FluffyChat send them in the clear even in
-/// encrypted rooms (an emoji and the event it points at: public anyway).
-/// They carry no text; the chat itself is still checked to be private and
-/// encrypted before anything happens.
+/// A tap in a resident's chat: counted only on their live screen (or 📊 on
+/// a check-in notice).
+///
+/// Unlike messages, reactions needn't arrive encrypted: Element Web and
+/// FluffyChat send them in the clear even in encrypted rooms (an emoji and
+/// the event it points at: public anyway). They carry no text; the chat
+/// itself is still checked to be private and encrypted before anything
+/// happens.
+///
+/// The tap is taken away again (so the button can be pressed once more)
+/// only *after* the screen has changed. While their reaction is still
+/// there, a second tap on the same button is, to the client, taking it
+/// back: a redaction the bot ignores. Taking it away first would open a
+/// moment in which the old screen still shows but a tap lands on the new
+/// one (1️⃣ on the topic list choosing location 1️⃣).
 pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
     let Some(resident) = kk.resident_of(room).await else {
         return;
@@ -473,7 +497,6 @@ pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
         lock(kk, room, &resident.mxid).await;
         return;
     };
-    consume(kk, room, &ev.event_id).await;
     let ttl = kk.settings.get().session_ttl();
     let key = ev.content.relates_to.key.clone();
     let room_id = room.room_id().as_str();
@@ -489,9 +512,22 @@ pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
                 .await
         }
     };
-    match result {
-        Ok(msgs) => deliver(kk, room, &resident.mxid, msgs).await,
-        Err(error) => tracing::error!(%error, "A Kummerkasten tap failed"),
+    // A reaction that isn't a button of this screen (a ❤️ for the bot) is
+    // left alone: it did nothing and is theirs.
+    let pressed = match result {
+        Ok(msgs) if msgs.is_empty() => false,
+        Ok(msgs) => {
+            deliver(kk, room, &resident.mxid, msgs).await;
+            true
+        }
+        Err(error) => {
+            tracing::error!(%error, "A Kummerkasten tap failed");
+            deliver(kk, room, &resident.mxid, vec![Msg::note(SORRY)]).await;
+            true
+        }
+    };
+    if pressed {
+        consume(kk, room, &ev.event_id).await;
     }
     kk.wake.notify_one();
 }
@@ -711,7 +747,7 @@ pub async fn on_entry_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEv
 pub async fn post_entry(kk: &Kk, room: &Room) -> Result<()> {
     let text = "📮 **Kummerkasten**\n\n\
                 Something on your mind? A problem, an idea, a thank-you? 🌱\n\
-                Tap 📮 and I'll open a private chat with you.\n\n\
+                Tap 📮 (or write `!kummerkasten`) and I'll open a private chat with you.\n\n\
                 🥷 anonymous if you like · 🔐 private · 🧹 tidied up after every plenum";
     let event_id = post_with_keys(kk, room, text, &[ENTRY]).await?;
     let (room_id, id) = (room.room_id().to_string(), event_id.to_string());

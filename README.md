@@ -34,6 +34,13 @@ note, a receipt), the next step comes as a fresh screen at the bottom and
 the old one is removed. Receipts (✅ stored, the deletion code) are never
 edited.
 
+A pressed button is released (the bot takes your reaction away) once the
+screen has changed, so the same button works again on the next step. If
+the bot can't handle a tap or a message, it says so in a short note instead
+of staying silent. And if the screen is ever gone (removed by a tidy-up or
+a restart in the middle of a step), the next message or tap brings it
+back, below the answer, so there is always something to tap on.
+
 ## For residents
 
 * **Getting your chat**: write `!kummerkasten` in the house room, or tap
