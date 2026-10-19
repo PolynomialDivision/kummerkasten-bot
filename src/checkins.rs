@@ -103,6 +103,8 @@ pub struct Run {
     pub target: Target,
     pub identities: Vec<Identity>,
     pub plenum_id: Option<i64>,
+    /// When it opens: its start, or later when planned for later.
+    pub opens_at: DateTime<Utc>,
     pub closes_at: DateTime<Utc>,
     pub reminder_at: Option<DateTime<Utc>>,
     pub announce: bool,
@@ -111,8 +113,9 @@ pub struct Run {
 }
 
 impl Run {
+    /// Open for answers: started (or due to open by now), not closed.
     pub fn is_open(&self, now: DateTime<Utc>) -> bool {
-        self.open && now < self.closes_at
+        self.open && self.opens_at <= now && now < self.closes_at
     }
 
     /// "about 2 minutes".
@@ -158,6 +161,7 @@ pub fn run(conn: &Connection, id: i64) -> Result<Run> {
         target,
         identities,
         plenum_id,
+        opens_at,
         closes_at,
         reminder_at,
         announce,
@@ -170,12 +174,13 @@ pub fn run(conn: &Connection, id: i64) -> Result<Run> {
         String,
         Option<i64>,
         String,
+        String,
         Option<String>,
         bool,
         String,
     ) = conn
         .query_row(
-            "SELECT emoji, title, intro, target, identities, plenum_id, closes_at,
+            "SELECT emoji, title, intro, target, identities, plenum_id, opens_at, closes_at,
                     reminder_at, announce, status
              FROM survey_runs WHERE id = ?1",
             [id],
@@ -191,6 +196,7 @@ pub fn run(conn: &Connection, id: i64) -> Result<Run> {
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
+                    r.get(10)?,
                 ))
             },
         )
@@ -211,6 +217,7 @@ pub fn run(conn: &Connection, id: i64) -> Result<Run> {
         target: serde_json::from_str(&target)?,
         identities: parse_identities(&identities)?,
         plenum_id,
+        opens_at: time::parse_text(&opens_at)?,
         closes_at: time::parse_text(&closes_at)?,
         reminder_at: reminder_at.map(|t| time::parse_text(&t)).transpose()?,
         announce,
@@ -238,6 +245,8 @@ pub enum Deadline {
 #[derive(Clone, Debug)]
 pub struct StartOptions {
     pub target: Target,
+    /// Open later instead of at the start: the invitations go out then.
+    pub opens: Option<DateTime<Utc>>,
     pub deadline: Deadline,
     pub reminder: bool,
     pub announce: bool,
@@ -250,6 +259,7 @@ impl Default for StartOptions {
     fn default() -> Self {
         Self {
             target: Target::House,
+            opens: None,
             deadline: Deadline::Default,
             reminder: true,
             announce: false,
@@ -270,6 +280,8 @@ pub struct Plan {
     pub target: Target,
     pub identities: Vec<Identity>,
     pub plenum: Option<(i64, i64, DateTime<Utc>)>,
+    /// Set: opens then, not at the start.
+    pub opens: Option<DateTime<Utc>>,
     pub closes_at: DateTime<Utc>,
     /// Set: the deadline is this long before the plenum (negative) or
     /// after it, and follows it.
@@ -292,6 +304,9 @@ pub fn plan(
 ) -> Result<Plan> {
     let plan = draft(conn, template, opts, now, remind_before)?;
     if closes_too_soon(&plan, now) {
+        if plan.opens.is_some() {
+            bail!("It would close less than an hour after it opens. Give people at least an hour.");
+        }
         match plan.plenum_offset {
             Some(o) if o.is_zero() => bail!(
                 "The next plenum starts within the hour (or already has), and without `closes` \
@@ -310,7 +325,7 @@ pub fn plan(
 
 /// Less than an hour to answer: `plan` refuses it, a preview only warns.
 pub fn closes_too_soon(plan: &Plan, now: DateTime<Utc>) -> bool {
-    plan.closes_at <= now + Duration::hours(1)
+    plan.closes_at <= plan.opens.unwrap_or(now) + Duration::hours(1)
 }
 
 /// `plan` without the closing time check: what the preview shows.
@@ -352,17 +367,24 @@ pub fn draft(
     } else {
         None
     };
+    let opens_at = match opts.opens {
+        Some(at) if at <= now => {
+            bail!("That start is in the past. Leave out `opens` to start now.")
+        }
+        Some(at) => at,
+        None => now,
+    };
     let (closes_at, plenum_offset) = match (opts.deadline, plenum) {
         (Deadline::Fixed(at), _) => (at, None),
         (Deadline::Default, Some((_, _, at))) => (at, Some(Duration::zero())),
-        (Deadline::Default, None) => (now + Duration::days(7), None),
+        (Deadline::Default, None) => (opens_at + Duration::days(7), None),
         (Deadline::BeforePlenum(before), Some((_, _, at))) => (at - before, Some(-before)),
         (Deadline::BeforePlenum(_), None) => {
             bail!("A deadline before the plenum needs a plenum. Leave out `no-plenum`.")
         }
     };
     let reminder_at = Some(closes_at - remind_before)
-        .filter(|at| opts.reminder && *at >= now + Duration::hours(1));
+        .filter(|at| opts.reminder && *at >= opens_at + Duration::hours(1));
     if opts.announce && central_rooms(conn)?.is_empty() {
         bail!("No central room is set for announcements: `!kk rooms central <!room:server>`.");
     }
@@ -378,6 +400,7 @@ pub fn draft(
         target: opts.target.clone(),
         identities: opts.identities.clone(),
         plenum,
+        opens: opts.opens,
         closes_at,
         plenum_offset,
         reminder_at,
@@ -404,7 +427,7 @@ pub fn start(conn: &mut Connection, plan: &Plan, actor: &str, now: DateTime<Utc>
            (template_id, emoji, title, intro, target, identities, plenum_id, round_id,
             opens_at, closes_at, reminder_at, announce, created_by, created_at,
             deadline_mode, deadline_offset_minutes, reminder_offset_minutes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?9, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?17, ?14, ?15, ?16)",
         params![
             surveys::template_id(&tx, &plan.template)?,
             plan.emoji,
@@ -414,7 +437,7 @@ pub fn start(conn: &mut Connection, plan: &Plan, actor: &str, now: DateTime<Utc>
             identities_text(&plan.identities),
             plan.plenum.map(|p| p.0),
             plan.plenum.map(|p| p.1),
-            time::to_text(now),
+            time::to_text(plan.opens.unwrap_or(now)),
             time::to_text(plan.closes_at),
             plan.reminder_at.map(time::to_text),
             plan.announce,
@@ -427,6 +450,7 @@ pub fn start(conn: &mut Connection, plan: &Plan, actor: &str, now: DateTime<Utc>
             plan.plenum_offset.map(|o| o.num_minutes()),
             plan.reminder_at
                 .map(|at| (plan.closes_at - at).num_minutes()),
+            time::to_text(now),
         ],
     )?;
     let run = tx.last_insert_rowid();
@@ -438,7 +462,10 @@ pub fn start(conn: &mut Connection, plan: &Plan, actor: &str, now: DateTime<Utc>
         )?;
     }
     tx.commit()?;
-    tracing::info!(run, "Check-in started");
+    match plan.opens.filter(|at| *at > now) {
+        Some(_) => tracing::info!(run, "Check-in planned to open later"),
+        None => tracing::info!(run, "Check-in started"),
+    }
     Ok(run)
 }
 
@@ -848,7 +875,7 @@ pub fn take_reminders(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<i64>>
 
 /// Runs to announce in the central room (only those set to).
 pub fn take_announcements(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<i64>> {
-    take(conn, "announced_at", "announce = 1", now)
+    take(conn, "announced_at", "announce = 1 AND opens_at <= ?1", now)
 }
 
 pub fn central_rooms(conn: &Connection) -> Result<Vec<String>> {
@@ -922,6 +949,7 @@ pub struct RunRow {
     pub emoji: String,
     pub title: String,
     pub open: bool,
+    pub opens_at: DateTime<Utc>,
     pub closes_at: DateTime<Utc>,
     pub responses: i64,
     /// Asked when it started (counted then), if known.
@@ -954,7 +982,8 @@ pub fn open_run_of(
 pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
     let mut stmt = conn.prepare(
         "SELECT r.id, r.emoji, r.title, r.status = 'open', r.closes_at,
-                (SELECT count(*) FROM responses s WHERE s.run_id = r.id), r.eligible_at_launch
+                (SELECT count(*) FROM responses s WHERE s.run_id = r.id), r.eligible_at_launch,
+                r.opens_at
          FROM survey_runs r ORDER BY r.id DESC LIMIT 10",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -966,16 +995,18 @@ pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
             r.get::<_, String>(4)?,
             r.get(5)?,
             r.get(6)?,
+            r.get::<_, String>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, emoji, title, open, closes, responses, eligible) = row?;
+        let (id, emoji, title, open, closes, responses, eligible, opens) = row?;
         out.push(RunRow {
             id,
             emoji,
             title,
             open,
+            opens_at: time::parse_text(&opens)?,
             closes_at: time::parse_text(&closes)?,
             responses,
             eligible,
@@ -1512,6 +1543,72 @@ pub(crate) mod tests {
         assert_eq!(close_due(&conn, loud.closes_at).unwrap(), 2);
         assert_eq!(message_run(&conn, "$notice").unwrap(), None);
         assert!(!run(&conn, loud.id).unwrap().is_open(now));
+    }
+
+    #[test]
+    fn a_check_in_planned_for_later_stays_hidden_until_it_opens() {
+        let now = at(2026, 11, 2, 12);
+        let mut conn = with_default_rule(now);
+        let secrets = Secrets::from_master(&[1; 32]);
+        let opens = now + Duration::days(1);
+        let run = started(
+            &mut conn,
+            now,
+            StartOptions {
+                opens: Some(opens),
+                ..Default::default()
+            },
+        );
+        assert_eq!(run.opens_at, opens);
+        assert!(!run.is_open(now));
+        assert!(run.is_open(opens));
+        // The reminder still comes after it opens, a day before the close.
+        assert!(run.reminder_at.unwrap() > opens);
+        // Until then nobody is told and nobody sees it.
+        assert!(take_notices(&conn, now).unwrap().is_empty());
+        assert!(listing(&conn, &secrets, "@a:x", &rooms(), None, now)
+            .unwrap()
+            .is_empty());
+        assert!(!should_tell(&conn, &secrets, &run, "@a:x", &rooms(), None, now).unwrap());
+        // Then the invitations go out, once.
+        assert_eq!(take_notices(&conn, opens).unwrap(), [run.id]);
+        assert!(take_notices(&conn, opens).unwrap().is_empty());
+        let list = listing(&conn, &secrets, "@a:x", &rooms(), None, opens).unwrap();
+        assert_eq!(list.iter().map(|l| l.id).collect::<Vec<_>>(), [run.id]);
+        // A second one for the same people is refused meanwhile, as for an
+        // open one.
+        assert_eq!(
+            open_run_of(&conn, "cleaning", &Target::House, now).unwrap(),
+            Some(run.id)
+        );
+    }
+
+    #[test]
+    fn a_planned_start_must_be_ahead_and_leave_time_to_answer() {
+        let now = at(2026, 11, 2, 12);
+        let conn = with_default_rule(now);
+        let remind = Duration::hours(24);
+        let past = StartOptions {
+            opens: Some(now - Duration::minutes(5)),
+            ..Default::default()
+        };
+        let error = plan(&conn, "cleaning", &past, now, remind).unwrap_err();
+        assert!(error.to_string().contains("in the past"), "{error}");
+        // Opening after the plenum it would close at: no time to answer.
+        let next = plenums::next(&conn).unwrap().unwrap().starts_at;
+        let late = StartOptions {
+            opens: Some(next + Duration::hours(2)),
+            ..Default::default()
+        };
+        let error = plan(&conn, "cleaning", &late, now, remind).unwrap_err();
+        assert!(error.to_string().contains("after it opens"), "{error}");
+        // With its own close a week later: fine.
+        let dated = StartOptions {
+            opens: Some(next + Duration::hours(2)),
+            deadline: Deadline::Fixed(next + Duration::days(7)),
+            ..Default::default()
+        };
+        assert!(plan(&conn, "cleaning", &dated, now, remind).is_ok());
     }
 
     #[test]

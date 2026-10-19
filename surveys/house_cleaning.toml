@@ -5,7 +5,7 @@ key = "house_cleaning"
 emoji = "🧹"
 title = "House cleaning"
 topic = "cleaning"
-intro = "We'd like to know how cleaning in the house works for you, so the plenum on Sunday can talk about what really bothers people and what helps."
+intro = "We'd like to know how cleaning in the house works for you, so the plenum on Sunday can talk about what really bothers people and what helps.\n\n🥷 Your answers are anonymous.\n⏱️ About 5 minutes. The written questions at the end are optional."
 
 [[question]]
 single = "🧼 How happy are you with how clean the house is right now?"
@@ -44,7 +44,7 @@ choices = [
 other = "✏️ Something else"
 
 [[question]]
-single = "🍽️ What is the bigger problem, in your view?"
+single = "🔍 What is the bigger problem, in your view?"
 choices = [
     "🧹 Cleaning shifts aren't done well enough",
     "🍽️ People leave too much mess in everyday life",
@@ -76,7 +76,7 @@ choices = [
 other = "✏️ My own idea"
 
 [[question]]
-single = "🗓️ Do we clean often enough? (Next you can say which areas, if you like.)"
+single = "🗓️ Do we clean often enough? (Afterwards you can add which areas you mean.)"
 choices = [
     "👍 Yes, just right",
     "⬆️ We should clean more often",

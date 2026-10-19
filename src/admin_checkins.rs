@@ -33,7 +33,7 @@ pub const HELP: &str = "📊 **Check-ins**
 `!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview` · `export`
 `!kk survey load [<name>]`: a survey file (store/surveys/, or upload a .toml here)
 `!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
-`!kk checkin start <key> [house | room <!room> | floor <location>] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
+`!kk checkin start <key> [house | room <!room> | floor <location>] [opens 2026-11-10 [18:00]] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
    without `closes`: until the plenum starts; `1d-before`/`12h-before` follow the plenum when it moves, a date doesn't
 `!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin close <n>`
 `!kk rooms central <!room> [off]`: where `announce` posts";
@@ -53,7 +53,7 @@ Residents see nothing but the check-in you start. They get it as a message, answ
 2️⃣ **Start it**
 `!kk checkin start cleaning`: shows what would happen, then
 `!kk checkin go` to start it (or `!kk checkin drop`)
-   options: `closes 2026-11-14 [18:00]` · `closes 1d-before` · `only anonymous` · `no-reminder` · `room <!room>` · `floor <location>`
+   options: `opens 2026-11-10 [18:00]` (invite then, not now) · `closes 2026-11-14 [18:00]` · `closes 1d-before` · `only anonymous` · `no-reminder` · `room <!room>` · `floor <location>`
    by default it closes when the next plenum starts, with one reminder a day before
 
 3️⃣ **Follow it**
@@ -507,6 +507,7 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
                 target: plan.target.clone(),
                 identities: plan.identities.clone(),
                 plenum_id: plan.plenum.map(|p| p.0),
+                opens_at: plan.opens.unwrap_or(now),
                 closes_at: plan.closes_at,
                 reminder_at: None,
                 announce: false,
@@ -835,6 +836,19 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
                 });
                 i += 1;
             }
+            "opens" => {
+                // Planned for later: the invitations go out then.
+                let date = time::parse_date(rest.get(i + 1).context("`opens` needs a date")?)?;
+                let at = match rest.get(i + 2).and_then(|t| time::parse_hm(t).ok()) {
+                    Some(t) => {
+                        i += 1;
+                        t
+                    }
+                    None => chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                };
+                opts.opens = Some(zone.at(date, at));
+                i += 1;
+            }
             "closes" => {
                 let date = time::parse_date(rest.get(i + 1).context("`closes` needs a date")?)?;
                 let at = match rest.get(i + 2).and_then(|t| time::parse_hm(t).ok()) {
@@ -902,6 +916,13 @@ async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<St
     if let Some(asked_for) = asked_for {
         out.push(format!("   (live it would go to: {asked_for})"));
     }
+    out.push(match plan.opens {
+        Some(at) => format!(
+            "🕒 Opens {} · nobody sees it before",
+            zone.day_time_label(at, today)
+        ),
+        None => "🕒 Opens right away".to_owned(),
+    });
     out.extend([
         format!("📝 {} question(s)", plan.versions.len()),
         format!(
@@ -953,12 +974,20 @@ async fn go(kk: &Kk, actor: &str) -> Result<String> {
         .map(|(plan, _)| plan)
         .context("Nothing to start. Plan it first with `!kk checkin start <key> …`.")?;
     let actor = actor.to_owned();
+    let opens = plan.opens.filter(|at| *at > Utc::now());
     let id = kk
         .engine
         .db
         .run(move |c| checkins::start(c, &plan, &actor, Utc::now()))
         .await?;
     kk.wake.notify_one();
+    if let Some(at) = opens {
+        let zone = kk.engine.zone;
+        let when = zone.day_time_label(at, zone.date(Utc::now()));
+        return Ok(format!(
+            "🕒 Check-in #{id} planned: it opens {when}.\n📬 Then everyone it's for gets one message in their Kummerkasten chat.\n🔒 Changed your mind? `!kk checkin close {id}`"
+        ));
+    }
     Ok(if kk.is_test() {
         format!("🚀 Check-in #{id} started, 🧪 only for you: the message comes into your Kummerkasten chat. 📬")
     } else {
@@ -981,12 +1010,20 @@ async fn runs(kk: &Kk) -> Result<String> {
         emoji,
         title,
         open,
+        opens_at,
         closes_at,
         responses,
         eligible,
     } in list
     {
-        let state = if open {
+        let now = Utc::now();
+        let state = if open && now < opens_at {
+            format!(
+                "🕒 planned, opens {} until {}",
+                zone.day_time_label(opens_at, today),
+                zone.day_time_label(closes_at, today)
+            )
+        } else if open {
             format!("🟢 open until {}", zone.day_time_label(closes_at, today))
         } else {
             "🔒 closed".to_owned()

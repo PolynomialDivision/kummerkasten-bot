@@ -318,6 +318,7 @@ Check-ins:
 !kk checkin start cleaning room !k2:example.org closes 2026-11-14 18:00 no-reminder announce
 !kk checkin start cleaning closes 1d-before          a day before the plenum, moving with it
 !kk checkin start cleaning floor floor.2 only anonymous,floor no-plenum
+!kk checkin start cleaning opens 2026-11-10 18:00 closes 2026-11-14 20:00   planned: invites then
 !kk checkin go · !kk checkin drop              start it / forget the plan
 !kk checkins · !kk checkin close 4
 ```
@@ -410,6 +411,12 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
   `closes 1d-before`): those, and their reminder, move when the plenum moves
   or the round moves on to another plenum. A reminder already sent stays
   sent.
+* **Planned starts** (`opens 2026-11-10 18:00`, 09:00 without a time): the
+  check-in is stored at `!kk checkin go`, but nobody is told, sees or can
+  answer it before then; the invitations go out at that time (the bot
+  checks every minute). `!kk checkins` shows it as planned, and
+  `!kk checkin close <n>` cancels it. The deadline needs to be at least an
+  hour after it opens; the reminder comes after it opens.
 * Notices, reminders and announcements go out **per run in one batch**,
   queued in the **outbox** in the transaction that marks them due. The
   outbox decides who gets it when it goes out, checks each person right
