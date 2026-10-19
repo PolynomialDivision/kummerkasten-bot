@@ -17,8 +17,12 @@ admin_users = ["@admin:example.org"]
 allowed_inviters = []
 allowed_rooms    = []
 # encryption_strategy = "identity_based"   # all_devices | identity_based | only_trusted
+# Whose devices count: "cross_signed" = every device you signed with your
+# own identity (a new identity is accepted), "verified" = only after
+# !admin verify (a new identity needs !reset-trust and a new verification).
+trust = "cross_signed"
 
-# Admin commands only from devices the bot has verified (`!admin verify`).
+# Only accept admin commands from a device that counts under `trust` above.
 [security.admin_dm]
 require_verified_device = true
 
