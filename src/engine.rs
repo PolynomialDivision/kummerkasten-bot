@@ -555,7 +555,7 @@ impl Engine {
                 };
                 let mut out = Vec::new();
                 for (mxid, room_id, json, updated) in sessions {
-                    let flow: Flow = serde_json::from_str(&json).unwrap_or_default();
+                    let flow = Flow::restore(&json);
                     let updated = time::parse_text(&updated)?;
                     if !this.draft_over(conn, &flow, updated, now, ttl)? {
                         continue;
@@ -884,7 +884,7 @@ impl Engine {
                 };
                 let mut receipts = Vec::new();
                 for (mxid, room_id, json, updated, screen) in sessions {
-                    let flow: Flow = serde_json::from_str(&json).unwrap_or_default();
+                    let flow = Flow::restore(&json);
                     let updated = time::parse_text(&updated)?;
                     if in_checkin(&flow) && !this.draft_over(conn, &flow, updated, now, ttl)? {
                         continue;
@@ -1056,17 +1056,17 @@ impl Engine {
                     };
                     return self.reset(conn, who, room_id, note, now);
                 }
-                if session.stale() && matches!(input, Input::Tap(_)) {
+                if session.stale() {
                     // The chat may still show the view before this one (a
-                    // crash or a failed edit in between; the edit not yet
-                    // delivered when a second device tapped): a tap meant
-                    // for that view must not act on this one. Show this one.
-                    return Ok(vec![Msg::screen(self.render(
-                        conn,
-                        who,
-                        &session.flow,
-                        now,
-                    )?)]);
+                    // restart or a failed edit in between; the edit not yet
+                    // delivered when a second device tapped): a tap or an
+                    // answer meant for that view must not act on this one
+                    // (a typed "3" would pick 3 here). Show this one.
+                    let view = Msg::screen(self.render(conn, who, &session.flow, now)?);
+                    return Ok(match input {
+                        Input::Tap(_) => vec![view],
+                        Input::Text { .. } => vec![Msg::note(screens::shown_again()), view],
+                    });
                 }
                 (session.flow, session.screen_event)
             }
@@ -1670,7 +1670,7 @@ fn load(conn: &Connection, mxid: &str) -> Result<Option<Session>> {
         .optional()?;
     Ok(match row {
         Some((json, updated, room, screen_event, pending, echoed)) => Some(Session {
-            flow: serde_json::from_str(&json).unwrap_or_default(),
+            flow: Flow::restore(&json),
             updated: time::parse_text(&updated)?,
             room,
             screen_event,
@@ -1683,8 +1683,9 @@ fn load(conn: &Connection, mxid: &str) -> Result<Option<Session>> {
 
 /// `msgs` as the answer to an interaction: when they hold a screen, the
 /// session is marked pending until `dm` confirms it was shown, and not
-/// echoed until the bot sees its own event showing it (same transaction as
-/// the flow it shows).
+/// echoed until the bot sees its own event showing it. (`save` already did
+/// so for a changed step, in the same statement; this covers a screen shown
+/// again unchanged.)
 fn finish(conn: &Connection, mxid: &str, msgs: Vec<Msg>) -> Result<Vec<Msg>> {
     if msgs.iter().any(|m| m.live) {
         conn.execute(
@@ -1709,9 +1710,15 @@ fn save(
     flow: &Flow,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    // A step that changed isn't shown yet: pending (and not echoed) in the
+    // same statement, so a crash right after saving can't leave the chat
+    // showing the step before as if it were this one (see `finish`).
     conn.execute(
-        "INSERT INTO sessions (mxid, room_id, flow, updated_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (mxid) DO UPDATE SET room_id = ?2, flow = ?3, updated_at = ?4",
+        "INSERT INTO sessions (mxid, room_id, flow, updated_at, pending, echoed)
+         VALUES (?1, ?2, ?3, ?4, 1, 0)
+         ON CONFLICT (mxid) DO UPDATE SET room_id = ?2, flow = ?3, updated_at = ?4,
+             pending = CASE WHEN sessions.flow IS ?3 THEN sessions.pending ELSE 1 END,
+             echoed = CASE WHEN sessions.flow IS ?3 THEN sessions.echoed ELSE 0 END",
         params![
             mxid,
             room_id,
@@ -2182,13 +2189,14 @@ mod tests {
         let out = chat.tap("⏭️");
         assert!(screen(&out).text.contains("What's your idea"));
         // ⬅️ handled but not shown: the chat still asks for the idea, the
-        // flow is back at the place. Their text is answered as the flow
-        // stands (a hint here), and the screen the flow is at comes along,
-        // so the chat stops lying.
+        // flow is back at the place. Their text was meant for the idea, so
+        // it isn't used here: a note, and the screen the flow is at, so the
+        // chat stops lying.
         chat.tap_undelivered("⬅️");
         assert!(chat.pending());
         let out = chat.say("A quiet hour after 22:00");
         assert_eq!(out[0].kind, Kind::Note);
+        assert_eq!(out[0].text, screens::shown_again());
         assert!(screen(&out).text.contains("📍 **Where?**"));
         assert!(!chat.pending());
         assert_eq!(chat.count("SELECT count(*) FROM submissions"), 0);

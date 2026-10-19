@@ -26,7 +26,27 @@ pub fn add_room(conn: &Connection, room_id: &str, label: &str, actor: &str) -> R
     Ok(())
 }
 
+/// Open check-ins for the members of `room_id`: without the room they would
+/// reach nobody, and whoever is answering would lose their answers.
+pub fn open_runs_for_room(conn: &Connection, room_id: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM survey_runs
+         WHERE status = 'open' AND closes_at > ?2
+           AND json_extract(target, '$.kind') = 'room'
+           AND json_extract(target, '$.room_id') = ?1
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![room_id, time::now_text()], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn remove_room(conn: &Connection, room_id: &str) -> Result<bool> {
+    if let Some(id) = open_runs_for_room(conn, room_id)?.first() {
+        anyhow::bail!(
+            "Check-in #{id} is still open for the members of this room. \
+             Close it first with `!kk checkin close {id}`."
+        );
+    }
     Ok(conn.execute(
         "UPDATE authorized_rooms SET active = 0 WHERE room_id = ?1 AND active = 1",
         [room_id],
@@ -55,6 +75,15 @@ pub fn sync_rooms(conn: &Connection, rooms: &[crate::config::RoomConfig]) -> Res
         rows.collect::<rusqlite::Result<_>>()?
     };
     for room in active.iter().filter(|r| !listed.contains(&r.as_str())) {
+        let open = open_runs_for_room(&tx, room)?;
+        if !open.is_empty() {
+            tracing::warn!(
+                room,
+                runs = ?open,
+                "A room left the config while check-ins for its members are open: \
+                 they now reach nobody (put the room back, or close them)"
+            );
+        }
         changed += tx.execute(
             "UPDATE authorized_rooms SET active = 0, central = 0 WHERE room_id = ?1",
             [room],
@@ -392,6 +421,18 @@ pub fn replace_screen(conn: &Connection, room_id: &str, event_id: &str) -> Resul
         "UPDATE dm_events SET doomed = 1
          WHERE room_id = ?1 AND in_session = 1 AND (event_id = ?2 OR replaces = ?2)",
         params![room_id, event_id],
+    )?)
+}
+
+/// Whether anything was stored that only reads with the secret key: who
+/// answered a check-in, deletion codes. Then a missing key file is an
+/// error, not a reason to make a new one.
+pub fn holds_keyed_data(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM participations)
+             OR EXISTS (SELECT 1 FROM deletion_credentials)",
+        [],
+        |r| r.get(0),
     )?)
 }
 

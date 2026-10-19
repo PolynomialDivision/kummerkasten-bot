@@ -1182,6 +1182,12 @@ pub fn locked() -> String {
         .to_owned()
 }
 
+/// A message typed while the chat still showed the step before (the bot
+/// had just restarted or an update hadn't arrived): not used.
+pub fn shown_again() -> &'static str {
+    "🔄 The question had just changed, so I didn't use that.\n👇 Here it is: please answer it again."
+}
+
 pub fn expired() -> &'static str {
     "⏳ That took a while, so I tidied away the unfinished draft. Here's the menu again!"
 }

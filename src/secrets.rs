@@ -37,10 +37,21 @@ impl std::fmt::Debug for Secrets {
 }
 
 impl Secrets {
-    /// Load the master key from `path`, creating it if it doesn't exist.
-    pub fn load_or_create(path: &Path) -> Result<Self> {
+    /// Load the master key from `path`, creating it if it doesn't exist and
+    /// `may_create`: not when the database already holds what was made with
+    /// a key (a deploy that lost the file would otherwise let everyone
+    /// answer a running check-in again and break every deletion code).
+    pub fn load_or_create(path: &Path, may_create: bool) -> Result<Self> {
         let master = match std::fs::read(path) {
             Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !may_create => {
+                bail!(
+                    "{} is missing, but the database holds data made with it (who answered \
+                     which check-in, deletion codes). Restore the file (it belongs next to the \
+                     database), or move the database away to start over.",
+                    path.display()
+                )
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let mut key = vec![0u8; 32];
                 OsRng.fill_bytes(&mut key);
@@ -225,10 +236,15 @@ mod tests {
     fn the_key_file_is_created_once_and_private() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kummerkasten.key");
-        let first = Secrets::load_or_create(&path).unwrap();
-        let again = Secrets::load_or_create(&path).unwrap();
+        let first = Secrets::load_or_create(&path, true).unwrap();
+        let again = Secrets::load_or_create(&path, false).unwrap();
         let token = new_token();
         assert_eq!(first.token_hmac(&token), again.token_hmac(&token));
+        // Lost while the database holds keyed data: refused, not replaced.
+        let lost = dir.path().join("lost.key");
+        let error = Secrets::load_or_create(&lost, false).unwrap_err();
+        assert!(error.to_string().contains("is missing"), "{error}");
+        assert!(!lost.exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

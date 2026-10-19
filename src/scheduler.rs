@@ -34,7 +34,17 @@ const REDACT_PAUSE: Duration = Duration::from_millis(250);
 
 pub async fn run(kk: Kk) {
     loop {
-        tick(&kk).await;
+        // Each tick on its own task: a panic in one is logged and the clock
+        // goes on. Otherwise nothing time-based (notices, reminders,
+        // closing, redactions) would happen again until a restart, and the
+        // health check (sync only) would not notice.
+        let ticking = tokio::spawn({
+            let kk = kk.clone();
+            async move { tick(&kk).await }
+        });
+        if let Err(error) = ticking.await {
+            tracing::error!(%error, "A scheduler tick failed; carrying on");
+        }
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
             _ = kk.wake.notified() => {}
@@ -241,6 +251,16 @@ async fn recipients(kk: &Kk, kind: outbox::Kind, ref_id: i64) -> anyhow::Result<
     use outbox::Kind as K;
     Ok(match kind {
         K::Notice | K::Reminder => {
+            // Closed meanwhile (the bot was down past its close): nobody,
+            // and no chats created for it.
+            let open = kk
+                .engine
+                .db
+                .run(move |c| Ok(checkins::run(c, ref_id)?.is_open(Utc::now())))
+                .await?;
+            if !open {
+                return Ok(Vec::new());
+            }
             if kind == K::Notice {
                 // Before the notice, every eligible resident without a chat
                 // gets one (they get the notice when they accept it).
@@ -318,8 +338,11 @@ async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
         ) else {
             return dm::Told::NotNeeded;
         };
-        let Some(who) = kk.who(&user).await else {
-            return dm::Told::NotNeeded;
+        // Not a member any more: not needed. The server couldn't say: later.
+        let who = match kk.who_checked(&user).await {
+            Ok(Some(who)) => who,
+            Ok(None) => return dm::Told::NotNeeded,
+            Err(_) => return dm::Told::Failed,
         };
         let which = if item.kind == K::Reminder {
             CheckinText::Reminder
@@ -367,6 +390,21 @@ async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
         })
         .await;
     if kind == K::Announcement {
+        // Only while it is open: days late (a room unreachable meanwhile)
+        // it would invite to a closed check-in.
+        let open = kk
+            .engine
+            .db
+            .run(move |c| Ok(checkins::run(c, id)?.is_open(now)))
+            .await;
+        match open {
+            Ok(true) => {}
+            Ok(false) => return dm::Told::NotNeeded,
+            Err(error) => {
+                tracing::error!(%error, "Could not read a check-in to announce");
+                return dm::Told::Failed;
+            }
+        }
         let text = match kk
             .engine
             .checkin_text(id, CheckinText::Announcement, now)

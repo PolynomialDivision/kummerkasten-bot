@@ -417,7 +417,9 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
 * Deletion codes: 80 random bits (16 Crockford Base32 characters from the
   OS's random generator, `XXXX-XXXX-XXXX-XXXX`; codes handed out before,
   with 12 characters, still work), stored as HMAC-SHA256 with a server key
-  (`store/kummerkasten.key`, 0600, created on first start). Never stored or
+  (`store/kummerkasten.key`, 0600, created on first start; once the
+  database holds codes or check-in answers, a missing key file stops the
+  bot instead of being replaced). Never stored or
   logged in clear. Without the key a database copy can't even test guesses;
   looking one up compares HMACs, so timing can't help guess a code.
 * 🗑️ Deleting deletes the database record (and its code), and the bot
@@ -496,8 +498,9 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
 **Access**
 
 * Who may use it: members of the authorized rooms, asked of the homeserver
-  **before every action** (never cached). Errors count as "no". Leaving all
-  rooms locks the chat at the next tap.
+  **before every action** (never cached). When the server can't answer,
+  nothing is done ("try again in a moment"), and nothing they were
+  answering is dropped. Leaving all rooms locks the chat at the next tap.
 * Every message or tap in a chat is only handled if the chat is still
   exactly the bot and that resident, both joined, and end-to-end encrypted
   (fresh `/state`), and for messages the event itself must have arrived
@@ -529,6 +532,48 @@ participations (run, HMAC key)        responses (UUID) ── answers ── ans
 * **Small groups**: floor submissions on a floor with two people aren't
   anonymous; results hide groups below `privacy_threshold` (and what would
   reveal them).
+
+## Updates and restarts
+
+An update (or any restart) while a check-in is running loses nothing:
+
+* **Stopping** (`docker stop`, SIGTERM): the taps and messages being
+  handled are finished first (up to 8 s, under Docker's 10 s), then the
+  bot stops between two sync batches. Nothing is half done.
+* **Answers in progress** are in the database after every step. After the
+  restart the chat shows the question they were at again; a tap or a typed
+  answer meant for the screen before is not used ("🔄 The question had
+  just changed"). Answers are stored once, even if ✅ arrives twice.
+* **Downtime**: a check-in that closed meanwhile is closed at the first
+  tick and nothing goes out for it any more (no notices, no chats created,
+  no announcement). A reminder whose time passed is sent late, unless the
+  check-in closes within the hour; one that a moved plenum would put in
+  the past is dropped.
+* **A new version that stores things differently**: answers in progress
+  from the old version still read (tests pin what is stored). If a
+  conversation can't be read at all, the check-in is kept and starts again
+  at its intro with the answers that still read; the log says so (without
+  any text).
+* **The server having trouble** right after a restart: "try again in a
+  moment", never a locked chat or a lost draft.
+* **The scheduler** (notices, reminders, closing, redactions) carries on
+  after an unexpected error in one tick.
+
+What the bot refuses at startup, to keep data consistent:
+
+* **An older image over a newer database** (rollback): it says which
+  version the database is from. Run the newer image again, or restore a
+  backup from before the update.
+* **A missing `kummerkasten.key`** while the database holds codes or
+  check-in answers: a new key would let everyone answer a running check-in
+  again and break every deletion code. Restore the file.
+
+Removing a room that an open check-in is for: `!kk rooms remove` refuses
+(close the check-in first); a room dropped from `[[kummerkasten.rooms]]`
+is logged as a warning.
+
+Not covered: a hard kill (`kill -9`, out of memory) in the middle of
+handling can still lose the taps of that moment; the resident taps again.
 
 ## Development
 

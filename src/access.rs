@@ -1,6 +1,8 @@
 //! Who may use the Kummerkasten: whoever is joined to one of the authorized
 //! rooms *right now*, as the homeserver says: asked again before every
-//! action, never remembered. Errors count as "no".
+//! action, never remembered. When the server can't answer, nothing is
+//! allowed; callers tell that apart from "not joined" so a hiccup doesn't
+//! lock anyone out for good.
 
 use std::future::Future;
 
@@ -28,27 +30,31 @@ pub async fn authorized<M: Membership>(
     rooms: &[OwnedRoomId],
     user: &UserId,
 ) -> bool {
-    !joined_rooms(membership, rooms, user).await.is_empty()
+    joined_rooms(membership, rooms, user)
+        .await
+        .is_ok_and(|joined| !joined.is_empty())
 }
 
 /// Which of `rooms` `user` is joined to right now (for targets like "the
-/// members of Kitchen 2"). Empty: no access.
+/// members of Kitchen 2"). Empty: no access. `Err`: the server couldn't say
+/// for one of them, so the list may be short (and a target missed).
 pub async fn joined_rooms<M: Membership>(
     membership: &M,
     rooms: &[OwnedRoomId],
     user: &UserId,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut joined = Vec::new();
     for room in rooms {
         match membership.is_joined(room, user).await {
             Ok(true) => joined.push(room.to_string()),
             Ok(false) => {}
             Err(error) => {
-                tracing::warn!(room = %room, %error, "Could not check a membership; counting it as no");
+                tracing::warn!(room = %room, %error, "Could not check a membership");
+                anyhow::bail!("the server could not say whether {user} is in {room}");
             }
         }
     }
-    joined
+    Ok(joined)
 }
 
 #[cfg(test)]
@@ -100,7 +106,7 @@ mod tests {
         // A member of any authorized room may use it.
         assert!(authorized(&server, &rooms, alice).await);
         assert_eq!(
-            joined_rooms(&server, &rooms, alice).await,
+            joined_rooms(&server, &rooms, alice).await.unwrap(),
             [floor.to_string()]
         );
         // A room that isn't authorized doesn't count.
@@ -116,5 +122,7 @@ mod tests {
             .insert((floor.clone(), alice.to_owned()));
         server.broken.lock().unwrap().insert(floor);
         assert!(!authorized(&server, &rooms, alice).await);
+        // ... and the caller can tell it from "not joined".
+        assert!(joined_rooms(&server, &rooms, alice).await.is_err());
     }
 }

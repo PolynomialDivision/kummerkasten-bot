@@ -113,16 +113,23 @@ impl Kk {
     /// `user` with the authorized rooms they are in right now (asked of
     /// the server); `None` without access.
     pub async fn who(&self, user: &UserId) -> Option<Who> {
+        self.who_checked(user).await.ok().flatten()
+    }
+
+    /// [`Kk::who`], with "the server couldn't say" (`Err`) apart from "not
+    /// a member" (`None`): only the second locks a chat and drops what
+    /// they were answering.
+    pub async fn who_checked(&self, user: &UserId) -> Result<Option<Who>> {
         // Test mode: nobody but the admins, whichever room they are in.
         if !self.may_use(user.as_str()) {
-            return None;
+            return Ok(None);
         }
         let rooms = self.authorized_rooms().await;
-        let joined = access::joined_rooms(&self.client, &rooms, user).await;
-        (!joined.is_empty()).then(|| Who {
+        let joined = access::joined_rooms(&self.client, &rooms, user).await?;
+        Ok((!joined.is_empty()).then(|| Who {
             mxid: user.to_string(),
             rooms: joined,
-        })
+        }))
     }
 
     /// The chat is still exactly the bot and `user`, joined and encrypted.
@@ -213,6 +220,11 @@ pub async fn deliver_txn(
 /// Said when handling a tap or message failed on the bot's side. Nothing
 /// about what went wrong: the chat holds private text, logs hold the error.
 const SORRY: &str = "😕 Something went wrong on my side. Please try that again, or send `!menu`.";
+
+/// The server couldn't confirm they're still in the house: nothing done,
+/// nothing lost.
+const UNSURE: &str =
+    "📡 I couldn't check that with the server just now.\n⏳ Nothing is lost: please try again in a moment.";
 
 /// Show `msg` as the chat's screen: edit the current one, or send a fresh
 /// one (with `txn` if given). Returns whether it is shown.
@@ -646,9 +658,23 @@ pub async fn on_message(
     if !first.unwrap_or(false) || !kk.chat_is_private(room, &ev.sender).await {
         return;
     }
-    let Some(who) = kk.who(&ev.sender).await else {
-        lock(kk, room, &resident.mxid).await;
-        return;
+    let who = match kk.who_checked(&ev.sender).await {
+        Ok(Some(who)) => who,
+        Ok(None) => {
+            lock(kk, room, &resident.mxid).await;
+            return;
+        }
+        Err(_) => {
+            // Their message is kept as a chat event (cleared with the rest).
+            let (room_id, id) = (room.room_id().to_string(), event_id.clone());
+            let _ = kk
+                .engine
+                .db
+                .run(move |c| store::record_event(c, &room_id, &id, true))
+                .await;
+            deliver(kk, room, &resident.mxid, vec![Msg::note(UNSURE)]).await;
+            return;
+        }
     };
     {
         let (room_id, id) = (room.room_id().to_string(), event_id.clone());
@@ -761,9 +787,17 @@ pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
     if !first.unwrap_or(false) || !kk.chat_is_private(room, &ev.sender).await {
         return;
     }
-    let Some(who) = kk.who(&ev.sender).await else {
-        lock(kk, room, &resident.mxid).await;
-        return;
+    let who = match kk.who_checked(&ev.sender).await {
+        Ok(Some(who)) => who,
+        Ok(None) => {
+            lock(kk, room, &resident.mxid).await;
+            return;
+        }
+        Err(_) => {
+            deliver(kk, room, &resident.mxid, vec![Msg::note(UNSURE)]).await;
+            consume(kk, room, &ev.event_id).await;
+            return;
+        }
     };
     let ttl = kk.settings.get().session_ttl();
     let key = ev.content.relates_to.key.clone();
@@ -814,9 +848,15 @@ pub async fn on_member(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMemberEvent) {
         MembershipState::Join if !resident.dm_joined => {
             let m = mxid.clone();
             let _ = kk.engine.db.run(move |c| store::set_joined(c, &m)).await;
-            let Some(who) = kk.who(&ev.state_key).await else {
-                lock(kk, room, &mxid).await;
-                return;
+            let who = match kk.who_checked(&ev.state_key).await {
+                Ok(Some(who)) => who,
+                Ok(None) => {
+                    lock(kk, room, &mxid).await;
+                    return;
+                }
+                // The server couldn't say: nothing now, their next tap or
+                // message (or the next notice) tries again.
+                Err(_) => return,
             };
             if kk.engine.is_survey() {
                 // No introduction, no menu: the check-in waiting for them.
@@ -897,7 +937,7 @@ pub async fn open_chat(kk: &Kk, user: &UserId) -> Result<Opened> {
 
 /// Open (or bring up) `user`'s chat, at `at` if they have one already.
 pub async fn open_chat_at(kk: &Kk, user: &UserId, at: Option<MenuItem>) -> Result<Opened> {
-    let Some(who) = kk.who(user).await else {
+    let Some(who) = kk.who_checked(user).await? else {
         return Ok(Opened::Locked);
     };
     if kk.engine.is_survey() && !kk.engine.has_survey_for(&who, Utc::now()).await? {

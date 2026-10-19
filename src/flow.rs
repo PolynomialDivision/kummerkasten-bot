@@ -116,6 +116,7 @@ pub enum Share {
 pub struct CheckinDraft {
     pub run: i64,
     /// By question position (0-based).
+    #[serde(default)]
     pub answers: BTreeMap<usize, Answer>,
     pub identity: Option<Identity>,
     /// Answers the author chose to share as ideas, by question.
@@ -123,7 +124,10 @@ pub struct CheckinDraft {
     pub ideas: BTreeMap<usize, IdeaPlan>,
 }
 
+/// Stored with the session: a field added later needs a default (missing
+/// in older rows), and the tests in `a_saved_flow_*` pin what is stored.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct Draft {
     pub topic: Option<i64>,
     pub location: Option<i64>,
@@ -159,6 +163,7 @@ impl Default for Draft {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct Flow {
     pub stack: Vec<Screen>,
     pub draft: Draft,
@@ -174,6 +179,27 @@ impl Default for Flow {
 }
 
 impl Flow {
+    /// A saved flow read back. One this version can't read (a release
+    /// changed what is stored) is logged, and a check-in in it is kept:
+    /// from its intro, with the answers that still read. Only the position
+    /// of the problem is logged, never the text around it.
+    pub fn restore(json: &str) -> Flow {
+        match serde_json::from_str(json) {
+            Ok(flow) => flow,
+            Err(error) => {
+                let kept = salvage_checkin(json);
+                tracing::error!(
+                    kind = ?error.classify(),
+                    line = error.line(),
+                    column = error.column(),
+                    kept_checkin = kept.is_some(),
+                    "A saved conversation could not be read"
+                );
+                kept.unwrap_or_default()
+            }
+        }
+    }
+
     pub fn screen(&self) -> &Screen {
         self.stack.last().unwrap_or(&Screen::Menu)
     }
@@ -225,6 +251,27 @@ impl Flow {
             self.draft.suggestion.as_deref()
         }
     }
+}
+
+/// The check-in of a flow that no longer reads as a whole: its run and the
+/// answers that still read, back at the intro.
+fn salvage_checkin(json: &str) -> Option<Flow> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let checkin = value.get("draft")?.get("checkin")?;
+    let run = checkin.get("run")?.as_i64()?;
+    let answers = checkin
+        .get("answers")
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default();
+    let mut flow = Flow::default();
+    flow.draft.checkin = Some(CheckinDraft {
+        run,
+        answers,
+        identity: None,
+        ideas: BTreeMap::new(),
+    });
+    flow.push(Screen::CheckinIntro);
+    Some(flow)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1017,6 +1064,74 @@ mod tests {
         let f = to_preview(&cat, Identity::Named);
         let stored = serde_json::to_string(&f).unwrap();
         assert_eq!(serde_json::from_str::<Flow>(&stored).unwrap(), f);
+    }
+
+    /// A check-in half answered, as an earlier release stored it. If this
+    /// stops reading, a deploy would throw away everyone's answers in
+    /// progress: give the new field a default instead of changing this.
+    const STORED_CHECKIN: &str = r#"{"stack":[{"screen":"menu"},{"screen":"checkin_intro"},{"screen":"checkin_question","index":1},{"screen":"checkin_comment","index":1}],"draft":{"topic":null,"location":null,"body":null,"suggestion":null,"identity":null,"floor":null,"retention":null,"for_plenum":true,"checkin":{"run":7,"answers":{"0":{"value":3,"choices":[],"text":null,"comment":null,"skipped":false},"1":{"value":null,"choices":[11,12],"text":null,"comment":"often","skipped":false}},"identity":"anonymous","ideas":{}},"idea":null}}"#;
+
+    fn stored_checkin() -> Flow {
+        let mut flow = Flow::default();
+        flow.draft.checkin = Some(CheckinDraft {
+            run: 7,
+            answers: BTreeMap::from([
+                (
+                    0,
+                    Answer {
+                        value: Some(3),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    1,
+                    Answer {
+                        choices: vec![11, 12],
+                        comment: Some("often".into()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            identity: Some(Identity::Anonymous),
+            ideas: BTreeMap::new(),
+        });
+        flow.push(Screen::CheckinIntro);
+        flow.push(Screen::CheckinQuestion { index: 1 });
+        flow.push(Screen::CheckinComment { index: 1 });
+        flow
+    }
+
+    #[test]
+    fn a_saved_flow_from_an_earlier_release_still_reads() {
+        assert_eq!(Flow::restore(STORED_CHECKIN), stored_checkin());
+        assert_eq!(
+            serde_json::to_string(&stored_checkin()).unwrap(),
+            STORED_CHECKIN,
+            "what is stored changed: old rows must still read (see above)"
+        );
+        // Rows from before a field existed: the field takes its default.
+        let older = r#"{"stack":[{"screen":"menu"},{"screen":"checkin_intro"}],"draft":{"checkin":{"run":7}}}"#;
+        let flow = Flow::restore(older);
+        assert_eq!(flow.run(), Some(7));
+        assert_eq!(flow.screen(), &Screen::CheckinIntro);
+        assert!(flow.draft.for_plenum);
+    }
+
+    #[test]
+    fn a_saved_flow_that_no_longer_reads_keeps_its_check_in() {
+        // A screen this version doesn't know: back to the intro, answers kept.
+        let unknown = STORED_CHECKIN.replace("checkin_comment", "checkin_photo");
+        let flow = Flow::restore(&unknown);
+        assert_eq!(flow.stack, vec![Screen::Menu, Screen::CheckinIntro]);
+        let kept = flow.draft.checkin.unwrap();
+        assert_eq!(kept.run, 7);
+        assert_eq!(
+            kept.answers,
+            stored_checkin().draft.checkin.unwrap().answers
+        );
+        // Nothing to save: the menu, as before.
+        assert_eq!(Flow::restore("{\"stack\":7}"), Flow::default());
+        assert_eq!(Flow::restore("not json"), Flow::default());
     }
 
     // ── Check-ins ──────────────────────────────────────────────────────────

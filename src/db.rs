@@ -96,6 +96,19 @@ pub fn migrate(conn: &mut Connection) -> Result<usize> {
              applied_at  TEXT NOT NULL
          );",
     )?;
+    // An older image over a database a newer one migrated: it would write
+    // what the schema no longer takes, or misread what it holds.
+    let newest: Option<i64> =
+        conn.query_row("SELECT max(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })?;
+    let known = MIGRATIONS.last().map_or(0, |(version, _)| *version);
+    if let Some(newest) = newest.filter(|n| *n > known) {
+        anyhow::bail!(
+            "The database is from a newer version of the bot (migration {newest}, this one knows \
+             up to {known}). Run the newer image again, or restore a backup from before it."
+        );
+    }
     let mut applied = 0;
     for (version, sql) in MIGRATIONS {
         let done: Option<i64> = conn
@@ -163,6 +176,16 @@ mod tests {
             .query_row("PRAGMA secure_delete", [], |r| r.get(0))
             .unwrap();
         assert_eq!(secure, 1);
+    }
+
+    #[test]
+    fn an_older_image_refuses_a_database_a_newer_one_migrated() {
+        let mut conn = memory_connection();
+        let next = MIGRATIONS.len() as i64 + 1;
+        conn.execute("INSERT INTO schema_migrations VALUES (?1, 'later')", [next])
+            .unwrap();
+        let error = migrate(&mut conn).unwrap_err().to_string();
+        assert!(error.contains("newer version"), "{error}");
     }
 
     #[test]

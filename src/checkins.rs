@@ -74,8 +74,10 @@ impl Target {
     }
 }
 
-/// One answer while answering (part of the flow's draft).
+/// One answer while answering (part of the flow's draft, stored with the
+/// session: a new field needs a default).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
 pub struct Answer {
     pub value: Option<i64>,
     /// Choice version IDs.
@@ -722,16 +724,17 @@ pub fn follow_plenum(conn: &Connection, plenum_id: i64, now: DateTime<Utc>) -> R
         // that is past now closes the run at the next tick, as it should.
         let closes =
             (plenum.starts_at + Duration::minutes(offset)).max(opens + Duration::minutes(1));
-        let _ = now;
         let reminder = match reminded_at {
             // Sent: it stays what it was, if that still fits before the close.
             Some(_) => reminder_at
                 .map(|t| time::parse_text(&t))
                 .transpose()?
                 .filter(|at| *at < closes),
+            // Not sent: moved into the past (the plenum came earlier) it
+            // would go out at once, maybe right after the notice: none then.
             None => remind_offset
                 .map(|m| closes - Duration::minutes(m))
-                .filter(|at| *at > opens && *at < closes),
+                .filter(|at| *at > opens && *at > now && *at < closes),
         };
         moved += conn.execute(
             "UPDATE survey_runs SET closes_at = ?2, reminder_at = ?3 WHERE id = ?1",
@@ -822,7 +825,19 @@ pub fn take_notices(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<i64>> {
 }
 
 /// Runs whose one reminder is due (once each; none if not configured).
+/// One that comes due within the last hour before the close (the bot was
+/// down at its time) is dropped: "still open" minutes before it closes
+/// helps nobody.
 pub fn take_reminders(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<i64>> {
+    let late = conn.execute(
+        "UPDATE survey_runs SET reminded_at = ?1
+         WHERE status = 'open' AND reminded_at IS NULL AND reminder_at IS NOT NULL
+           AND reminder_at <= ?1 AND closes_at > ?1 AND closes_at <= ?2",
+        params![time::to_text(now), time::to_text(now + Duration::hours(1))],
+    )?;
+    if late > 0 {
+        tracing::info!(runs = late, "Reminders skipped: due too close to the close");
+    }
     take(
         conn,
         "reminded_at",
@@ -1135,6 +1150,80 @@ pub(crate) mod tests {
         };
         let planned = plan(&conn, "cleaning", &dated, now, remind).unwrap();
         assert!(!closes_too_soon(&planned, now));
+    }
+
+    #[test]
+    fn a_reminder_missed_until_the_last_hour_is_dropped() {
+        let now = at(2026, 11, 2, 12);
+        let mut conn = with_default_rule(now);
+        // On time: sent once.
+        let on_time = started(&mut conn, now, StartOptions::default());
+        let due = on_time.reminder_at.unwrap();
+        assert_eq!(take_reminders(&conn, due).unwrap(), [on_time.id]);
+        // Down from before its time until half an hour before the close:
+        // not sent, and not later either.
+        let missed = started(&mut conn, now, StartOptions::default());
+        let late = missed.closes_at - Duration::minutes(30);
+        assert!(late > missed.reminder_at.unwrap());
+        assert!(take_reminders(&conn, late).unwrap().is_empty());
+        assert!(take_reminders(&conn, late + Duration::minutes(5))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_plenum_moved_earlier_drops_a_reminder_that_would_be_past() {
+        let now = at(2026, 11, 2, 12);
+        let mut conn = with_default_rule(now);
+        let run = started(&mut conn, now, StartOptions::default());
+        let plenum = run.plenum_id.unwrap();
+        // A week later the plenum moves to tomorrow morning: "a day before"
+        // would be in the past (and go out at once).
+        let later = now + Duration::days(8);
+        let soon = later + Duration::hours(20);
+        assert!(soon < run.closes_at);
+        plenums::reschedule(
+            &mut conn,
+            plenum,
+            soon,
+            None,
+            "@admin:x",
+            plenums::tests::zone(),
+            later,
+        )
+        .unwrap();
+        let moved = super::run(&conn, run.id).unwrap();
+        assert_eq!(moved.closes_at, soon);
+        assert_eq!(moved.reminder_at, None);
+        assert!(take_reminders(&conn, later + Duration::minutes(1))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_room_with_an_open_check_in_for_its_members_stays() {
+        let now = at(2026, 11, 2, 12);
+        let mut conn = with_default_rule(now);
+        crate::store::add_room(&conn, "!kitchen:x", "Kitchen", "@admin:x").unwrap();
+        let run = started(
+            &mut conn,
+            now,
+            StartOptions {
+                target: Target::Room {
+                    room_id: "!kitchen:x".into(),
+                    label: "Kitchen".into(),
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::store::open_runs_for_room(&conn, "!kitchen:x").unwrap(),
+            [run.id]
+        );
+        let error = crate::store::remove_room(&conn, "!kitchen:x").unwrap_err();
+        assert!(error.to_string().contains("still open"), "{error}");
+        close(&conn, run.id, now).unwrap();
+        assert!(crate::store::remove_room(&conn, "!kitchen:x").unwrap());
     }
 
     #[test]
