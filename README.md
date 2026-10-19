@@ -99,6 +99,8 @@ answering).
 **For admins** `!kk help` shows just this:
 
 ```
+📎 a survey file (.toml)            upload it here: stored (see below)
+!kk survey load house_cleaning      one from store/surveys/ or shipped
 !kk survey cleaning                 the questions, numbered
 !kk survey cleaning preview         each question as residents see it
 !kk checkin start cleaning          what would happen; then
@@ -115,17 +117,56 @@ nothing below `privacy_threshold` answers, and written answers only from
 that many on, sorted, never in the order they came, never with a name.
 `!kk help all` lists every command.
 
-A ready-made house cleaning survey (11 questions, English) is in
-`surveys/house_cleaning.txt`: paste the whole file as one message to the
-bot (a message may carry up to 120 commands; a long one that ran through
-is answered with one line plus any warnings). A test replays it on a fresh
-database, so it is known to build, start and show its emoji buttons.
+**Surveys as files.** A whole survey can be one TOML file, the questions
+one below the other, no numbers to keep track of:
+
+```toml
+key = "house_cleaning"
+emoji = "🧹"
+title = "House cleaning"
+topic = "cleaning"                 # optional
+intro = "We'd like to know …"      # optional
+
+[[question]]
+single = "🧼 How happy are you with how clean the house is?"
+choices = ["😍 Very happy", "🙂 Fairly happy", "😐 It's okay"]
+other = "✏️ Something else"        # optional: they write their own
+
+[[question]]
+text = "🌟 If you could wish for one thing …"
+optional = true
+```
+
+A question is one of `single`, `multiple`, `yes_no`, `scale` or `text`.
+Optional per question: `optional`, `comment` (a comment field), `suggestion`
+(may become an idea), `metric`, `problem`, `min`/`max` (scales). A choice
+is `"emoji label"`, or `{ label = "emoji label", problem = "key" }`.
+
+```
+📎 upload the .toml in your chat with the bot    stores it
+!kk survey load                                  the files there are
+!kk survey load house_cleaning                   store/surveys/house_cleaning.toml,
+                                                 else the one that comes with the bot
+!kk survey house_cleaning export                 the survey back as a file
+```
+
+A file is checked completely before anything is stored, and is stored as
+a whole or not at all; a mistake is answered with the question it is in.
+A survey that was never started is replaced by a file with its key; one
+that was started stays as it is (its results stay comparable), so the file
+needs another key then. An uploaded `.txt` is run as a list of `!kk`
+commands, as if sent as one message (up to 120).
+
+A ready-made house cleaning survey (12 questions, English) comes with the
+bot: `surveys/house_cleaning.toml`, loaded with `!kk survey load
+house_cleaning`. A test applies it on a fresh database and exports it
+again, so it is known to build, start and show its emoji buttons.
 
 **Trying it out first.** With `mode = "test"` the bot uses its own files
 (`kummerkasten-test.sqlite`, `kummerkasten-test.key`, `settings-test.json`)
 and a check-in goes only to the admin who starts it. To start the test
 over from nothing: stop the bot, delete those three files, start it again.
-Live data is never touched; in live mode the survey is pasted once more.
+Live data is never touched; in live mode the survey is loaded once more.
 
 ## For residents
 

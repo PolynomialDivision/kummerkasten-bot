@@ -17,7 +17,7 @@ use mxbot_common::{
                     message::{MessageType, OriginalSyncRoomMessageEvent},
                 },
             },
-            OwnedRoomId,
+            OwnedEventId, OwnedRoomId,
         },
         Room, RoomState,
     },
@@ -56,6 +56,7 @@ mod stats;
 mod store;
 mod submissions;
 mod summary;
+mod survey_file;
 mod surveys;
 mod time;
 
@@ -188,6 +189,14 @@ async fn main() -> Result<()> {
                     dm::on_own_message(&kk, &room, &ev).await;
                     return;
                 }
+                // A survey file an admin uploads in their chat with the bot.
+                if let MessageType::File(file) = &ev.content.msgtype {
+                    if bot.admin.is_console(&room, &ev.sender, encryption.as_ref()).await {
+                        let reply = admin_checkins::upload(&kk, &ev.sender, file).await;
+                        answer_admin(&kk, &room, &ev.event_id, &reply).await;
+                        return;
+                    }
+                }
                 let dispatch = bot.admin.handle(&room, &ev, encryption.as_ref()).await;
                 let body = match &ev.content.msgtype {
                     MessageType::Text(text) => text.body.trim().to_owned(),
@@ -196,18 +205,11 @@ async fn main() -> Result<()> {
                 match route(dispatch, &body) {
                     None => {}
                     Some(Route::Admin) => {
-                        let reply = admin::run(&kk, &ev.sender, &body).await;
-                        match send_with_retry(&room, markup::notice(&reply)).await {
-                            // In their Kummerkasten chat: the command and the answer
-                            // are messages after the screen (it isn't edited above
-                            // them), cleared with the round.
-                            Ok(answer) if kk.is_chat(&room).await => {
-                                dm::track(&kk, &room, &ev.event_id, false).await;
-                                dm::track(&kk, &room, &answer, false).await;
-                            }
-                            Ok(_) => {}
-                            Err(error) => tracing::warn!(%error, "Could not answer an admin"),
-                        }
+                        let reply = match admin_checkins::export_request(&body) {
+                            Some(key) => send_survey_file(&kk, &room, &key).await,
+                            None => admin::run(&kk, &ev.sender, &body).await,
+                        };
+                        answer_admin(&kk, &room, &ev.event_id, &reply).await;
                     }
                     Some(Route::Normal) => {
                         if kk.is_chat(&room).await {
@@ -278,6 +280,51 @@ async fn main() -> Result<()> {
     dm::resume_screens(&kk).await;
     tokio::spawn(scheduler::run(kk.clone()));
     bot.run().await
+}
+
+/// Answer an admin's command (or upload) where it came from. In their
+/// Kummerkasten chat the command and the answer are messages after the
+/// screen (it isn't edited above them), cleared with the round.
+async fn answer_admin(kk: &dm::Kk, room: &Room, asked: &OwnedEventId, reply: &str) {
+    match send_with_retry(room, markup::notice(reply)).await {
+        Ok(answer) if kk.is_chat(room).await => {
+            dm::track(kk, room, asked, false).await;
+            dm::track(kk, room, &answer, false).await;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "Could not answer an admin"),
+    }
+}
+
+/// `!kk survey <key> export`: the template as a .toml attachment. Returns
+/// the answer to go with it.
+async fn send_survey_file(kk: &dm::Kk, room: &Room, key: &str) -> String {
+    let (name, toml) = match admin_checkins::export_file(kk, key).await {
+        Ok(file) => file,
+        Err(error) => return format!("😕 {error:#}"),
+    };
+    let sent = room
+        .send_attachment(
+            name.as_str(),
+            &mime::TEXT_PLAIN_UTF_8,
+            toml.into_bytes(),
+            mxbot_common::matrix_sdk::attachment::AttachmentConfig::new(),
+        )
+        .await;
+    match sent {
+        Ok(response) => {
+            if kk.is_chat(room).await {
+                dm::track(kk, room, &response.event_id, false).await;
+            }
+            format!(
+                "📎 Here is **{name}**.\n✏️ Change it and upload it again: it replaces the survey while it was never started."
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not send a survey file");
+            "😕 I couldn't send the file. Please try again.".to_owned()
+        }
+    }
 }
 
 #[cfg(test)]

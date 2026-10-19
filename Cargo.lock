@@ -1608,6 +1608,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "hmac 0.12.1",
+ "mime",
  "mxbot-common",
  "rand 0.8.8",
  "rusqlite",

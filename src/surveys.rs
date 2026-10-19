@@ -438,11 +438,18 @@ pub struct Edited {
 /// check-in, the change goes into a new version; that history stays.
 pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Edited> {
     let tx = conn.transaction()?;
-    let question = nth(&tx, key, n)?;
+    let edited = edit_in(&tx, key, n, edit)?;
+    tx.commit()?;
+    Ok(edited)
+}
+
+/// [`edit`] inside the caller's transaction (a whole file at once).
+pub fn edit_in(tx: &Connection, key: &str, n: usize, edit: Edit) -> Result<Edited> {
+    let question = nth(tx, key, n)?;
     let mut v = question.current.clone();
     // Validate (and resolve keys) before touching anything.
     let metric_id = match &edit {
-        Edit::Metric(Some(m)) => Some(id_of(&tx, "metrics", m)?),
+        Edit::Metric(Some(m)) => Some(id_of(tx, "metrics", m)?),
         _ => None,
     };
     let problem_id = match &edit {
@@ -452,7 +459,7 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
         }
         | Edit::ChoiceProblem {
             problem: Some(p), ..
-        } => Some(id_of(&tx, "problems", p)?),
+        } => Some(id_of(tx, "problems", p)?),
         _ => None,
     };
     match &edit {
@@ -499,7 +506,7 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
              FROM choice_versions WHERE question_version_id = ?1",
             params![v.id, id],
         )?;
-        v = version(&tx, id)?;
+        v = version(tx, id)?;
         Some(id)
     } else {
         None
@@ -602,7 +609,6 @@ pub fn edit(conn: &mut Connection, key: &str, n: usize, edit: Edit) -> Result<Ed
             )?;
         }
     }
-    tx.commit()?;
     Ok(Edited { new_version })
 }
 

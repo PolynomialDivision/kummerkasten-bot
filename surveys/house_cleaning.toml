@@ -1,0 +1,117 @@
+# 🧹 House cleaning check-in.
+# Upload this file in your chat with the bot, or: !kk survey load house_cleaning
+
+key = "house_cleaning"
+emoji = "🧹"
+title = "House cleaning"
+topic = "cleaning"
+intro = "We'd like to know how cleaning in the house works for you, so the plenum on Sunday can talk about what really bothers people and what helps."
+
+[[question]]
+single = "🧼 How happy are you with how clean the house is right now?"
+choices = [
+    "😍 Very happy",
+    "🙂 Fairly happy",
+    "😐 It's okay",
+    "🙁 Fairly unhappy",
+    "😤 Very unhappy",
+]
+
+[[question]]
+multiple = "🏠 Where do you see the biggest cleaning problems right now?"
+choices = [
+    "🍳 Kitchen",
+    "🚿 Bathrooms and toilets",
+    "🪜 Stairwell and hallways",
+    "🛋️ Common rooms",
+    "♻️ Rubbish and recycling",
+    "🧹 My own floor",
+    "✨ Nowhere, really",
+]
+other = "✏️ Somewhere else"
+
+[[question]]
+multiple = "🤔 What bothers you most about cleaning?"
+choices = [
+    "⏳ Cleaning happens too rarely",
+    "🧠 Some tasks get forgotten",
+    "⚖️ Not everyone does their share",
+    "❓ It's unclear what needs cleaning",
+    "🔁 Shared rooms get dirty again quickly",
+    "🧴 Supplies or tools are missing",
+    "😌 Nothing really bothers me",
+]
+other = "✏️ Something else"
+
+[[question]]
+single = "🍽️ What is the bigger problem, in your view?"
+choices = [
+    "🧹 Cleaning shifts aren't done well enough",
+    "🍽️ People leave too much mess in everyday life",
+    "⚖️ Both equally",
+    "😌 Neither, really",
+]
+
+[[question]]
+single = "⚖️ Is our current cleaning plan fair and sensible?"
+choices = [
+    "👍 Yes, it works well",
+    "🟡 Mostly, but it could be better",
+    "👎 No, the tasks are shared unfairly",
+    "🔄 I'd like a different system",
+    "🤷 I can't judge",
+]
+
+[[question]]
+multiple = "🧽 What would make cleaning easier for you?"
+choices = [
+    "📋 Clearer checklists with concrete tasks",
+    "🔔 Better reminders",
+    "🧴 Better supplies and tools",
+    "👥 Cleaning together with others",
+    "📅 More flexible shifts and swapping",
+    "⏱️ Smaller but more frequent tasks",
+    "🏠 Clearer responsibilities",
+]
+other = "✏️ My own idea"
+
+[[question]]
+single = "🗓️ Do we clean often enough? (Next you can say which areas, if you like.)"
+choices = [
+    "👍 Yes, just right",
+    "⬆️ We should clean more often",
+    "⬇️ Less would be enough",
+    "🔀 It depends on the area",
+    "🤷 I don't know",
+]
+comment = true
+
+[[question]]
+multiple = "📋 For which areas should we start (more) cleaning plans?"
+choices = [
+    "🍳 Kitchens",
+    "🚪 Hallways",
+    "🪜 Stairwell",
+    "🛋️ Common rooms",
+    "🚿 Bathrooms and toilets",
+    "♻️ Bin areas",
+    "✨ None, the current rules are enough",
+]
+other = "✏️ Other areas"
+
+[[question]]
+text = "💡 What exactly would you change about how we organise cleaning?"
+optional = true
+suggestion = true
+
+[[question]]
+text = "❤️ What works well right now and should stay as it is?"
+optional = true
+
+[[question]]
+text = "🌟 If you could wish for one thing about cleanliness in our house, what would it be?"
+optional = true
+
+[[question]]
+text = "🙋 What could you yourself do to make it work better?"
+optional = true

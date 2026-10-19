@@ -5,13 +5,15 @@ use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use mxbot_common::matrix_sdk::ruma::OwnedRoomId;
+use mxbot_common::matrix_sdk::ruma::{
+    events::room::message::FileMessageEventContent, OwnedRoomId, OwnedUserId,
+};
 
 use crate::{
     checkins::{self, StartOptions, Target},
     dm::Kk,
     markup::literal,
-    screens,
+    screens, survey_file,
     surveys::{self, Edit, NewQuestion, QKind},
     time,
 };
@@ -28,7 +30,8 @@ pub const HELP: &str = "📊 **Check-ins**
 `!kk survey <key> metric <n> <key|none>` · `problem <n> <key|none>` · `scale <n> <min> <max>`
 `!kk survey <key> choice <n> add [problem <key>] [other] [emoji] <label>`
 `!kk survey <key> choice <n> rename <c> <label>` · `choice <n> emoji <c> <emoji|none>` · `choice <n> problem <c> <key|none>` · `choice <n> remove <c>`
-`!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview`
+`!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview` · `export`
+`!kk survey load [<name>]`: a survey file (store/surveys/, or upload a .toml here)
 `!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
 `!kk checkin start <key> [house | room <!room> | floor <location>] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
    without `closes`: until the plenum starts; `1d-before`/`12h-before` follow the plenum when it moves, a date doesn't
@@ -38,6 +41,10 @@ pub const HELP: &str = "📊 **Check-ins**
 /// `!kk help` in survey-only mode: the whole way, nothing else.
 pub const SURVEY_HELP: &str = "📊 **Survey-only mode**
 Residents see nothing but the check-in you start. They get it as a message, answer it question by question, and are done.
+
+0️⃣ **Get one**
+📎 Upload a survey file (.toml) here, or `!kk survey load house_cleaning`
+`!kk survey load`: the files there are · `!kk survey cleaning export`: one as a file
 
 1️⃣ **Look at it**
 `!kk survey cleaning`: the questions, numbered
@@ -76,6 +83,11 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                     "✅ Template created. Add questions with `!kk survey <key> add …`.".to_owned()
                 })
         }
+        ["survey", "load"] => Ok(survey_files().await),
+        ["survey", "load", name] => load(kk, name).await,
+        ["survey", key, "export"] => Ok(format!(
+            "📎 Send `!kk survey {key} export` on its own: the file comes as an attachment."
+        )),
         ["survey", key] => overview(kk, key).await,
         ["survey", key, "preview"] => preview(kk, key).await,
         ["survey", key, "intro", text @ ..] if !text.is_empty() => {
@@ -294,13 +306,13 @@ fn edit_of(verb: &str, rest: &[&str]) -> Option<Edit> {
     })
 }
 
-fn looks_like_emoji(s: &str) -> bool {
+pub(crate) fn looks_like_emoji(s: &str) -> bool {
     s.chars()
         .next()
         .is_some_and(|c| !c.is_alphanumeric() && !c.is_ascii_punctuation())
 }
 
-fn choice_edit(verb: &str, rest: &[&str]) -> Option<Edit> {
+pub(crate) fn choice_edit(verb: &str, rest: &[&str]) -> Option<Edit> {
     Some(match (verb, rest) {
         ("add", rest) => {
             let (words, problem) = split_option(rest, "problem");
@@ -529,6 +541,154 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
             Ok(out.join("\n"))
         })
         .await
+}
+
+// ── Survey files (see `survey_file`) ───────────────────────────────────────
+
+/// Where admins keep survey files on the server.
+fn surveys_dir() -> std::path::PathBuf {
+    mxbot_common::config::store_path_from_env().join("surveys")
+}
+
+/// The answer to a file that was applied.
+fn applied_text(title: &str, applied: &survey_file::Applied) -> String {
+    let key = &applied.key;
+    let mut out = vec![format!(
+        "✅ **{}** saved: {} questions.",
+        literal(title),
+        applied.questions
+    )];
+    if applied.replaced {
+        out.push("♻️ It replaced the one with this key (never started).".to_owned());
+    }
+    out.push(format!(
+        "👀 `!kk survey {key} preview`\n🚀 `!kk checkin start {key}`"
+    ));
+    out.join("\n")
+}
+
+/// Read, check and store a survey file's text, all or nothing.
+pub async fn apply_file(kk: &Kk, text: String) -> Result<String> {
+    let file = survey_file::SurveyFile::parse(&text)?;
+    let title = file.title.clone();
+    let applied = kk
+        .engine
+        .db
+        .run(move |c| survey_file::apply(c, &file))
+        .await?;
+    tracing::info!(survey = %applied.key, questions = applied.questions, "Survey file applied");
+    Ok(applied_text(&title, &applied))
+}
+
+/// `!kk survey load <name>`: `store/surveys/<name>.toml`, else the one
+/// shipped with the bot by that name.
+async fn load(kk: &Kk, name: &str) -> Result<String> {
+    let file_name = survey_file::file_name(name)?;
+    let path = surveys_dir().join(&file_name);
+    let text = match tokio::fs::read(&path).await {
+        Ok(bytes) if bytes.len() > survey_file::MAX_BYTES => {
+            bail!("{file_name} is too large (at most 128 KB).")
+        }
+        Ok(bytes) => String::from_utf8(bytes).context("The file isn't UTF-8 text.")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match survey_file::SHIPPED.iter().find(|(n, _)| *n == file_name) {
+                Some((_, text)) => text.to_string(),
+                None => bail!("There's no {file_name}.\n\n{}", survey_files().await),
+            }
+        }
+        Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+    };
+    apply_file(kk, text).await
+}
+
+/// `!kk survey load`: the files there are.
+async fn survey_files() -> String {
+    let mut own = Vec::new();
+    if let Ok(mut dir) = tokio::fs::read_dir(surveys_dir()).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".toml") {
+                own.push(stem.to_owned());
+            }
+        }
+    }
+    own.sort();
+    let shipped: Vec<&str> = survey_file::SHIPPED
+        .iter()
+        .filter_map(|(n, _)| n.strip_suffix(".toml"))
+        .filter(|stem| !own.iter().any(|o| o == stem))
+        .collect();
+    let mut out = vec!["📂 **Survey files**".to_owned()];
+    for stem in &own {
+        out.push(format!("📄 `!kk survey load {stem}`"));
+    }
+    for stem in shipped {
+        out.push(format!("📦 `!kk survey load {stem}` (comes with the bot)"));
+    }
+    out.push(String::new());
+    out.push(format!(
+        "📎 Or upload a .toml file here. Your own go in `{}` on the server.",
+        surveys_dir().display()
+    ));
+    out.join("\n")
+}
+
+/// A file an admin uploaded in their chat with the bot: a survey (.toml),
+/// or a list of `!kk` commands (.txt), run as if sent as one message.
+pub async fn upload(kk: &Kk, sender: &OwnedUserId, file: &FileMessageEventContent) -> String {
+    let read = read_upload(kk, file).await;
+    match read {
+        Ok((name, text)) if name.ends_with(".txt") => crate::admin::run(kk, sender, &text).await,
+        Ok((_, text)) => apply_file(kk, text)
+            .await
+            .unwrap_or_else(|error| format!("😕 {error:#}")),
+        Err(error) => format!("😕 {error:#}"),
+    }
+}
+
+/// An uploaded file's name and text.
+async fn read_upload(kk: &Kk, file: &FileMessageEventContent) -> Result<(String, String)> {
+    let name = file.filename().trim().to_lowercase();
+    if !(name.ends_with(".toml") || name.ends_with(".txt")) {
+        bail!("I read survey files (.toml) and lists of `!kk` commands (.txt), not {name}.");
+    }
+    let too_large = || anyhow::anyhow!("{name} is too large (at most 128 KB).");
+    let size = file.info.as_ref().and_then(|i| i.size).map(u64::from);
+    if size.is_some_and(|s| s > survey_file::MAX_BYTES as u64) {
+        return Err(too_large());
+    }
+    let bytes = kk
+        .client
+        .media()
+        .get_file(file, false)
+        .await
+        .context("Could not download the file")?
+        .context("The file has no content.")?;
+    if bytes.len() > survey_file::MAX_BYTES {
+        return Err(too_large());
+    }
+    let text = String::from_utf8(bytes).context("The file isn't UTF-8 text.")?;
+    Ok((name, text))
+}
+
+/// `!kk survey <key> export` sent on its own: the key.
+pub fn export_request(body: &str) -> Option<String> {
+    let words: Vec<&str> = body.split_whitespace().collect();
+    match words.as_slice() {
+        [kk, "survey", key, "export"] if kk.eq_ignore_ascii_case("!kk") => Some(key.to_string()),
+        _ => None,
+    }
+}
+
+/// Template `key` as a file: `(file name, TOML)`.
+pub async fn export_file(kk: &Kk, key: &str) -> Result<(String, String)> {
+    let key = key.to_owned();
+    let file = kk
+        .engine
+        .db
+        .run(move |c| survey_file::export(c, &key))
+        .await?;
+    Ok((format!("{}.toml", file.key), file.to_toml()?))
 }
 
 /// `add <kind> [optional] [suggestion] [metric <key>] [problem <key>] <question>`.
@@ -846,95 +1006,6 @@ async fn runs(kk: &Kk) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The ready-made house cleaning survey (`surveys/house_cleaning.txt`),
-    /// replayed command by command as the bot runs them on a fresh
-    /// database: it must build, start and show proper emoji buttons.
-    #[test]
-    fn the_house_cleaning_survey_builds_and_starts() {
-        let block = include_str!("../surveys/house_cleaning.txt");
-        let commands = crate::admin::split_commands(block);
-        assert_eq!(commands.len(), block.lines().count());
-        assert!(commands.len() <= crate::admin::MAX_COMMANDS);
-        let now = crate::plenums::tests::at(2026, 10, 19, 12);
-        let mut conn = crate::plenums::tests::with_default_rule(now);
-        for command in &commands {
-            let args: Vec<&str> = command.split_whitespace().skip(1).collect();
-            let done = match args.as_slice() {
-                ["survey", "new", key, emoji, rest @ ..] => {
-                    let (title, topic) = split_option(rest, "topic");
-                    surveys::create_template(&conn, key, emoji, &title, topic.as_deref())
-                }
-                ["survey", key, "intro", text @ ..] => {
-                    surveys::set_intro(&conn, key, &text.join(" "))
-                }
-                ["survey", key, "add", kind, rest @ ..] => {
-                    let q = question_spec(kind, rest).unwrap();
-                    surveys::add_question(
-                        &conn,
-                        key,
-                        NewQuestion {
-                            kind: q.kind,
-                            text: &q.text,
-                            required: q.required,
-                            asks_suggestion: q.suggestion,
-                            metric: q.metric.as_deref(),
-                            problem: q.problem.as_deref(),
-                        },
-                    )
-                    .map(drop)
-                }
-                ["survey", key, "choice", n, verb, rest @ ..] => {
-                    let edit = choice_edit(verb, rest).unwrap_or_else(|| panic!("{command}"));
-                    if let Edit::AddChoice { emoji, .. } = &edit {
-                        assert!(!emoji.is_empty(), "no emoji: {command}");
-                    }
-                    surveys::edit(&mut conn, key, n.parse().unwrap(), edit).map(drop)
-                }
-                ["survey", key, verb, n, rest @ ..] => {
-                    let edit = edit_of(verb, rest).unwrap_or_else(|| panic!("{command}"));
-                    surveys::edit(&mut conn, key, n.parse().unwrap(), edit).map(drop)
-                }
-                _ => panic!("not a survey command: {command}"),
-            };
-            done.unwrap_or_else(|e| panic!("{command}: {e:#}"));
-        }
-        let questions = surveys::questions(&conn, "house_cleaning").unwrap();
-        assert_eq!(questions.len(), 11);
-        for (i, q) in questions.iter().enumerate() {
-            let n = i + 1;
-            if q.current.kind.has_choices() {
-                let emojis = surveys::choice_emojis(&conn, "house_cleaning", n).unwrap();
-                assert!((2..=10).contains(&emojis.len()), "question {n}");
-                let warnings = screens::choice_key_warnings(&emojis);
-                assert!(warnings.is_empty(), "question {n}: {warnings:?}");
-                assert!(q.current.required, "question {n}");
-            } else {
-                assert!(!q.current.required, "question {n}");
-            }
-        }
-        assert!(questions[6].current.allow_comment);
-        // Starts as it will in production, and every button is its emoji.
-        let opts = StartOptions {
-            identities: vec![crate::submissions::Identity::Anonymous],
-            ..Default::default()
-        };
-        let plan = checkins::plan(
-            &conn,
-            "house_cleaning",
-            &opts,
-            now,
-            chrono::Duration::hours(24),
-        )
-        .unwrap();
-        let id = checkins::start(&mut conn, &plan, "@admin:x", now).unwrap();
-        let run = checkins::run(&conn, id).unwrap();
-        assert_eq!(run.title, "House cleaning");
-        for i in 0..run.questions.len() {
-            let text = screens::question_preview(&run, i);
-            assert!(!text.contains("1️⃣"), "question {}: {text}", i + 1);
-        }
-    }
 
     #[test]
     fn edit_commands_parse() {
