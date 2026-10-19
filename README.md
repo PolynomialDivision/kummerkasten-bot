@@ -115,6 +115,18 @@ nothing below `privacy_threshold` answers, and written answers only from
 that many on, sorted, never in the order they came, never with a name.
 `!kk help all` lists every command.
 
+A ready-made house cleaning survey (11 questions, English) is in
+`surveys/house_cleaning.txt`: paste the whole file as one message to the
+bot (a message may carry up to 120 commands; a long one that ran through
+is answered with one line plus any warnings). A test replays it on a fresh
+database, so it is known to build, start and show its emoji buttons.
+
+**Trying it out first.** With `mode = "test"` the bot uses its own files
+(`kummerkasten-test.sqlite`, `kummerkasten-test.key`, `settings-test.json`)
+and a check-in goes only to the admin who starts it. To start the test
+over from nothing: stop the bot, delete those three files, start it again.
+Live data is never touched; in live mode the survey is pasted once more.
+
 ## For residents
 
 * **Getting your chat**: write `!kummerkasten` in the house room, or tap

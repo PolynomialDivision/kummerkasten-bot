@@ -521,7 +521,17 @@ async fn preview(kk: &Kk, key: &str) -> Result<String> {
         .await
 }
 
-async fn add(kk: &Kk, key: &str, kind: &str, rest: &[&str]) -> Result<String> {
+/// `add <kind> [optional] [suggestion] [metric <key>] [problem <key>] <question>`.
+struct QuestionSpec {
+    kind: QKind,
+    text: String,
+    required: bool,
+    suggestion: bool,
+    metric: Option<String>,
+    problem: Option<String>,
+}
+
+fn question_spec(kind: &str, rest: &[&str]) -> Result<QuestionSpec> {
     let kind = QKind::parse(kind)?;
     let mut words = Vec::new();
     let (mut required, mut suggestion) = (true, false);
@@ -543,7 +553,25 @@ async fn add(kk: &Kk, key: &str, kind: &str, rest: &[&str]) -> Result<String> {
         }
         i += 1;
     }
-    let text = words.join(" ");
+    Ok(QuestionSpec {
+        kind,
+        text: words.join(" "),
+        required,
+        suggestion,
+        metric,
+        problem,
+    })
+}
+
+async fn add(kk: &Kk, key: &str, kind: &str, rest: &[&str]) -> Result<String> {
+    let QuestionSpec {
+        kind,
+        text,
+        required,
+        suggestion,
+        metric,
+        problem,
+    } = question_spec(kind, rest)?;
     let key = key.to_owned();
     let k = key.clone();
     let n = kk
@@ -808,6 +836,95 @@ async fn runs(kk: &Kk) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ready-made house cleaning survey (`surveys/house_cleaning.txt`),
+    /// replayed command by command as the bot runs them on a fresh
+    /// database: it must build, start and show proper emoji buttons.
+    #[test]
+    fn the_house_cleaning_survey_builds_and_starts() {
+        let block = include_str!("../surveys/house_cleaning.txt");
+        let commands = crate::admin::split_commands(block);
+        assert_eq!(commands.len(), block.lines().count());
+        assert!(commands.len() <= crate::admin::MAX_COMMANDS);
+        let now = crate::plenums::tests::at(2026, 10, 19, 12);
+        let mut conn = crate::plenums::tests::with_default_rule(now);
+        for command in &commands {
+            let args: Vec<&str> = command.split_whitespace().skip(1).collect();
+            let done = match args.as_slice() {
+                ["survey", "new", key, emoji, rest @ ..] => {
+                    let (title, topic) = split_option(rest, "topic");
+                    surveys::create_template(&conn, key, emoji, &title, topic.as_deref())
+                }
+                ["survey", key, "intro", text @ ..] => {
+                    surveys::set_intro(&conn, key, &text.join(" "))
+                }
+                ["survey", key, "add", kind, rest @ ..] => {
+                    let q = question_spec(kind, rest).unwrap();
+                    surveys::add_question(
+                        &conn,
+                        key,
+                        NewQuestion {
+                            kind: q.kind,
+                            text: &q.text,
+                            required: q.required,
+                            asks_suggestion: q.suggestion,
+                            metric: q.metric.as_deref(),
+                            problem: q.problem.as_deref(),
+                        },
+                    )
+                    .map(drop)
+                }
+                ["survey", key, "choice", n, verb, rest @ ..] => {
+                    let edit = choice_edit(verb, rest).unwrap_or_else(|| panic!("{command}"));
+                    if let Edit::AddChoice { emoji, .. } = &edit {
+                        assert!(!emoji.is_empty(), "no emoji: {command}");
+                    }
+                    surveys::edit(&mut conn, key, n.parse().unwrap(), edit).map(drop)
+                }
+                ["survey", key, verb, n, rest @ ..] => {
+                    let edit = edit_of(verb, rest).unwrap_or_else(|| panic!("{command}"));
+                    surveys::edit(&mut conn, key, n.parse().unwrap(), edit).map(drop)
+                }
+                _ => panic!("not a survey command: {command}"),
+            };
+            done.unwrap_or_else(|e| panic!("{command}: {e:#}"));
+        }
+        let questions = surveys::questions(&conn, "house_cleaning").unwrap();
+        assert_eq!(questions.len(), 11);
+        for (i, q) in questions.iter().enumerate() {
+            let n = i + 1;
+            if q.current.kind.has_choices() {
+                let emojis = surveys::choice_emojis(&conn, "house_cleaning", n).unwrap();
+                assert!((2..=10).contains(&emojis.len()), "question {n}");
+                let warnings = screens::choice_key_warnings(&emojis);
+                assert!(warnings.is_empty(), "question {n}: {warnings:?}");
+                assert!(q.current.required, "question {n}");
+            } else {
+                assert!(!q.current.required, "question {n}");
+            }
+        }
+        assert!(questions[6].current.allow_comment);
+        // Starts as it will in production, and every button is its emoji.
+        let opts = StartOptions {
+            identities: vec![crate::submissions::Identity::Anonymous],
+            ..Default::default()
+        };
+        let plan = checkins::plan(
+            &conn,
+            "house_cleaning",
+            &opts,
+            now,
+            chrono::Duration::hours(24),
+        )
+        .unwrap();
+        let id = checkins::start(&mut conn, &plan, "@admin:x", now).unwrap();
+        let run = checkins::run(&conn, id).unwrap();
+        assert_eq!(run.title, "House cleaning");
+        for i in 0..run.questions.len() {
+            let text = screens::question_preview(&run, i);
+            assert!(!text.contains("1️⃣"), "question {}: {text}", i + 1);
+        }
+    }
 
     #[test]
     fn edit_commands_parse() {

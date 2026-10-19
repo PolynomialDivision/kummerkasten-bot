@@ -62,12 +62,17 @@ impl std::fmt::Display for Unknown {
 
 impl std::error::Error for Unknown {}
 
-/// Most commands one message may carry.
-const MAX_COMMANDS: usize = 30;
+/// Most commands one message may carry: a whole survey (questions and
+/// their choices) fits.
+pub const MAX_COMMANDS: usize = 120;
+
+/// From this many commands on, a message that ran through is answered in
+/// short: how many ran, and only what needs a look (warnings).
+const SHORT_FROM: usize = 8;
 
 /// One message, one or more commands: every line starting with `!kk` begins
 /// a command; other lines continue the one before (a long text may wrap).
-fn split_commands(body: &str) -> Vec<String> {
+pub fn split_commands(body: &str) -> Vec<String> {
     let mut commands: Vec<String> = Vec::new();
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let starts = line
@@ -123,11 +128,19 @@ pub async fn run(kk: &Kk, sender: &OwnedUserId, body: &str) -> String {
         };
     }
     let mut out = Vec::new();
+    let mut notable = Vec::new();
+    let mut failed = false;
     for (i, command) in commands.iter().enumerate() {
         let head = format!("**{}.** {}", i + 1, heading(command));
         match dispatch(kk, sender, command).await {
-            Ok(reply) => out.push(format!("{head}\n{reply}")),
+            Ok(reply) => {
+                if is_notable(&reply) {
+                    notable.push(format!("{head}\n{reply}"));
+                }
+                out.push(format!("{head}\n{reply}"));
+            }
             Err(error) => {
+                failed = true;
                 out.push(format!("{head}\n😕 {error:#}"));
                 let rest = commands.len() - i - 1;
                 if rest > 0 {
@@ -139,7 +152,18 @@ pub async fn run(kk: &Kk, sender: &OwnedUserId, body: &str) -> String {
             }
         }
     }
+    if !failed && commands.len() >= SHORT_FROM {
+        let mut short = vec![format!("✅ All {} commands ran.", commands.len())];
+        short.extend(notable);
+        return short.join("\n\n");
+    }
     out.join("\n\n")
+}
+
+/// A reply worth showing even when a long message ran through: a warning
+/// (look-alike or numbered buttons, a new question version).
+fn is_notable(reply: &str) -> bool {
+    ["⚠️", "👀", "🔢"].iter().any(|m| reply.contains(m))
 }
 
 async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
@@ -662,6 +686,17 @@ async fn invite_all(kk: &Kk) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_message_that_ran_through_shows_only_what_needs_a_look() {
+        assert!(is_notable(
+            "➕ Choice added.\n👀 🙂 😊 look alike as reactions"
+        ));
+        assert!(is_notable(
+            "⚠️ **This question was already asked in a check-in.**"
+        ));
+        assert!(!is_notable("➕ Choice added."));
+    }
 
     #[test]
     fn a_message_with_several_lines_carries_several_commands() {
