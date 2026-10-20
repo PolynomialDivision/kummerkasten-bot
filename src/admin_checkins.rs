@@ -35,7 +35,7 @@ pub const HELP: &str = "📊 **Check-ins**
 `!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
 `!kk checkin start <key> [house | room <!room> | floor <location>] [opens 2026-11-10 [18:00]] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
    without `closes`: until the plenum starts; `1d-before`/`12h-before` follow the plenum when it moves, a date doesn't
-`!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin close <n>`
+`!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin remind <n>` · `!kk checkin close <n>`
 `!kk rooms central <!room> [off]`: where `announce` posts";
 
 /// `!kk help` in survey-only mode: the whole way, nothing else.
@@ -58,6 +58,7 @@ Residents see nothing but the check-in you start. They get it as a message, answ
 
 3️⃣ **Follow it**
 `!kk checkins`: open and closed ones, how many answered
+`!kk checkin remind <n>`: its reminder now, to everyone who hasn't answered (the planned one still comes)
 
 4️⃣ **Close and read it**
 `!kk checkin close <n>`: end it now (otherwise it closes by itself)
@@ -222,6 +223,43 @@ pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<Stri
                 )),
             }
         }
+        ["checkin", "remind", n] => match n.trim_start_matches('#').parse::<i64>() {
+            Ok(id) => {
+                let open = kk
+                    .engine
+                    .db
+                    .run(move |c| {
+                        let exists: i64 = c.query_row(
+                            "SELECT count(*) FROM survey_runs WHERE id = ?1",
+                            [id],
+                            |r| r.get(0),
+                        )?;
+                        Ok((exists > 0)
+                            .then(|| checkins::run(c, id))
+                            .transpose()?
+                            .map(|r| r.is_open(Utc::now())))
+                    })
+                    .await;
+                match open {
+                    Ok(None) => Err(anyhow::anyhow!("There's no check-in #{id}. See `!kk checkins`.")),
+                    Ok(Some(false)) => Err(anyhow::anyhow!("Check-in #{id} isn't open.")),
+                    Err(error) => Err(error),
+                    Ok(Some(true)) => crate::dm::remind_now(kk, id).await.map(|(sent, skipped, failed)| {
+                        let mut reply = format!(
+                            "🔔 Check-in #{id}: reminder sent into {sent} chat(s). {skipped} didn't need it (answered, or no chat accepted yet)."
+                        );
+                        if failed > 0 {
+                            reply.push_str(&format!(" ⚠️ {failed} failed; try again later."));
+                        }
+                        reply.push_str(" The planned reminder still comes.");
+                        reply
+                    }),
+                }
+            }
+            Err(_) => Err(anyhow::anyhow!(
+                "Which check-in? A number from `!kk checkins`."
+            )),
+        },
         ["checkin", "close", n] => match n.trim_start_matches('#').parse::<i64>() {
             Ok(id) => kk
                 .engine

@@ -78,6 +78,10 @@ place: tap an answer (or type its number), write when asked, ⬅️ to go back,
 offer to share an answer as an idea, no ❌ (stopping is simply not
 answering).
 
+* **From another homeserver.** Someone from matrix.org who accepts their
+  chat gets the check-in 20 seconds later, not at once: sent in the same
+  second, it never reached their server (2026-10-20). `!kk checkin remind`
+  brings it to those who got an empty chat before that.
 * **Pausing is fine.** A half-answered check-in waits until it closes, also
   across restarts; there is no 60-minute timeout here. The one reminder is a
   short note with their current step right below it.
@@ -106,6 +110,7 @@ answering).
 !kk checkin start cleaning          what would happen; then
 !kk checkin go                      start it (or !kk checkin drop)
 !kk checkins                        open and closed ones, how many answered
+!kk checkin remind 4                its reminder now (the planned one still comes)
 !kk checkin close 4                 end it now (otherwise it closes by itself)
 !kk checkin results 4               the answers, once it is closed
 ```

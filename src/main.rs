@@ -262,7 +262,15 @@ async fn main() -> Result<()> {
                     return;
                 }
                 if kk.is_chat(&room).await {
-                    dm::on_member(&kk, &room, &ev).await;
+                    if dm::waits_after_join(&kk.bot, &ev) {
+                        // Not in the sync loop: the other events go on meanwhile.
+                        tokio::spawn(async move {
+                            tokio::time::sleep(dm::FEDERATED_JOIN_GRACE).await;
+                            dm::on_member(&kk, &room, &ev).await;
+                        });
+                    } else {
+                        dm::on_member(&kk, &room, &ev).await;
+                    }
                 } else {
                     dm::on_authorized_join(&kk, &room, &ev).await;
                 }

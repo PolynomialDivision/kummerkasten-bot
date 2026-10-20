@@ -834,6 +834,85 @@ pub async fn on_reaction(kk: &Kk, room: &Room, ev: &OriginalSyncReactionEvent) {
     kk.wake.notify_one();
 }
 
+/// How long the bot waits after someone from another homeserver accepted
+/// their chat before it writes there. Sent in the same second as the join,
+/// the check-in reached the bot's own server but never matrix.org: 11 of 11
+/// residents from there had an empty chat (2026-10-20, `get-remote-pdu`:
+/// "event not found"), while a later message in the same chat brought it
+/// along. Their server is apparently still busy with the join and drops
+/// what arrives meanwhile.
+pub const FEDERATED_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a membership event is someone from another homeserver joining:
+/// that one waits [`FEDERATED_JOIN_GRACE`] before it is handled.
+pub fn waits_after_join(bot: &UserId, ev: &OriginalSyncRoomMemberEvent) -> bool {
+    ev.content.membership == MembershipState::Join
+        && ev.state_key.server_name() != bot.server_name()
+}
+
+/// `!kk checkin remind <n>`: check-in `run_id`'s reminder now, into every
+/// accepted chat whose resident hasn't answered (checked per person, as for
+/// the planned reminder, which still comes). A new message in a chat also
+/// makes a federated server fetch what it missed there (a check-in sent
+/// before [`FEDERATED_JOIN_GRACE`] existed). Returns
+/// `(sent, not needed, failed)`; counts only, never who.
+pub async fn remind_now(kk: &Kk, run_id: i64) -> Result<(usize, usize, usize)> {
+    let chats = kk.engine.db.run(|c| store::open_chats(c)).await?;
+    let (mut sent, mut not_needed, mut failed) = (0, 0, 0);
+    for (mxid, room_id) in chats {
+        let (Ok(user), Ok(room_id)) = (
+            OwnedUserId::try_from(mxid.as_str()),
+            OwnedRoomId::try_from(room_id.as_str()),
+        ) else {
+            not_needed += 1;
+            continue;
+        };
+        let Some(room) = kk.client.get_room(&room_id) else {
+            not_needed += 1;
+            continue;
+        };
+        let who = match kk.who_checked(&user).await {
+            Ok(Some(who)) => who,
+            Ok(None) => {
+                not_needed += 1;
+                continue;
+            }
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        match tell_txn(
+            kk,
+            &room,
+            &who,
+            run_id,
+            CheckinText::Reminder,
+            &TransactionId::new(),
+        )
+        .await
+        {
+            Told::Sent => sent += 1,
+            Told::NotNeeded => not_needed += 1,
+            Told::Failed => failed += 1,
+        }
+    }
+    if sent > 0 {
+        kk.engine
+            .db
+            .run(move |c| checkins::count_batch(c, run_id, Batch::Reminder, 0, sent))
+            .await?;
+    }
+    tracing::info!(
+        run = run_id,
+        sent,
+        not_needed,
+        failed,
+        "Check-in reminder sent by an admin"
+    );
+    Ok((sent, not_needed, failed))
+}
+
 /// Someone joined or left a resident's chat.
 pub async fn on_member(kk: &Kk, room: &Room, ev: &OriginalSyncRoomMemberEvent) {
     let Some(resident) = kk.resident_of(room).await else {
@@ -1446,6 +1525,39 @@ mod tests {
         RoomVersionStability, RoomVersionsCapability,
     };
     use mxbot_common::private::choose_room_version;
+
+    fn member(user: &str, membership: &str) -> OriginalSyncRoomMemberEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "m.room.member",
+            "event_id": "$e:example.org",
+            "sender": user,
+            "state_key": user,
+            "origin_server_ts": 1,
+            "content": {"membership": membership},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_join_from_another_server_waits() {
+        let bot = UserId::parse("@kummerkasten-bot:scharni.org").unwrap();
+        assert!(waits_after_join(
+            &bot,
+            &member("@schnick:matrix.org", "join")
+        ));
+        assert!(!waits_after_join(
+            &bot,
+            &member("@nick:scharni.org", "join")
+        ));
+        assert!(!waits_after_join(
+            &bot,
+            &member("@schnick:matrix.org", "leave")
+        ));
+        assert!(!waits_after_join(
+            &bot,
+            &member("@schnick:matrix.org", "invite")
+        ));
+    }
 
     fn server(stable: &[&str], unstable: &[&str]) -> RoomVersionsCapability {
         let mut available = std::collections::BTreeMap::new();
