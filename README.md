@@ -344,6 +344,7 @@ events, series, moved / deleted       #41 Sun 1 Nov · #42 Sun 15 Nov · …    
 [kummerkasten.calendar]
 account_url = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
 calendar = "plenum-house"         # plenum-bot's calendar, shared with this account
+owner = "plenum-bot"              # the account sharing it (default)
 username = "kummerkasten-bot"
 password_env = "CALDAV_PASSWORD"  # the env var with the app password (default)
 refresh_minutes = 5               # default
@@ -354,8 +355,11 @@ read from the environment variable, never from the config.
 
 * **The dates come only from the Nextcloud calendar** of the house plenum,
   which plenum-bot owns (`plenum-house`) and shares read-only with this
-  bot's own Nextcloud account (there it is `plenum-house_shared_by_plenum-bot`;
-  either name is found). The bot keeps no schedule of its own: there are no
+  bot's own Nextcloud account (there it is `plenum-house_shared_by_plenum-bot`).
+  Only that share is read (`owner`): never a calendar of the bot's own and
+  never one of the same name another account shares, so nobody can slip it
+  a schedule of their own; without that share the reads fail and nothing
+  changes. The bot keeps no schedule of its own: there are no
   rules and no commands to add, move or cancel a plenum. Do that in the
   calendar; `!kk plenum add/move/cancel/remove` and `!kk rule` only point
   there. `!kk plenums` says when the calendar was last read, and why not if
@@ -367,7 +371,11 @@ read from the environment variable, never from the config.
   row is linked to it (`calendar_id`):
   * an occurrence with a row: the row follows it. Moved: the same row moves
     (see below). Deleted from the calendar: a future plenum is cancelled.
-    Back in the calendar: scheduled again.
+    Back in the calendar: scheduled again, and if its cancellation was
+    already posted, announced anew (its day-before summary goes out again).
+    An occurrence that is over changes nothing: a future plenum moved into
+    the past in the calendar stays where it is (with a warning in the log),
+    so the open round never ends up on a plenum that is over.
   * an occurrence without a row adopts a row from before the calendar (the
     old rules) at the same time, else on the same day; else it is a new
     plenum. One that is already over is not created after the fact.

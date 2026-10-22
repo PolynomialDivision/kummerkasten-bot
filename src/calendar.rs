@@ -1,7 +1,8 @@
 //! The plenum's dates, from Nextcloud: plenum-bot owns the house plenum's
 //! calendar (`plenum-house`) and shares it read-only with this bot's own
-//! account, where it appears as `plenum-house_shared_by_plenum-bot`. That
-//! calendar is the only place the dates are kept (decided 2026-10-22):
+//! account, where it appears as `plenum-house_shared_by_plenum-bot`. Only
+//! that share is read ([`pick`]): any Nextcloud user can make a calendar of
+//! that name and share it with the bot. That calendar is the only place the dates are kept (decided 2026-10-22):
 //! people add, move and cancel plenums there, and every few minutes the bot
 //! reads it over CalDAV and follows it ([`plenums::sync_calendar`]).
 //!
@@ -65,27 +66,14 @@ pub fn occurrences(
     found
 }
 
-/// The collection of `calendar` among an account's: the account's own one of
-/// that name, else the one shared with it (`<calendar>_shared_by_<owner>`).
-pub fn pick(urls: &[String], calendar: &str) -> Option<String> {
-    let slug = |url: &str| -> String {
-        url.trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let shared = format!("{calendar}_shared_by_");
+/// The collection of `calendar` that `owner` shares with the account:
+/// exactly `<calendar>_shared_by_<owner>`. Never a calendar of the account's
+/// own (anyone can make one of that name and share it with the bot), never
+/// one another account shares under the same name.
+pub fn pick(urls: &[String], calendar: &str, owner: &str) -> Option<String> {
+    let share = format!("{calendar}_shared_by_{owner}");
     urls.iter()
-        .find(|u| slug(u) == calendar)
-        .or_else(|| {
-            let mut shares: Vec<&String> = urls
-                .iter()
-                .filter(|u| slug(u).starts_with(&shared))
-                .collect();
-            shares.sort();
-            shares.first().copied()
-        })
+        .find(|u| u.trim_end_matches('/').rsplit('/').next() == Some(share.as_str()))
         .cloned()
 }
 
@@ -138,9 +126,10 @@ impl Reader {
         let urls = caldav::discover_calendars(&self.http, &source)
             .await
             .context("listing the account's calendars")?;
-        let Some(url) = pick(&urls, &self.config.calendar) else {
+        let Some(url) = pick(&urls, &self.config.calendar, &self.config.owner) else {
             bail!(
-                "the calendar {:?} is not shared with {} (it has {} calendar(s))",
+                "{} doesn't share the calendar {:?} with {} (it has {} calendar(s))",
+                self.config.owner,
                 self.config.calendar,
                 self.config.username,
                 urls.len()
@@ -257,20 +246,30 @@ END:VCALENDAR\r\n";
     }
 
     #[test]
-    fn the_own_calendar_or_the_one_shared_with_the_bot() {
+    fn only_the_calendar_its_owner_shares_with_the_bot() {
         let base = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot";
+        let pick = |urls: &[String]| pick(urls, "plenum-house", "plenum-bot");
+        let share = format!("{base}/plenum-house_shared_by_plenum-bot/");
         let urls = [
             format!("{base}/personal/"),
-            format!("{base}/plenum-house_shared_by_plenum-bot/"),
-            format!("{base}/plenum-house-old/"),
+            // Made by someone else under the same name, shared with the bot
+            // (sorted before the real one).
+            format!("{base}/plenum-house_shared_by_eve/"),
+            format!("{base}/plenum-house_shared_by_plenum-bot_shared_by_eve/"),
+            // The bot's own of that name.
+            format!("{base}/plenum-house/"),
+            share.clone(),
+            format!("{base}/plenum-house-old_shared_by_plenum-bot/"),
         ];
+        assert_eq!(pick(&urls).as_deref(), Some(share.as_str()));
+        // Without the share: none, however alike the others are named.
+        let without: Vec<String> = urls.iter().filter(|u| **u != share).cloned().collect();
+        assert_eq!(pick(&without), None);
         assert_eq!(
-            pick(&urls, "plenum-house").as_deref(),
-            Some(urls[1].as_str())
+            pick(&[share.trim_end_matches('/').to_owned()]).as_deref(),
+            Some(share.trim_end_matches('/'))
         );
-        let own = [urls[1].clone(), format!("{base}/plenum-house/")];
-        assert_eq!(pick(&own, "plenum-house").as_deref(), Some(own[1].as_str()));
-        assert_eq!(pick(&urls, "plenum-kitchen"), None);
-        assert_eq!(pick(&urls[2..], "plenum-house"), None);
+        assert_eq!(super::pick(&urls, "plenum-kitchen", "plenum-bot"), None);
+        assert_eq!(super::pick(&urls, "plenum-house", "plenum"), None);
     }
 }

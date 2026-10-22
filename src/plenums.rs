@@ -8,9 +8,10 @@
 //!   → plenum row (`calendar_id`, stable row ID)
 //!
 //! A moved event moves its row (same ID), a deleted one cancels it, one that
-//! comes back schedules it again. Past plenums are never rewritten, and a
-//! read without any occurrence changes nothing (an emptied or re-made
-//! calendar must not cancel the plenum a round is collecting for).
+//! comes back schedules it again. Past plenums are never rewritten, future
+//! ones never moved into the past, and a read without any occurrence
+//! changes nothing (an emptied or re-made calendar must not cancel the
+//! plenum a round is collecting for).
 //!
 //! Invariant kept by [`ensure_round`]: the one open round belongs to the
 //! earliest scheduled plenum, and the "delete after the next plenum"
@@ -222,9 +223,11 @@ const CALENDAR: &str = "calendar";
 /// a new row (not for one already past). A linked row follows its
 /// occurrence (moved: same row; back: scheduled again); a linked future row
 /// whose occurrence is gone is cancelled, and so is every future row from
-/// before the calendar that no occurrence took over. Completed plenums, and
-/// past ones that stay past, are never rewritten. Without any occurrence
-/// ahead, nothing changes at all.
+/// before the calendar that no occurrence took over. Completed plenums are
+/// never rewritten, and an occurrence that is over rewrites none (a past
+/// plenum stays past, a future one is not moved into the past). A restored
+/// plenum whose cancellation was posted is announced anew. Without any
+/// occurrence ahead, nothing changes at all.
 pub fn sync_calendar(
     conn: &mut Connection,
     occurrences: &[Occurrence],
@@ -321,20 +324,46 @@ pub fn sync_calendar(
             }
             continue;
         };
-        if p.status == Status::Completed || (p.starts_at <= now && o.starts_at <= now) {
+        if p.status == Status::Completed {
             continue;
         }
+        // An occurrence that is over (per the calendar) changes nothing: a
+        // past plenum stays as it is, and a future one is not moved into
+        // the past (nor brought back there): the round would sit on a
+        // plenum that is over (with auto-complete, its "delete after"
+        // submissions would go). It stays where it is; once the event is
+        // out of view, it counts as gone.
+        if o.starts_at <= now {
+            if p.starts_at > now {
+                tracing::warn!(
+                    plenum = p.id,
+                    event = %o.id,
+                    "The calendar has this future plenum in the past: it stays as it is"
+                );
+            }
+            continue;
+        }
+        let mut p = p.clone();
         if p.status == Status::Cancelled {
-            // A cancellation not announced yet is simply off again.
+            // A cancellation not announced yet is simply off again. One
+            // people were told of: the plenum is announced anew (its
+            // day-before summary goes out again, the normal way).
+            let told = p.announced_at.is_some() && update_pending(&tx, p.id)?.is_none();
             tx.execute(
-                "UPDATE plenums SET status = 'scheduled', update_pending = NULL WHERE id = ?1",
-                [p.id],
+                "UPDATE plenums SET status = 'scheduled', update_pending = NULL,
+                        announced_at = CASE WHEN ?2 THEN NULL ELSE announced_at END
+                 WHERE id = ?1",
+                params![p.id, told],
             )?;
             audit(&tx, Some(p.id), "restore", &o.id, CALENDAR, now)?;
+            if told {
+                p.announced_at = None;
+            }
+            p.status = Status::Scheduled;
             synced.restored += 1;
         }
         if p.starts_at != o.starts_at {
-            move_row(&tx, p, o.starts_at, now)?;
+            move_row(&tx, &p, o.starts_at, now)?;
             synced.moved += 1;
         }
     }
@@ -387,6 +416,14 @@ pub fn sync_calendar(
     }
     tx.commit()?;
     Ok(synced)
+}
+
+fn update_pending(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT update_pending FROM plenums WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 
 fn linked(conn: &Connection, calendar_id: &str) -> Result<Option<Plenum>> {
@@ -852,6 +889,98 @@ pub(crate) mod tests {
             starts_at: at(2026, 11, 15, 20),
         });
         assert_eq!(read(&mut conn, &calendar, evening).added, 0);
+    }
+
+    #[test]
+    fn a_future_plenum_is_not_moved_into_the_past() {
+        let now = at(2026, 11, 15, 12);
+        let mut conn = with_house_calendar(now);
+        let first = next(&conn).unwrap().unwrap();
+        assert_eq!(first.starts_at, at(2026, 11, 15, 19));
+        let round = open_round(&conn).unwrap().unwrap();
+        assert_eq!(round.plenum_id, first.id);
+        let before = upcoming(&conn, 50).unwrap();
+        // Moved to yesterday, or to earlier today: it stays as it is, and
+        // so does the round.
+        for to in [at(2026, 11, 14, 19), at(2026, 11, 15, 10)] {
+            move_in_calendar(&mut conn, first.id, to, now);
+            assert_eq!(upcoming(&conn, 50).unwrap(), before);
+            assert_eq!(open_round(&conn).unwrap().unwrap(), round);
+            assert!(!next(&conn).unwrap().unwrap().awaiting_completion(now));
+        }
+        // A cancelled one that comes back in the past stays cancelled.
+        let second = before[1].clone();
+        cancel_in_calendar(&mut conn, second.id, now);
+        let mut calendar = calendar_of(&conn);
+        calendar.push(Occurrence {
+            id: second.calendar_id.clone().unwrap(),
+            starts_at: at(2026, 11, 14, 19),
+        });
+        let synced = read(&mut conn, &calendar, now);
+        assert_eq!((synced.restored, synced.moved), (0, 0));
+        let p = get(&conn, second.id).unwrap().unwrap();
+        assert_eq!(
+            (p.status, p.starts_at),
+            (Status::Cancelled, second.starts_at)
+        );
+        assert_eq!(open_round(&conn).unwrap().unwrap(), round);
+    }
+
+    #[test]
+    fn a_restored_plenum_is_announced_again_once_its_cancellation_was_posted() {
+        use crate::summary::{take_summary, take_updates, Update};
+        let now = at(2026, 11, 14, 20);
+        let mut conn = with_house_calendar(now);
+        let first = next(&conn).unwrap().unwrap();
+        assert_eq!(
+            take_summary(&conn, now, Duration::days(1)).unwrap(),
+            Some(first.id)
+        );
+        // Cancelled and back before the cancellation went out: nothing to
+        // say, the summary stands.
+        cancel_in_calendar(&mut conn, first.id, now);
+        let mut calendar = calendar_of(&conn);
+        calendar.insert(
+            0,
+            Occurrence {
+                id: first.calendar_id.clone().unwrap(),
+                starts_at: first.starts_at,
+            },
+        );
+        assert_eq!(read(&mut conn, &calendar, now).restored, 1);
+        let p = get(&conn, first.id).unwrap().unwrap();
+        assert!(p.announced_at.is_some());
+        assert!(take_updates(&conn).unwrap().is_empty());
+        assert_eq!(take_summary(&conn, now, Duration::days(1)).unwrap(), None);
+        // Cancelled, and people were told: back, it is announced anew.
+        cancel_in_calendar(&mut conn, first.id, now);
+        assert_eq!(
+            take_updates(&conn).unwrap(),
+            [(first.id, Update::Cancelled)]
+        );
+        let later = now + Duration::hours(1);
+        assert_eq!(read(&mut conn, &calendar, later).restored, 1);
+        let p = get(&conn, first.id).unwrap().unwrap();
+        assert_eq!((p.status, p.announced_at), (Status::Scheduled, None));
+        assert!(take_updates(&conn).unwrap().is_empty());
+        assert_eq!(
+            take_summary(&conn, later, Duration::days(1)).unwrap(),
+            Some(first.id)
+        );
+        assert_eq!(open_round(&conn).unwrap().unwrap().plenum_id, first.id);
+        // Back and moved at once: the new date gets the summary, no update
+        // about a move from a date that was called off.
+        cancel_in_calendar(&mut conn, first.id, later);
+        take_updates(&conn).unwrap();
+        calendar[0].starts_at = at(2026, 11, 15, 18);
+        read(&mut conn, &calendar, later);
+        let p = get(&conn, first.id).unwrap().unwrap();
+        assert_eq!((p.starts_at, p.announced_at), (at(2026, 11, 15, 18), None));
+        assert!(take_updates(&conn).unwrap().is_empty());
+        assert_eq!(
+            take_summary(&conn, later, Duration::days(1)).unwrap(),
+            Some(first.id)
+        );
     }
 
     #[test]

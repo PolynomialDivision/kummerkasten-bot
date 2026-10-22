@@ -41,12 +41,15 @@ timezone = "Europe/Berlin"
 
 # The plenum's dates: only from this Nextcloud calendar. plenum-bot owns it
 # and shares it read-only with the bot's own Nextcloud account (Nextcloud
-# names the share "<calendar>_shared_by_<owner>"; either name is found).
+# names the share "<calendar>_shared_by_<owner>"). Only that share is read:
+# not a calendar of the bot's own, not one of that name from anyone else.
 # Moving, cancelling or adding a plenum happens there; the bot follows. Left
 # out, the bot has no dates and leaves the plenums it knows as they are.
 [kummerkasten.calendar]
 account_url     = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
 calendar        = "plenum-house"
+# The account that owns and shares it (default "plenum-bot").
+# owner         = "plenum-bot"
 username        = "kummerkasten-bot"
 # The environment variable with the account's app password (never here).
 password_env    = "CALDAV_PASSWORD"

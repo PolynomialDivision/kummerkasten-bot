@@ -107,6 +107,11 @@ pub struct CalendarConfig {
     /// The calendar's name at its owner (`plenum-house`). Shared with this
     /// account, Nextcloud calls it `<calendar>_shared_by_<owner>`.
     pub calendar: String,
+    /// The Nextcloud account that owns the calendar and shares it with this
+    /// one. Only its share is read: never a calendar of this account, never
+    /// one of that name another account shares.
+    #[serde(default = "default_owner")]
+    pub owner: String,
     pub username: String,
     /// The environment variable holding the app password (never the config).
     #[serde(default = "default_password_env")]
@@ -114,6 +119,10 @@ pub struct CalendarConfig {
     /// How often the calendar is read.
     #[serde(default = "default_refresh_minutes")]
     pub refresh_minutes: u64,
+}
+
+fn default_owner() -> String {
+    "plenum-bot".to_owned()
 }
 
 fn default_password_env() -> String {
@@ -165,12 +174,16 @@ pub fn check_kummerkasten(kk: &KkConfig, security: &SecurityConfig) -> Result<()
         }
         for (name, value) in [
             ("calendar", &calendar.calendar),
+            ("owner", &calendar.owner),
             ("username", &calendar.username),
             ("password_env", &calendar.password_env),
         ] {
             if value.trim().is_empty() {
                 bail!("[kummerkasten.calendar] {name} must not be empty");
             }
+        }
+        if calendar.owner == calendar.username {
+            bail!("[kummerkasten.calendar] owner is the account that shares the calendar, not the bot's own");
         }
     }
     if kk.mode == Mode::Test && security.admin_users.is_empty() {
@@ -333,8 +346,12 @@ mod tests {
         assert_eq!(kk.plenum_time.as_deref(), Some("19:00"));
         let calendar = kk.calendar.as_ref().unwrap();
         assert_eq!(
-            (calendar.password_env.as_str(), calendar.refresh_minutes),
-            ("CALDAV_PASSWORD", 5)
+            (
+                calendar.owner.as_str(),
+                calendar.password_env.as_str(),
+                calendar.refresh_minutes
+            ),
+            ("plenum-bot", "CALDAV_PASSWORD", 5)
         );
         check_kummerkasten(kk, &config.security).unwrap();
         // Without it: no dates, but the bot starts.
@@ -352,6 +369,20 @@ mod tests {
         )
         .unwrap();
         assert!(check_kummerkasten(&empty.kummerkasten, &empty.security).is_err());
+        // Another owner can be named; never the bot's own account.
+        let other = parse(
+            "[kummerkasten.calendar]\naccount_url = \"https://c.x/\"\ncalendar = \"p\"\n\
+             username = \"u\"\nowner = \"o\"\n",
+        )
+        .unwrap();
+        assert_eq!(other.kummerkasten.calendar.as_ref().unwrap().owner, "o");
+        check_kummerkasten(&other.kummerkasten, &other.security).unwrap();
+        let own = parse(
+            "[kummerkasten.calendar]\naccount_url = \"https://c.x/\"\ncalendar = \"p\"\n\
+             username = \"u\"\nowner = \"u\"\n",
+        )
+        .unwrap();
+        assert!(check_kummerkasten(&own.kummerkasten, &own.security).is_err());
     }
 
     #[test]
@@ -362,6 +393,8 @@ mod tests {
         check_kummerkasten(&config.kummerkasten, &config.security).unwrap();
         let calendar = config.kummerkasten.calendar.unwrap();
         assert_eq!(calendar.calendar, "plenum-house");
+        // Rendered without `owner`: the default is plenum-bot's account.
+        assert_eq!(calendar.owner, "plenum-bot");
         assert!(calendar
             .account_url
             .ends_with("/calendars/kummerkasten-bot/"));
