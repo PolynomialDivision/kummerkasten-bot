@@ -230,13 +230,13 @@ mod tests {
     use super::*;
     use crate::{
         lifecycle,
-        plenums::tests::{at, with_default_rule},
+        plenums::tests::{at, with_house_calendar},
     };
 
     #[test]
     fn measures_are_created_edited_and_belong_to_a_concrete_plenum() {
         let now = at(2026, 10, 5, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let first = plenums::next(&conn).unwrap().unwrap();
         lifecycle::complete(&mut conn, first.id, "@admin:x", now).unwrap();
         let id = add(

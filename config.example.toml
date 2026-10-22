@@ -29,9 +29,6 @@ require_verified_device = true
 [kummerkasten]
 # Every date residents see, and when a day ends.
 timezone = "Europe/Berlin"
-# Time of the starting rhythm: the 1st, 3rd and 5th Sunday of each month.
-# Used once, on first start; afterwards `!kk rule set …` changes it.
-plenum_time = "19:00"
 # "live" (default) or "test": its own database (kummerkasten-test.sqlite;
 # the live one is never touched), only admin_users have access, every
 # check-in goes only to the admin who starts it, messages say 🧪 Test.
@@ -41,6 +38,19 @@ plenum_time = "19:00"
 # messages, no plenum summaries. "full": the whole Kummerkasten (feedback,
 # ideas, results). Nothing is deleted either way; switching back is a restart.
 # ui = "full"
+
+# The plenum's dates: only from this Nextcloud calendar. plenum-bot owns it
+# and shares it read-only with the bot's own Nextcloud account (Nextcloud
+# names the share "<calendar>_shared_by_<owner>"; either name is found).
+# Moving, cancelling or adding a plenum happens there; the bot follows. Left
+# out, the bot has no dates and leaves the plenums it knows as they are.
+[kummerkasten.calendar]
+account_url     = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
+calendar        = "plenum-house"
+username        = "kummerkasten-bot"
+# The environment variable with the account's app password (never here).
+password_env    = "CALDAV_PASSWORD"
+refresh_minutes = 5
 
 # The authorized rooms. Listed here, they are synced at every start (the
 # others deactivated) and `!kk rooms add/remove/central` are refused; left

@@ -1019,7 +1019,7 @@ pub fn overview(conn: &Connection) -> Result<Vec<RunRow>> {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        plenums::tests::{at, with_default_rule},
+        plenums::tests::{at, with_house_calendar},
         surveys::{edit, Edit},
     };
 
@@ -1069,7 +1069,7 @@ pub(crate) mod tests {
     #[test]
     fn a_run_is_a_snapshot_the_template_can_no_longer_change() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let run1 = started(&mut conn, now, StartOptions::default());
         assert_eq!(run1.questions.len(), 3);
         // For the next plenum, closing when it starts, one reminder a day before.
@@ -1164,7 +1164,7 @@ pub(crate) mod tests {
     fn a_plenum_within_the_hour_needs_a_closing_date_but_the_preview_still_works() {
         let plenum = at(2026, 11, 1, 19);
         let now = plenum - Duration::minutes(30);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         let remind = Duration::hours(24);
         let opts = StartOptions::default();
         let err = plan(&conn, "cleaning", &opts, now, remind).unwrap_err();
@@ -1186,7 +1186,7 @@ pub(crate) mod tests {
     #[test]
     fn a_reminder_missed_until_the_last_hour_is_dropped() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         // On time: sent once.
         let on_time = started(&mut conn, now, StartOptions::default());
         let due = on_time.reminder_at.unwrap();
@@ -1205,7 +1205,7 @@ pub(crate) mod tests {
     #[test]
     fn a_plenum_moved_earlier_drops_a_reminder_that_would_be_past() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let run = started(&mut conn, now, StartOptions::default());
         let plenum = run.plenum_id.unwrap();
         // A week later the plenum moves to tomorrow morning: "a day before"
@@ -1213,16 +1213,7 @@ pub(crate) mod tests {
         let later = now + Duration::days(8);
         let soon = later + Duration::hours(20);
         assert!(soon < run.closes_at);
-        plenums::reschedule(
-            &mut conn,
-            plenum,
-            soon,
-            None,
-            "@admin:x",
-            plenums::tests::zone(),
-            later,
-        )
-        .unwrap();
+        plenums::tests::move_in_calendar(&mut conn, plenum, soon, later);
         let moved = super::run(&conn, run.id).unwrap();
         assert_eq!(moved.closes_at, soon);
         assert_eq!(moved.reminder_at, None);
@@ -1234,7 +1225,7 @@ pub(crate) mod tests {
     #[test]
     fn a_room_with_an_open_check_in_for_its_members_stays() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         crate::store::add_room(&conn, "!kitchen:x", "Kitchen", "@admin:x").unwrap();
         let run = started(
             &mut conn,
@@ -1299,7 +1290,7 @@ pub(crate) mod tests {
     #[test]
     fn anonymous_floor_and_named_responses() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let run = started(&mut conn, now, StartOptions::default());
         let floor: i64 = conn
@@ -1359,7 +1350,7 @@ pub(crate) mod tests {
     #[test]
     fn one_answer_per_person_without_a_link_to_the_answer() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let run = started(&mut conn, now, StartOptions::default());
         let a = answers(&run);
@@ -1422,7 +1413,7 @@ pub(crate) mod tests {
     #[test]
     fn answers_must_fit_and_required_ones_must_be_there() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let run = started(&mut conn, now, StartOptions::default());
         fn sub<'a>(rooms: &'a [String], a: &'a BTreeMap<usize, Answer>) -> Submission<'a> {
@@ -1481,7 +1472,7 @@ pub(crate) mod tests {
     #[test]
     fn notices_reminders_and_announcements_go_out_once_and_only_as_configured() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let quiet = started(
             &mut conn,
@@ -1548,7 +1539,7 @@ pub(crate) mod tests {
     #[test]
     fn a_check_in_planned_for_later_stays_hidden_until_it_opens() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let opens = now + Duration::days(1);
         let run = started(
@@ -1586,7 +1577,7 @@ pub(crate) mod tests {
     #[test]
     fn a_planned_start_must_be_ahead_and_leave_time_to_answer() {
         let now = at(2026, 11, 2, 12);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         let remind = Duration::hours(24);
         let past = StartOptions {
             opens: Some(now - Duration::minutes(5)),
@@ -1614,7 +1605,7 @@ pub(crate) mod tests {
     #[test]
     fn the_menu_lists_open_and_answered_check_ins() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let run = started(&mut conn, now, StartOptions::default());
         let kitchen_only = started(

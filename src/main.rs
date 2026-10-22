@@ -32,6 +32,7 @@ mod access;
 mod admin;
 mod admin_checkins;
 mod admin_results;
+mod calendar;
 mod catalog;
 mod checkins;
 mod config;
@@ -44,7 +45,6 @@ mod lifecycle;
 mod markup;
 mod measures;
 mod outbox;
-mod plenum;
 mod plenums;
 mod reconcile;
 mod results;
@@ -126,17 +126,37 @@ async fn main() -> Result<()> {
         tracing::info!(rooms = count, changed, "Authorized rooms from the config");
     }
 
-    // First start: the house's rhythm as the starting rule. Then plenums
-    // into view and a round open.
-    let plenum_time = time::parse_hm(&config.kummerkasten.plenum_time)?;
-    db.run(move |conn| {
-        let now = Utc::now();
-        let rule = plenum::Recurrence::default_rule(plenum_time);
-        if plenums::ensure_rule(conn, &rule, zone.date(now))? {
-            tracing::info!(rule = %rule.describe(), "Stored the starting plenum rhythm");
+    // The plenum's dates come only from the calendar. Without it (or its
+    // password) the bot has no dates: the plenums it knows stay as they are,
+    // and the round keeps collecting for the next of them.
+    if config.kummerkasten.plenum_time.is_some() {
+        tracing::warn!(
+            "[kummerkasten] plenum_time is ignored: the plenum's dates come from [kummerkasten.calendar]"
+        );
+    }
+    let mut calendar_status = calendar::Status::default();
+    let reader = match &config.kummerkasten.calendar {
+        None => {
+            tracing::warn!(
+                "No [kummerkasten.calendar]: no plenum dates; the plenums already known stay as they are"
+            );
+            None
         }
-        plenums::materialize(conn, zone, now)?;
-        plenums::ensure_round(conn, now)?;
+        Some(cal) => match calendar::Reader::from_config(cal) {
+            Ok(reader) => {
+                calendar_status.calendar = Some(cal.calendar.clone());
+                Some(reader)
+            }
+            Err(error) => {
+                tracing::error!(
+                    "{error:#}: no plenum dates; the plenums already known stay as they are"
+                );
+                None
+            }
+        },
+    };
+    db.run(move |conn| {
+        plenums::ensure_round(conn, Utc::now())?;
         Ok(())
     })
     .await?;
@@ -173,6 +193,7 @@ async fn main() -> Result<()> {
         pending_starts: Arc::default(),
         test_users: test.then(|| Arc::new(config.security.admin_users.clone())),
         managed_rooms: config.kummerkasten.rooms.clone().map(Arc::new),
+        calendar: Arc::new(std::sync::Mutex::new(calendar_status)),
     };
 
     bot.client.add_event_handler({
@@ -286,6 +307,12 @@ async fn main() -> Result<()> {
     }
     // Screens a crash left behind, before anyone taps on them.
     dm::resume_screens(&kk).await;
+    // The calendar first, so the clock never announces a date it would
+    // change a moment later.
+    if let Some(mut reader) = reader {
+        calendar::sync(&kk, &mut reader).await;
+        tokio::spawn(calendar::run(kk.clone(), reader));
+    }
     tokio::spawn(scheduler::run(kk.clone()));
     bot.run().await
 }

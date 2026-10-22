@@ -477,12 +477,12 @@ pub fn is_entry(conn: &Connection, room_id: &str, event_id: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
 
     #[test]
     fn the_config_rooms_become_exactly_the_active_rooms() {
         use crate::config::RoomConfig;
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         add_room(&conn, "!old:x", "Old", "@a:x").unwrap();
         let room = |id: &str, label: &str, central| RoomConfig {
             id: id.into(),
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn a_left_chat_is_redacted_before_the_bot_leaves() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         conn.execute(
             "INSERT INTO residents (mxid, dm_room_id, dm_joined, created_at) VALUES ('@a:x', '!a:x', 1, 'x')",
             [],
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn failed_redactions_back_off_and_are_never_given_up() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         record_event(&conn, "!a:x", "$1", true).unwrap();
         crate::engine::tidy(&conn, "!a:x").unwrap();
         let now = chrono::Utc::now();
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn a_screen_is_edited_only_while_it_is_the_last_message() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let editable = |e: &str| screen_is_editable(&conn, "!a:x", e).unwrap();
         record_event(&conn, "!a:x", "$screen", true).unwrap();
         // Without known buttons (an older screen): never edited.
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn buttons_are_tracked_with_their_screen_and_go_with_it() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let editable = |e: &str| screen_is_editable(&conn, "!a:x", e).unwrap();
         record_event(&conn, "!a:x", "$screen", true).unwrap();
         set_screen_buttons(&conn, "!a:x", "$screen", &[("📝".into(), "$r1".into())]).unwrap();
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn a_posted_entry_is_remembered_per_room() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         assert!(!entry_posted(&conn, "!h:x").unwrap());
         mark_entry_posted(&conn, "!h:x", "$1").unwrap();
         mark_entry_posted(&conn, "!h:x", "$2").unwrap();
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn events_are_tracked_per_round_and_redelivery_is_noticed() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let round = plenums::open_round(&conn).unwrap().unwrap();
         record_event(&conn, "!a:x", "$1", true).unwrap();
         record_event(&conn, "!a:x", "$1", true).unwrap();
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn tidying_a_flow_touches_only_that_chat_and_that_flow() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         record_event(&conn, "!a:x", "$screen", true).unwrap();
         record_event(&conn, "!a:x", "$receipt", false).unwrap();
         record_event(&conn, "!b:x", "$other", true).unwrap();
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_notice_waits_until_the_chat_is_cleared() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         set_dm(&conn, "@a:x", "!a:x").unwrap();
         set_joined(&conn, "@a:x").unwrap();
         record_event(&conn, "!a:x", "$1", false).unwrap();

@@ -48,7 +48,7 @@ pub fn complete(
     let next = plenums::next(&tx)?.context("No plenum is scheduled.")?;
     if next.id != plenum_id {
         bail!(
-            "Plenum #{} comes first. Complete or cancel it before #{plenum_id}.",
+            "Plenum #{} comes first. Complete it (or cancel it in the calendar) before #{plenum_id}.",
             next.id
         );
     }
@@ -192,7 +192,7 @@ pub fn reopen(
 mod tests {
     use super::*;
     use crate::{
-        plenums::tests::{at, with_default_rule, zone},
+        plenums::tests::{at, with_house_calendar, zone},
         secrets::Secrets,
         submissions::{self, tests::new, Identity, Retention},
     };
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn completing_a_plenum_runs_the_whole_lifecycle() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[9; 32]);
         let today = zone().date(now);
         let plenum = plenums::next(&conn).unwrap().unwrap();
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn a_cancelled_plenum_hands_its_deletions_to_the_next_one() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[9; 32]);
         let first = plenums::next(&conn).unwrap().unwrap();
         let s = submissions::submit(
@@ -303,7 +303,7 @@ mod tests {
             zone().date(now),
         )
         .unwrap();
-        plenums::cancel(&mut conn, first.id, "@admin:x", now).unwrap();
+        plenums::tests::cancel_in_calendar(&mut conn, first.id, now);
         let second = plenums::next(&conn).unwrap().unwrap();
         let points_at: i64 = conn
             .query_row(
@@ -314,16 +314,7 @@ mod tests {
             .unwrap();
         assert_eq!(points_at, second.id);
         // A move of that plenum keeps the link (it's the same row).
-        plenums::reschedule(
-            &mut conn,
-            second.id,
-            at(2026, 11, 28, 18),
-            None,
-            "@admin:x",
-            zone(),
-            now,
-        )
-        .unwrap();
+        plenums::tests::move_in_calendar(&mut conn, second.id, at(2026, 11, 28, 18), now);
         let done = complete(&mut conn, second.id, "system", at(2026, 11, 29, 9)).unwrap();
         assert_eq!(done.deleted, 1);
     }
@@ -331,7 +322,7 @@ mod tests {
     #[test]
     fn reopening_a_mistaken_completion_merges_the_rounds_back() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[9; 32]);
         let first = plenums::next(&conn).unwrap().unwrap();
         let old_round = plenums::open_round(&conn).unwrap().unwrap();

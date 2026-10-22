@@ -422,7 +422,7 @@ pub(crate) mod tests {
         lifecycle,
         plenums::{
             self,
-            tests::{at, with_default_rule, zone},
+            tests::{at, with_house_calendar, zone},
         },
         secrets::Secrets,
         submissions::{self, Identity, NewSubmission, Retention},
@@ -553,7 +553,7 @@ pub(crate) mod tests {
     #[test]
     fn metrics_compare_across_question_versions_but_never_across_metrics() {
         let now = at(2026, 3, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let people = |v| {
             vec![
@@ -620,7 +620,7 @@ pub(crate) mod tests {
     #[test]
     fn problems_aggregate_canonically_and_small_runs_show_no_value() {
         let now = at(2026, 3, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         closed_run(
             &mut conn,
@@ -673,7 +673,7 @@ pub(crate) mod tests {
     #[test]
     fn floor_breakdowns_suppress_small_and_derivable_groups() {
         let now = at(2026, 3, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let (f1, f2, f3) = (
             floor(&conn, "floor.1"),
@@ -721,7 +721,7 @@ pub(crate) mod tests {
     #[test]
     fn spontaneous_feedback_counts_what_is_stored_and_leaves_out_today() {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let round = plenums::open_round(&conn).unwrap().unwrap();
         let skipped: (i64, i64) = conn
@@ -788,7 +788,7 @@ pub(crate) mod tests {
     #[test]
     fn participation_counts_responses_against_eligible_at_launch() {
         let now = at(2026, 3, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let run = closed_run(
             &mut conn,

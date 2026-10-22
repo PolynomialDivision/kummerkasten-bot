@@ -1,5 +1,4 @@
-//! The clock: every minute (and whenever a handler wakes it) plenums come
-//! into view, rounds open, finished plenums are completed, check-ins open,
+//! The clock: every minute (and whenever a handler wakes it) rounds open, finished plenums are completed, check-ins open,
 //! remind and close, stale drafts are tidied, and the Matrix side catches
 //! up with the database: marked events are redacted, cleared chats get
 //! their notice and a fresh menu.
@@ -67,7 +66,8 @@ async fn tick(kk: &Kk) {
     dm::post_missing_entries(kk).await;
 }
 
-/// Plenums into view, the round invariant, completions that are due.
+/// The round invariant, completions that are due. (The plenums themselves
+/// come from the calendar: `calendar::run`.)
 async fn plenum_clock(kk: &Kk) {
     let _op = kk.ops.lock().await;
     let zone = kk.engine.zone;
@@ -81,7 +81,6 @@ async fn plenum_clock(kk: &Kk) {
         .db
         .run(move |conn| {
             let now = Utc::now();
-            plenums::materialize(conn, zone, now)?;
             plenums::ensure_round(conn, now)?;
             let mut completed = 0;
             if auto_complete {

@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn the_house_cleaning_survey_applies_and_starts() {
         let now = crate::plenums::tests::at(2026, 10, 19, 12);
-        let mut conn = crate::plenums::tests::with_default_rule(now);
+        let mut conn = crate::plenums::tests::with_house_calendar(now);
         let file = shipped();
         let applied = apply(&mut conn, &file).unwrap();
         assert_eq!(applied.questions, 12);
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn what_is_exported_applies_to_the_same_survey() {
         let now = crate::plenums::tests::at(2026, 10, 19, 12);
-        let mut conn = crate::plenums::tests::with_default_rule(now);
+        let mut conn = crate::plenums::tests::with_house_calendar(now);
         let file = shipped();
         apply(&mut conn, &file).unwrap();
         let exported = export(&conn, "house_cleaning").unwrap();
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn a_survey_never_started_is_replaced_one_started_is_kept() {
         let now = crate::plenums::tests::at(2026, 10, 19, 12);
-        let mut conn = crate::plenums::tests::with_default_rule(now);
+        let mut conn = crate::plenums::tests::with_house_calendar(now);
         let mut file = shipped();
         apply(&mut conn, &file).unwrap();
         file.questions.truncate(2);
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn a_bad_file_changes_nothing_and_says_where() {
         let now = crate::plenums::tests::at(2026, 10, 19, 12);
-        let mut conn = crate::plenums::tests::with_default_rule(now);
+        let mut conn = crate::plenums::tests::with_house_calendar(now);
         let unknown_problem = r#"
 key = "trial"
 emoji = "🧪"

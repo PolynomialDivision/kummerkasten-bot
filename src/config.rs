@@ -16,10 +16,15 @@ pub struct KkConfig {
     /// IANA timezone for every date residents see and every "which day".
     #[serde(default = "default_timezone")]
     pub timezone: String,
-    /// Time of the plenums of the starting rule (1st, 3rd and 5th Sunday).
-    /// Only used on first start; afterwards the rule lives in the database.
-    #[serde(default = "default_plenum_time")]
-    pub plenum_time: String,
+    /// No longer used: the plenum's dates come from `[kummerkasten.calendar]`.
+    /// Still accepted (and ignored, with a warning) for one release, so an
+    /// older config keeps starting the bot.
+    #[serde(default)]
+    pub plenum_time: Option<String>,
+    /// Where the plenum's dates come from. Left out: the bot has no dates
+    /// and leaves the plenums it knows as they are.
+    #[serde(default)]
+    pub calendar: Option<CalendarConfig>,
     /// Starting values of the settings admins can change at runtime.
     #[serde(default)]
     pub settings: Tunables,
@@ -55,7 +60,8 @@ impl Default for KkConfig {
     fn default() -> Self {
         Self {
             timezone: default_timezone(),
-            plenum_time: default_plenum_time(),
+            plenum_time: None,
+            calendar: None,
             settings: Tunables::default(),
             mode: Mode::default(),
             rooms: None,
@@ -88,6 +94,34 @@ impl Mode {
             ],
         }
     }
+}
+
+/// The Nextcloud calendar with the plenum's dates (`[kummerkasten.calendar]`):
+/// plenum-bot's, shared read-only with this bot's own account.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarConfig {
+    /// The bot's CalDAV calendar home,
+    /// `https://cloud.example.org/remote.php/dav/calendars/<username>/`.
+    pub account_url: String,
+    /// The calendar's name at its owner (`plenum-house`). Shared with this
+    /// account, Nextcloud calls it `<calendar>_shared_by_<owner>`.
+    pub calendar: String,
+    pub username: String,
+    /// The environment variable holding the app password (never the config).
+    #[serde(default = "default_password_env")]
+    pub password_env: String,
+    /// How often the calendar is read.
+    #[serde(default = "default_refresh_minutes")]
+    pub refresh_minutes: u64,
+}
+
+fn default_password_env() -> String {
+    "CALDAV_PASSWORD".to_owned()
+}
+
+fn default_refresh_minutes() -> u64 {
+    5
 }
 
 /// One authorized room from the config.
@@ -123,6 +157,22 @@ pub fn check_kummerkasten(kk: &KkConfig, security: &SecurityConfig) -> Result<()
             }
         }
     }
+    if let Some(calendar) = &kk.calendar {
+        if !calendar.account_url.starts_with("https://")
+            && !calendar.account_url.starts_with("http://")
+        {
+            bail!("[kummerkasten.calendar] account_url must be an http(s) URL");
+        }
+        for (name, value) in [
+            ("calendar", &calendar.calendar),
+            ("username", &calendar.username),
+            ("password_env", &calendar.password_env),
+        ] {
+            if value.trim().is_empty() {
+                bail!("[kummerkasten.calendar] {name} must not be empty");
+            }
+        }
+    }
     if kk.mode == Mode::Test && security.admin_users.is_empty() {
         bail!("mode = \"test\" needs [security] admin_users: only they may use it");
     }
@@ -131,10 +181,6 @@ pub fn check_kummerkasten(kk: &KkConfig, security: &SecurityConfig) -> Result<()
 
 fn default_timezone() -> String {
     "Europe/Berlin".to_owned()
-}
-
-fn default_plenum_time() -> String {
-    "19:00".to_owned()
 }
 
 /// Knobs admins can change with `!admin set <key> <value>`.
@@ -231,7 +277,10 @@ mod tests {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         check_security(&config.security).unwrap();
         crate::time::Zone::parse(&config.kummerkasten.timezone).unwrap();
-        crate::time::parse_hm(&config.kummerkasten.plenum_time).unwrap();
+        assert!(config.kummerkasten.plenum_time.is_none());
+        let calendar = config.kummerkasten.calendar.as_ref().unwrap();
+        assert_eq!(calendar.calendar, "plenum-house");
+        assert_eq!(calendar.password_env, "CALDAV_PASSWORD");
         assert!(config.security.admin_dm.require_verified_device);
         check_kummerkasten(&config.kummerkasten, &config.security).unwrap();
     }
@@ -267,6 +316,69 @@ mod tests {
         assert!(check_kummerkasten(&twice.kummerkasten, &twice.security).is_err());
         let bad = parse("[[kummerkasten.rooms]]\nid = \"house\"\nlabel = \"A\"\n");
         assert!(check_kummerkasten(&bad.kummerkasten, &bad.security).is_err());
+    }
+
+    #[test]
+    fn the_calendar_section_and_the_old_plenum_time() {
+        let parse = |s: &str| toml::from_str::<Config>(&format!("{MATRIX}{s}"));
+        // What house-infra renders: the calendar, and (for one release)
+        // still `plenum_time`, accepted and ignored.
+        let config = parse(
+            "[kummerkasten]\nplenum_time = \"19:00\"\n[kummerkasten.calendar]\n\
+             account_url = \"https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/\"\n\
+             calendar = \"plenum-house\"\nusername = \"kummerkasten-bot\"\n",
+        )
+        .unwrap();
+        let kk = &config.kummerkasten;
+        assert_eq!(kk.plenum_time.as_deref(), Some("19:00"));
+        let calendar = kk.calendar.as_ref().unwrap();
+        assert_eq!(
+            (calendar.password_env.as_str(), calendar.refresh_minutes),
+            ("CALDAV_PASSWORD", 5)
+        );
+        check_kummerkasten(kk, &config.security).unwrap();
+        // Without it: no dates, but the bot starts.
+        let old = parse("[kummerkasten]\nplenum_time = \"19:00\"\n").unwrap();
+        assert!(old.kummerkasten.calendar.is_none());
+        check_kummerkasten(&old.kummerkasten, &old.security).unwrap();
+        // A password in the config is refused: it belongs in the environment.
+        assert!(parse(
+            "[kummerkasten.calendar]\naccount_url = \"https://c.x/\"\ncalendar = \"p\"\n\
+             username = \"u\"\npassword = \"secret\"\n"
+        )
+        .is_err());
+        let empty = parse(
+            "[kummerkasten.calendar]\naccount_url = \"https://c.x/\"\ncalendar = \" \"\nusername = \"u\"\n",
+        )
+        .unwrap();
+        assert!(check_kummerkasten(&empty.kummerkasten, &empty.security).is_err());
+    }
+
+    #[test]
+    fn the_config_house_infra_renders_is_valid_also_the_old_one() {
+        let rendered = include_str!("../testdata/house-infra.config.toml");
+        let config: Config = toml::from_str(rendered).unwrap();
+        check_security(&config.security).unwrap();
+        check_kummerkasten(&config.kummerkasten, &config.security).unwrap();
+        let calendar = config.kummerkasten.calendar.unwrap();
+        assert_eq!(calendar.calendar, "plenum-house");
+        assert!(calendar
+            .account_url
+            .ends_with("/calendars/kummerkasten-bot/"));
+        // The one deployed before the calendar: `plenum_time`, no calendar.
+        let start = rendered.find("[kummerkasten.calendar]").unwrap();
+        let end = rendered.find("[kummerkasten.settings]").unwrap();
+        let old = format!(
+            "{}{}",
+            rendered[..start].replace(
+                "[kummerkasten]\n",
+                "[kummerkasten]\nplenum_time = \"19:00\"\n"
+            ),
+            &rendered[end..]
+        );
+        let config: Config = toml::from_str(&old).unwrap();
+        assert_eq!(config.kummerkasten.plenum_time.as_deref(), Some("19:00"));
+        assert!(config.kummerkasten.calendar.is_none());
     }
 
     const MATRIX: &str =

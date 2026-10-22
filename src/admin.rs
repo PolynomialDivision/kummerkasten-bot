@@ -2,7 +2,7 @@
 //! encrypted direct chat (`mxbot_common::admin::Dispatch::AdminDm`).
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
 use mxbot_common::matrix_sdk::{
     ruma::{OwnedRoomId, OwnedUserId},
     RoomState,
@@ -12,14 +12,13 @@ use crate::{
     catalog::{self, Kind},
     dm::{self, Kk},
     lifecycle,
-    plenum::Recurrence,
     plenums::{self, Plenum},
-    store, time,
+    store,
 };
 
 /// For `!admin`'s list.
 pub const SHORT_HELP: &str =
-    "!kk · Kummerkasten: rooms, plenums, rhythm, topics, check-ins, ideas, measures (`!kk help`)";
+    "!kk · Kummerkasten: rooms, plenums, topics, check-ins, ideas, measures (`!kk help`)";
 
 pub const HELP: &str = "📮 **Kummerkasten admin**
 
@@ -28,16 +27,12 @@ pub const HELP: &str = "📮 **Kummerkasten admin**
 `!kk entry <!room:server>`: post a 📮 entry message there
 `!kk invite-all`: open a chat for everyone in the rooms who has none
 
-🗓️ **Plenums**
-`!kk plenums`: the next ones, with their numbers
-`!kk plenum add 2026-11-14 [18:00]` · `!kk plenum move 12 2026-11-14 [18:00] [because <reason>]`
-   a move keeps everything attached (round, feedback, check-ins); at any notice
-`!kk plenum cancel 12` · `!kk plenum remove 12`
+🗓️ **Plenums**: their dates come from the Nextcloud calendar (plenum-bot's); add, move
+   and cancel them there, I follow within minutes. A move keeps everything attached.
+`!kk plenums`: the next ones, with their numbers, and how the calendar was read
 `!kk plenum complete 12`: it took place, so close the round, delete what was to be
    deleted, clear the chats (a date passing alone never does that)
 `!kk plenum reopen 12`: undo a completion by mistake
-`!kk rule` · `!kk rule set sun 1,3,5 19:00 [starting 2026-12-01]`
-   also `sun 19:00` (weekly), `every 2 sun 19:00 from 2026-11-01`
 `!kk round`: the current round in numbers
 
 🗂️ **Catalog** (`topic` · `location` · `problem`)
@@ -287,89 +282,21 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                 .engine
                 .db
                 .run(move |c| {
-                    plenums::materialize(c, zone, now)?;
                     Ok((
                         plenums::listing(c, now - chrono::Duration::days(1), 10)?,
                         plenums::previous(c)?,
                     ))
                 })
                 .await?;
-            let mut out = vec!["🗓️ **Plenums**".to_owned()];
+            let mut out = vec!["🗓️ **Plenums**".to_owned(), calendar_line(kk, now)];
             if let Some(p) = previous {
                 out.push(format!("⏮️ Previous: {}", line_of(kk, &p, now)));
             }
             out.extend(list.iter().map(|p| line_of(kk, p, now)));
             Ok(out.join("\n"))
         }
-        ["plenum", "add", date, rest @ ..] => {
-            let at = when(kk, date, rest.first().copied(), now).await?;
-            let id = kk
-                .engine
-                .db
-                .run(move |c| plenums::add(c, at, &actor, zone, now))
-                .await?;
-            Ok(format!(
-                "➕ Plenum #{id}: {}",
-                zone.day_time_label(at, zone.date(now))
-            ))
-        }
-        ["plenum", "move", id, date, rest @ ..] => {
-            let id = number(id)?;
-            let (time_arg, reason) = match rest {
-                [t, more @ ..] if time::parse_hm(t).is_ok() => (Some(*t), more),
-                more => (None, more),
-            };
-            let reason = match reason {
-                ["because" | "reason", words @ ..] | words => words.join(" "),
-            };
-            let at = when(kk, date, time_arg, now).await?;
-            let announced = kk
-                .engine
-                .db
-                .run(move |c| {
-                    let r = (!reason.is_empty()).then_some(reason.as_str());
-                    plenums::reschedule(c, id, at, r, &actor, zone, now)?;
-                    Ok(plenums::get(c, id)?.and_then(|p| p.announced_at).is_some())
-                })
-                .await?;
-            kk.wake.notify_one();
-            Ok(format!(
-                "🔄 Plenum #{id} moved to {}. Only this one; the rhythm stays.\n\
-                 🌱 Its round stays open until it is completed; feedback to delete after \
-                 it, its check-ins and everything else move with it.{}",
-                zone.day_time_label(at, zone.date(now)),
-                if announced {
-                    "\n📮 Its summary went out already. A short update follows."
-                } else {
-                    ""
-                }
-            ))
-        }
-        ["plenum", "cancel", id] => {
-            let id = number(id)?;
-            kk.engine
-                .db
-                .run(move |c| plenums::cancel(c, id, &actor, now))
-                .await?;
-            Ok(format!(
-                "⏭️ Plenum #{id} is cancelled. Its round carries on to the next plenum."
-            ))
-        }
-        ["plenum", "remove", id] => {
-            let id = number(id)?;
-            let removed = kk
-                .engine
-                .db
-                .run(move |c| plenums::remove(c, id, &actor, now))
-                .await?;
-            Ok(match removed {
-                plenums::Removed::Deleted => format!("🗑️ Plenum #{id} is gone."),
-                plenums::Removed::Cancelled => {
-                    format!(
-                        "⏭️ Plenum #{id} comes from the rhythm, so it's cancelled (and stays so)."
-                    )
-                }
-            })
+        ["plenum", "add" | "move" | "cancel" | "remove", ..] | ["rule", ..] => {
+            Ok(dates_in_the_calendar(kk))
         }
         ["plenum", "complete", id] => {
             let id = number(id)?;
@@ -393,46 +320,6 @@ async fn dispatch(kk: &Kk, sender: &OwnedUserId, line: &str) -> Result<String> {
                 .await?;
             Ok(format!(
                 "↩️ Plenum #{id} is open again. What was already deleted or cleared stays gone."
-            ))
-        }
-        ["rule"] => {
-            let rules = kk.engine.db.run(|c| plenums::rules(c)).await?;
-            let today = zone.date(now);
-            let mut out = vec!["🔁 **Plenum rhythm**".to_owned()];
-            for rule in rules {
-                let marker = if rule.effective_from > today {
-                    "from"
-                } else {
-                    "since"
-                };
-                out.push(format!(
-                    "• {marker} {}: {}",
-                    rule.effective_from.format("%-d %b %Y"),
-                    rule.recurrence.describe()
-                ));
-            }
-            Ok(out.join("\n"))
-        }
-        ["rule", "set", spec @ ..] => {
-            let mut spec: Vec<&str> = spec.to_vec();
-            let today = zone.date(now);
-            let mut starting = today + chrono::Duration::days(1);
-            if let Some(pos) = spec.iter().position(|a| *a == "starting") {
-                starting = time::parse_date(spec.get(pos + 1).context("`starting` needs a date")?)?;
-                spec.drain(pos..pos + 2);
-            }
-            let rule = Recurrence::parse(&spec, today)?;
-            let describe = rule.describe();
-            let change = kk
-                .engine
-                .db
-                .run(move |c| plenums::set_rule(c, &rule, starting, &actor, zone, now))
-                .await?;
-            Ok(format!(
-                "🔁 From {}: {describe}.\n{} upcoming plenum(s) replaced; {} moved by hand kept.",
-                starting.format("%-d %B %Y"),
-                change.replaced,
-                change.kept
             ))
         }
         ["round"] => {
@@ -507,34 +394,62 @@ fn number(s: &str) -> Result<i64> {
         .with_context(|| format!("{s:?} isn't a plenum number"))
 }
 
-/// `date` at `time`, or at the current rule's time.
-async fn when(
-    kk: &Kk,
-    date: &str,
-    time_arg: Option<&str>,
-    now: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
+/// Plenum dates are changed in the calendar, never here.
+fn dates_in_the_calendar(kk: &Kk) -> String {
+    let calendar = kk
+        .calendar
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .calendar
+        .clone();
+    match calendar {
+        Some(name) => format!(
+            "🗓️ The plenum's dates are in the Nextcloud calendar **{name}** (plenum-bot's). \
+             Add, move or cancel a plenum there; I follow it within minutes, and a moved \
+             plenum keeps its round, feedback and check-ins."
+        ),
+        None => "🗓️ The plenum's dates come from the Nextcloud calendar, but none is set up \
+                 (`[kummerkasten.calendar]`): the plenums I know stay as they are."
+            .to_owned(),
+    }
+}
+
+/// How the calendar was read, for `!kk plenums`.
+fn calendar_line(kk: &Kk, now: DateTime<Utc>) -> String {
+    let status = kk
+        .calendar
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let zone = kk.engine.zone;
-    let date = time::parse_date(date)?;
-    let at: NaiveTime = match time_arg {
-        Some(t) => time::parse_hm(t)?,
-        None => kk
-            .engine
-            .db
-            .run(move |c| plenums::rule_on(c, zone.date(now)))
-            .await?
-            .map(|r| r.recurrence.time())
-            .unwrap_or_else(|| NaiveTime::from_hms_opt(19, 0, 0).unwrap()),
+    let Some(name) = status.calendar else {
+        return "⚠️ No calendar is set up: no new dates, the ones below stay as they are."
+            .to_owned();
     };
-    Ok(zone.at(date, at))
+    let read = match status.read_at {
+        Some(at) => format!(
+            "read {} ({} plenum(s) in view)",
+            zone.day_time_label(at, zone.date(now)),
+            status.in_view
+        ),
+        None => "not read yet".to_owned(),
+    };
+    match status.error {
+        Some(error) => format!(
+            "📅 From the calendar **{name}**: {read}. ⚠️ The last read failed, the dates stay \
+             as they were: {}",
+            crate::markup::literal(&error)
+        ),
+        None => format!("📅 From the calendar **{name}**: {read}. Change dates there."),
+    }
 }
 
 fn line_of(kk: &Kk, p: &Plenum, now: DateTime<Utc>) -> String {
     let zone = kk.engine.zone;
     let today = zone.date(now);
     let mut notes = Vec::new();
-    if p.rule_id.is_none() {
-        notes.push("➕ extra".to_owned());
+    if p.calendar_id.is_none() && p.status == plenums::Status::Scheduled {
+        notes.push("📭 not from the calendar".to_owned());
     }
     if p.rescheduled {
         notes.push(format!(

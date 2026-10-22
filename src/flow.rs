@@ -1137,12 +1137,12 @@ mod tests {
     // ── Check-ins ──────────────────────────────────────────────────────────
 
     use crate::checkins::tests::started;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
 
     /// The starting cleaning run (scale, multiple, optional text).
     fn cleaning_run() -> (Catalog, Run) {
         let now = at(2026, 11, 2, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let run = started(&mut conn, now, Default::default());
         (Catalog::load(&conn).unwrap(), run)
     }

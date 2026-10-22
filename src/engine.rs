@@ -1740,13 +1740,13 @@ pub fn tidy(conn: &Connection, room_id: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
 
     const ME: &str = "@alice:example.org";
     const ROOM: &str = "!dm:example.org";
 
     fn engine(now: DateTime<Utc>) -> Engine {
-        let db = Db::from_connection(with_default_rule(now));
+        let db = Db::from_connection(with_house_calendar(now));
         db.with(|c| {
             c.execute(
                 "INSERT INTO residents (mxid, dm_room_id, dm_joined, created_at) VALUES (?1, ?2, 1, 'x')",

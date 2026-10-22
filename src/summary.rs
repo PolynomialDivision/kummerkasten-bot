@@ -351,7 +351,7 @@ mod tests {
     use crate::{
         checkins::{self, Deadline, StartOptions},
         lifecycle,
-        plenums::tests::{at, with_default_rule, zone},
+        plenums::tests::{at, with_house_calendar, zone},
         secrets::Secrets,
         submissions::{self, tests::new, Identity, Retention},
     };
@@ -368,7 +368,7 @@ mod tests {
     /// The default rule's first plenum after 5 Oct 2026: Sunday 18 Oct, 19:00.
     fn october() -> (Connection, plenums::Plenum) {
         let now = at(2026, 10, 5, 12);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         let p = plenums::next(&conn).unwrap().unwrap();
         assert_eq!(p.starts_at, at(2026, 10, 18, 19));
         (conn, p)
@@ -379,21 +379,12 @@ mod tests {
         let (mut conn, p) = october();
         // Saturday: Sunday's plenum moves to Monday 19 Oct.
         let saturday = at(2026, 10, 17, 10);
-        plenums::reschedule(
-            &mut conn,
-            p.id,
-            at(2026, 10, 19, 19),
-            Some("room is booked"),
-            "@admin:x",
-            zone(),
-            saturday,
-        )
-        .unwrap();
+        plenums::tests::move_in_calendar(&mut conn, p.id, at(2026, 10, 19, 19), saturday);
         let moved = plenums::get(&conn, p.id).unwrap().unwrap();
         assert_eq!(moved.id, p.id);
         assert_eq!(moved.starts_at, at(2026, 10, 19, 19));
         assert_eq!(moved.original_starts_at, at(2026, 10, 18, 19));
-        assert_eq!(moved.reschedule_reason.as_deref(), Some("room is booked"));
+        assert_eq!(moved.reschedule_reason, None);
         // Not on Saturday evening (a day before the old date) …
         assert_eq!(
             take_summary(&conn, at(2026, 10, 17, 20), day()).unwrap(),
@@ -419,16 +410,12 @@ mod tests {
             Some(p.id)
         );
         // Later that evening it moves by a day.
-        plenums::reschedule(
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             at(2026, 10, 19, 19),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 17, 22),
-        )
-        .unwrap();
+        );
         assert_eq!(take_updates(&conn).unwrap(), [(p.id, Update::Moved)]);
         assert!(take_updates(&conn).unwrap().is_empty());
         // No second full summary for a move by a day.
@@ -443,16 +430,12 @@ mod tests {
         let (mut conn, p) = october();
         take_summary(&conn, at(2026, 10, 17, 20), day()).unwrap();
         // A week later (the following plenum is only on 1 November).
-        plenums::reschedule(
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             at(2026, 10, 25, 19),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 17, 22),
-        )
-        .unwrap();
+        );
         assert_eq!(take_updates(&conn).unwrap(), [(p.id, Update::Moved)]);
         assert_eq!(
             take_summary(&conn, at(2026, 10, 18, 20), day()).unwrap(),
@@ -474,7 +457,7 @@ mod tests {
             (at(2026, 10, 18, 15), at(2026, 10, 19, 19)),
             (at(2026, 10, 19, 8), at(2026, 10, 20, 19)),
         ] {
-            plenums::reschedule(&mut conn, p.id, to, None, "@admin:x", zone(), when).unwrap();
+            plenums::tests::move_in_calendar(&mut conn, p.id, to, when);
             let now = plenums::get(&conn, p.id).unwrap().unwrap();
             assert_eq!(now.starts_at, to);
             assert_eq!(now.original_starts_at, at(2026, 10, 18, 19));
@@ -494,41 +477,35 @@ mod tests {
     }
 
     #[test]
-    fn a_move_never_passes_another_plenum() {
+    fn a_move_past_another_plenum_takes_the_summary_along() {
         let (mut conn, p) = october();
         let following = plenums::upcoming(&conn, 2).unwrap()[1].clone(); // 1 Nov
-        let err = plenums::reschedule(
+                                                                         // 18 Oct moves to after 1 Nov: the round and the next summary go to 1 Nov.
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             following.starts_at + Duration::hours(1),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 10, 9),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("Cancel this one instead"), "{err}");
-        // Nor can the later one jump before it.
-        assert!(plenums::reschedule(
-            &mut conn,
-            following.id,
-            at(2026, 10, 17, 19),
-            None,
-            "@admin:x",
-            zone(),
-            at(2026, 10, 10, 9),
-        )
-        .is_err());
+        );
+        assert_eq!(plenums::next(&conn).unwrap().unwrap().id, following.id);
         assert_eq!(
-            plenums::get(&conn, p.id).unwrap().unwrap().starts_at,
-            p.starts_at
+            plenums::open_round(&conn).unwrap().unwrap().plenum_id,
+            following.id
+        );
+        assert_eq!(
+            take_summary(&conn, at(2026, 10, 17, 20), day()).unwrap(),
+            None
+        );
+        assert_eq!(
+            take_summary(&conn, following.starts_at - Duration::hours(2), day()).unwrap(),
+            Some(following.id)
         );
     }
 
     #[test]
     fn a_cancelled_plenum_is_never_summarized_and_an_announced_one_gets_an_update() {
         let (mut conn, p) = october();
-        plenums::cancel(&mut conn, p.id, "@admin:x", at(2026, 10, 16, 9)).unwrap();
+        plenums::tests::cancel_in_calendar(&mut conn, p.id, at(2026, 10, 16, 9));
         // The summary due on the 17th would be for the *next* plenum (1 Nov),
         // which isn't due yet.
         assert_eq!(
@@ -542,13 +519,7 @@ mod tests {
             take_summary(&conn, next.starts_at - Duration::hours(2), day()).unwrap(),
             Some(next.id)
         );
-        plenums::cancel(
-            &mut conn,
-            next.id,
-            "@admin:x",
-            next.starts_at - Duration::hours(1),
-        )
-        .unwrap();
+        plenums::tests::cancel_in_calendar(&mut conn, next.id, next.starts_at - Duration::hours(1));
         assert_eq!(take_updates(&conn).unwrap(), [(next.id, Update::Cancelled)]);
     }
 
@@ -566,16 +537,12 @@ mod tests {
             zone().date(at(2026, 10, 5, 12)),
         )
         .unwrap();
-        plenums::reschedule(
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             at(2026, 10, 19, 19),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 17, 10),
-        )
-        .unwrap();
+        );
         // Still pointing at the same plenum.
         let points_at: i64 = conn
             .query_row(
@@ -646,16 +613,12 @@ mod tests {
         // Moved to Monday: the relative ones move along, the fixed one not.
         for _ in 0..2 {
             // (twice: rescheduling to the same time again changes nothing)
-            plenums::reschedule(
+            plenums::tests::move_in_calendar(
                 &mut conn,
                 p.id,
                 at(2026, 10, 19, 19),
-                None,
-                "@admin:x",
-                zone(),
                 at(2026, 10, 10, 9),
-            )
-            .unwrap();
+            );
             assert_eq!(
                 times(&conn, until_plenum),
                 (at(2026, 10, 19, 19), Some(at(2026, 10, 18, 19)))
@@ -681,16 +644,12 @@ mod tests {
             .unwrap()
             .is_empty());
         // A reminder already sent stays sent when the plenum moves again.
-        plenums::reschedule(
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             at(2026, 10, 20, 19),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 18, 20),
-        )
-        .unwrap();
+        );
         assert!(checkins::take_reminders(&conn, at(2026, 10, 19, 20))
             .unwrap()
             .is_empty());
@@ -717,7 +676,7 @@ mod tests {
         )
         .unwrap();
         let run = checkins::start(&mut conn, &plan, "@admin:x", now).unwrap();
-        plenums::cancel(&mut conn, p.id, "@admin:x", at(2026, 10, 10, 9)).unwrap();
+        plenums::tests::cancel_in_calendar(&mut conn, p.id, at(2026, 10, 10, 9));
         let next = plenums::next(&conn).unwrap().unwrap();
         let r = checkins::run(&conn, run).unwrap();
         assert_eq!(r.plenum_id, Some(next.id));
@@ -800,22 +759,13 @@ mod tests {
         )
         .unwrap();
         let saturday = at(2026, 10, 17, 21);
-        plenums::reschedule(
-            &mut conn,
-            p.id,
-            at(2026, 10, 19, 19),
-            Some("room booked"),
-            "@admin:x",
-            zone(),
-            saturday,
-        )
-        .unwrap();
+        plenums::tests::move_in_calendar(&mut conn, p.id, at(2026, 10, 19, 19), saturday);
         let (id, what) = take_updates(&conn).unwrap()[0];
         let text = update_text(&conn, id, what, zone(), saturday).unwrap();
         assert!(text.contains("Tomorrow's plenum has been moved."), "{text}");
         assert!(text.contains("~~Sunday, 18 October · 19:00~~"), "{text}");
         assert!(text.contains("➡️ **Monday, 19 October · 19:00**"), "{text}");
-        assert!(text.contains("room booked"));
+        assert!(!text.contains("💬"), "{text}");
         assert!(text.contains("stays open until the rescheduled plenum"));
         let (_, _, body) = &summaries(&conn, p.id).unwrap()[0];
         let moved = plenums::get(&conn, p.id).unwrap().unwrap();
@@ -841,21 +791,17 @@ mod tests {
             moved.starts_at,
         )
         .unwrap();
-        plenums::reschedule(
+        plenums::tests::move_in_calendar(
             &mut conn,
             p.id,
             at(2026, 10, 20, 19),
-            None,
-            "@admin:x",
-            zone(),
             at(2026, 10, 18, 9),
-        )
-        .unwrap();
+        );
         let (id, what) = take_updates(&conn).unwrap()[0];
         let text = update_text(&conn, id, what, zone(), at(2026, 10, 18, 9)).unwrap();
         assert!(text.contains("~~Monday, 19 October · 19:00~~"), "{text}");
         // Cancelled: said, with where the round goes.
-        plenums::cancel(&mut conn, p.id, "@admin:x", at(2026, 10, 18, 10)).unwrap();
+        plenums::tests::cancel_in_calendar(&mut conn, p.id, at(2026, 10, 18, 10));
         let (id, what) = take_updates(&conn).unwrap()[0];
         assert_eq!(what, Update::Cancelled);
         let text = update_text(&conn, id, what, zone(), at(2026, 10, 18, 10)).unwrap();

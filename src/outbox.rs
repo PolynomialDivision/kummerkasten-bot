@@ -215,7 +215,7 @@ fn finish(conn: &Connection, kind: &str, ref_id: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
 
     fn rows(conn: &Connection) -> Vec<(String, i64)> {
         let mut stmt = conn
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn a_batch_goes_to_each_target_and_is_forgotten_once_sent() {
         let now = at(2026, 11, 2, 12);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         queue(&conn, Kind::Notice, 7, now).unwrap();
         queue(&conn, Kind::Notice, 7, now).unwrap();
         let batches = batches(&conn).unwrap();
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn a_failed_message_waits_longer_each_time_and_is_never_given_up() {
         let now = at(2026, 11, 2, 12);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         queue(&conn, Kind::Summary, 3, now).unwrap();
         let row = batches(&conn).unwrap()[0].0;
         expand(&conn, row, &["!house:x".into()], now).unwrap();
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn a_batch_without_targets_is_simply_done_and_ids_are_never_reused() {
         let now = at(2026, 11, 2, 12);
-        let conn = with_default_rule(now);
+        let conn = with_house_calendar(now);
         queue(&conn, Kind::Announcement, 1, now).unwrap();
         let first = batches(&conn).unwrap()[0].0;
         expand(&conn, first, &[], now).unwrap();

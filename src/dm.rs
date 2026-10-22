@@ -80,6 +80,8 @@ pub struct Kk {
     /// The rooms from the config (`[[kummerkasten.rooms]]`); `None`: admins
     /// manage them with `!kk rooms …`.
     pub managed_rooms: Option<Arc<Vec<crate::config::RoomConfig>>>,
+    /// Where the plenum's dates come from, and how the last read went.
+    pub calendar: Arc<std::sync::Mutex<crate::calendar::Status>>,
 }
 
 pub type PendingStarts =

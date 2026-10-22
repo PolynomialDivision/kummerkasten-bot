@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/006_screens_outbox.sql")),
     (7, include_str!("../migrations/007_pending_screens.sql")),
     (8, include_str!("../migrations/008_echoed_screens.sql")),
+    (9, include_str!("../migrations/009_calendar_plenums.sql")),
 ];
 
 #[derive(Clone)]
@@ -296,6 +297,197 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(columns, ["event_id", "run_id"]);
+    }
+
+    /// The live database as commit 64a767d leaves it while a survey runs: the
+    /// starting rule, the plenums it generated, the 18 Oct one completed, an
+    /// open round for 1 Nov with feedback to delete after it, a check-in
+    /// closing when it starts, answers, an announcement. The new code's
+    /// migration and first calendar reads must keep all of it on its rows.
+    #[test]
+    fn the_running_survey_survives_the_move_to_the_calendar() {
+        use crate::plenums::{
+            self,
+            tests::{at, day, house_sundays, read, zone},
+            Occurrence, Status,
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in &MIGRATIONS[..8] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?1, 'then')",
+                [version],
+            )
+            .unwrap();
+        }
+        // ensure_rule + materialize on first start (14 Oct), and again today.
+        conn.execute(
+            "INSERT INTO plenum_rules (recurrence, effective_from, created_by, created_at)
+             VALUES ('{\"kind\":\"monthly_nth\",\"weekday\":6,\"nths\":[1,3,5],\"time\":\"19:00:00\"}',
+                     '2026-10-14', NULL, '2026-10-14T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let seven = chrono::NaiveTime::from_hms_opt(19, 0, 0).unwrap();
+        for d in house_sundays(
+            day(2026, 10, 14),
+            day(2026, 10, 22) + chrono::Duration::days(120),
+        ) {
+            conn.execute(
+                "INSERT OR IGNORE INTO plenums
+                   (rule_id, rule_date, starts_at, original_starts_at, status, created_at)
+                 VALUES (1, ?1, ?2, ?2, 'scheduled', '2026-10-14T10:00:00Z')",
+                rusqlite::params![
+                    crate::time::date_text(d),
+                    crate::time::to_text(zone().at(d, seven))
+                ],
+            )
+            .unwrap();
+        }
+        let row = |d: chrono::NaiveDate| -> i64 {
+            conn.query_row(
+                "SELECT id FROM plenums WHERE rule_date = ?1",
+                [crate::time::date_text(d)],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (oct18, nov1, nov15, nov29) = (
+            row(day(2026, 10, 18)),
+            row(day(2026, 11, 1)),
+            row(day(2026, 11, 15)),
+            row(day(2026, 11, 29)),
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO rounds (id, plenum_id, opened_at, closed_at, status)
+                 VALUES (1, {oct18}, '2026-10-14T10:00:00Z', '2026-10-18T20:00:00Z', 'closed');
+             UPDATE plenums SET status = 'completed', completed_at = '2026-10-18T20:00:00Z'
+                 WHERE id = {oct18};
+             INSERT INTO rounds (id, plenum_id, opened_at, status)
+                 VALUES (2, {nov1}, '2026-10-18T20:00:00Z', 'open');
+             INSERT INTO submissions (id, round_id, topic_id, body, identity, retention,
+                     delete_after_plenum_id, submitted_on)
+                 VALUES (77, 2, (SELECT min(id) FROM topics), 'too loud', 'anonymous',
+                         'delete_after_plenum', {nov1}, '2026-10-20'),
+                        (78, 2, (SELECT min(id) FROM topics), 'thanks', 'anonymous',
+                         'keep', NULL, '2026-10-21');
+             INSERT INTO survey_runs (id, template_id, emoji, title, intro, target, plenum_id,
+                     round_id, opens_at, closes_at, reminder_at, created_by, created_at,
+                     deadline_mode, deadline_offset_minutes, reminder_offset_minutes, notified_at)
+                 VALUES (5, 1, '🧹', 'Cleaning', '', '{{\"kind\":\"house\"}}', {nov1}, 2,
+                         '2026-10-20T10:00:00Z', '2026-11-01T18:00:00Z', '2026-10-31T18:00:00Z',
+                         '@a:x', '2026-10-20T10:00:00Z', 'relative_to_plenum', 0, 1440,
+                         '2026-10-20T10:00:00Z');
+             INSERT INTO responses (id, run_id, identity) VALUES ('r1', 5, 'anonymous'),
+                                                                 ('r2', 5, 'anonymous');
+             INSERT INTO checkin_messages (event_id, run_id) VALUES ('$notice', 5);
+             UPDATE plenums SET announced_at = '2026-10-17T18:00:00Z' WHERE id = {oct18};
+             INSERT INTO plenum_announcements (room_id, event_id, plenum_id, kind, body, for_starts_at)
+                 VALUES ('!house:x', '$summary', {oct18}, 'summary', '📮', '2026-10-18T17:00:00Z');"
+        ))
+        .unwrap();
+        let rows_before: i64 = conn
+            .query_row("SELECT count(*) FROM plenums", [], |r| r.get(0))
+            .unwrap();
+
+        // The new image: migration 9, then the calendar.
+        assert_eq!(migrate(&mut conn).unwrap(), 1);
+        let now = at(2026, 10, 22, 12);
+        // An empty (or not yet filled) calendar changes nothing.
+        assert!(!read(&mut conn, &[], now).changed());
+        // plenum-bot's calendar: 1 Nov as before; 15 Nov half an hour later;
+        // an extra one on 22 Nov; 29 Nov not there; the rest as before.
+        let calendar: Vec<Occurrence> = house_sundays(day(2026, 10, 21), day(2027, 2, 19))
+            .into_iter()
+            .filter(|d| *d != day(2026, 11, 29))
+            .map(|d| Occurrence {
+                id: format!("house#{d}"),
+                starts_at: if d == day(2026, 11, 15) {
+                    zone().at(d, chrono::NaiveTime::from_hms_opt(19, 30, 0).unwrap())
+                } else {
+                    zone().at(d, seven)
+                },
+            })
+            .chain([Occurrence {
+                id: "extra".to_owned(),
+                starts_at: at(2026, 11, 22, 19),
+            }])
+            .collect();
+        let synced = read(&mut conn, &calendar, now);
+        assert_eq!(
+            (synced.added, synced.moved, synced.retired, synced.cancelled),
+            (1, 1, 1, 0),
+            "{synced:?}"
+        );
+        assert_eq!(synced.adopted, calendar.len() - 1);
+        // Read again: nothing to do.
+        assert!(!read(&mut conn, &calendar, now).changed());
+
+        // The open round, its plenum and everything attached: unchanged.
+        let round = plenums::open_round(&conn).unwrap().unwrap();
+        assert_eq!((round.id, round.plenum_id), (2, nov1));
+        let p = plenums::get(&conn, nov1).unwrap().unwrap();
+        assert_eq!(p.calendar_id.as_deref(), Some("house#2026-11-01"));
+        assert_eq!(
+            (p.status, p.starts_at),
+            (Status::Scheduled, at(2026, 11, 1, 19))
+        );
+        assert!(!p.rescheduled);
+        assert_eq!(plenums::next(&conn).unwrap().unwrap().id, nov1);
+        let one = |sql: &str| -> String {
+            conn.query_row(sql, [], |r| r.get::<_, rusqlite::types::Value>(0))
+                .map(|v| format!("{v:?}"))
+                .unwrap()
+        };
+        assert_eq!(
+            one("SELECT group_concat(id || ':' || round_id || ':' || coalesce(delete_after_plenum_id, '-')) FROM submissions"),
+            format!("Text(\"77:2:{nov1},78:2:-\")")
+        );
+        assert_eq!(
+            one("SELECT plenum_id || ' ' || round_id || ' ' || status || ' ' || closes_at || ' ' || reminder_at FROM survey_runs WHERE id = 5"),
+            format!("Text(\"{nov1} 2 open 2026-11-01T18:00:00Z 2026-10-31T18:00:00Z\")")
+        );
+        assert_eq!(
+            one("SELECT count(*) FROM responses WHERE run_id = 5"),
+            "Integer(2)"
+        );
+        assert_eq!(
+            one("SELECT run_id FROM checkin_messages WHERE event_id = '$notice'"),
+            "Integer(5)"
+        );
+        assert_eq!(
+            one("SELECT plenum_id FROM plenum_announcements WHERE event_id = '$summary'"),
+            format!("Integer({oct18})")
+        );
+        // The past: untouched.
+        let past = plenums::get(&conn, oct18).unwrap().unwrap();
+        assert_eq!((past.status, past.calendar_id), (Status::Completed, None));
+        // 15 Nov: the same row, moved to the calendar's time.
+        let moved = plenums::get(&conn, nov15).unwrap().unwrap();
+        assert_eq!(moved.calendar_id.as_deref(), Some("house#2026-11-15"));
+        assert_eq!(
+            moved.starts_at,
+            zone().at(
+                day(2026, 11, 15),
+                chrono::NaiveTime::from_hms_opt(19, 30, 0).unwrap()
+            )
+        );
+        assert_eq!(moved.original_starts_at, at(2026, 11, 15, 19));
+        // 29 Nov was only the old schedule: gone. 22 Nov is new.
+        assert!(plenums::get(&conn, nov29).unwrap().is_none());
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM plenums"), rows_before);
+        assert_eq!(
+            count("SELECT count(*) FROM plenums WHERE calendar_id IS NULL"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM plenum_rules"), 1);
+        assert_eq!(count("SELECT count(*) FROM pragma_foreign_key_check"), 0);
     }
 
     #[test]

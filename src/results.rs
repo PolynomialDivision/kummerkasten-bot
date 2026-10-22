@@ -446,7 +446,7 @@ mod tests {
     use super::*;
     use crate::{
         measures::{NewMeasure, Status},
-        plenums::tests::{at, with_default_rule, zone},
+        plenums::tests::{at, with_house_calendar, zone},
         secrets::Secrets,
         stats::tests::{cleaning, closed_run},
     };
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn a_topic_shows_trends_problems_and_measures_without_claiming_causes() {
         let now = at(2026, 5, 4, 12);
-        let mut conn = with_default_rule(now);
+        let mut conn = with_house_calendar(now);
         let secrets = Secrets::from_master(&[1; 32]);
         let people = |v: i64, picks: usize| -> Vec<(String, i64, bool, Option<i64>)> {
             (0..5)

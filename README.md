@@ -273,16 +273,9 @@ fails.
 !kk entry !abc:example.org               post the 📮 entry message there
 !kk invite-all                           open chats for everyone in the rooms
 
-!kk plenums                              next plenums with their numbers
-!kk plenum add 2026-11-14 18:00          an extra one
-!kk plenum move 12 2026-11-14 18:00 because room booked
-                                         only this one, at any notice; everything stays attached
-!kk plenum cancel 12 · !kk plenum remove 12
+!kk plenums                              next plenums with their numbers, and the calendar's last read
 !kk plenum complete 12                   it took place: close the round, delete, clear chats
 !kk plenum reopen 12                     undo a completion by mistake
-!kk rule                                 the rhythm (with its history)
-!kk rule set sun 1,3,5 19:00 [starting 2026-12-01]
-!kk rule set sun 19:00 · !kk rule set every 2 sun 19:00 from 2026-11-01
 !kk round                                the current round in numbers
 
 !kk topics · !kk locations · !kk problems
@@ -343,29 +336,64 @@ is completed at `complete_at`, default 23:59, on its day).
 ## Plenums and rounds
 
 ```
-rule (versioned)  →  plenums (one row per date, stable ID)  →  changes per row
-1st/3rd/5th Sunday   #41 Sun 1 Nov · #42 Sun 15 Nov · …      moved / cancelled / completed
+Nextcloud calendar (plenum-bot's)  →  plenums (one row per date, stable ID)  →  rounds
+events, series, moved / deleted       #41 Sun 1 Nov · #42 Sun 15 Nov · …        one open
 ```
 
-* The starting rule is the 1st, 3rd and (where there is one) 5th Sunday of
-  each month at `plenum_time`: stored as data on first start, changeable
-  with `!kk rule set` (each change is a new version from a date on).
-* Plenums exist as rows ~4 months ahead. A row is never generated twice, so
-  moving or cancelling one occurrence sticks; a rule change replaces only
-  future occurrences nobody moved. Past plenums are never recomputed.
+```toml
+[kummerkasten.calendar]
+account_url = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
+calendar = "plenum-house"         # plenum-bot's calendar, shared with this account
+username = "kummerkasten-bot"
+password_env = "CALDAV_PASSWORD"  # the env var with the app password (default)
+refresh_minutes = 5               # default
+```
+
+The timezone is `[kummerkasten] timezone`. The app password is only ever
+read from the environment variable, never from the config.
+
+* **The dates come only from the Nextcloud calendar** of the house plenum,
+  which plenum-bot owns (`plenum-house`) and shares read-only with this
+  bot's own Nextcloud account (there it is `plenum-house_shared_by_plenum-bot`;
+  either name is found). The bot keeps no schedule of its own: there are no
+  rules and no commands to add, move or cancel a plenum. Do that in the
+  calendar; `!kk plenum add/move/cancel/remove` and `!kk rule` only point
+  there. `!kk plenums` says when the calendar was last read, and why not if
+  a read failed.
+* Every `refresh_minutes` (and once at startup, before anything is
+  announced) the bot reads the calendar from yesterday to ~4 months ahead
+  over CalDAV. Every timed occurrence keeps the ID the calendar gives it
+  (the event's UID; in a series UID and the date it was first due), and its
+  row is linked to it (`calendar_id`):
+  * an occurrence with a row: the row follows it. Moved: the same row moves
+    (see below). Deleted from the calendar: a future plenum is cancelled.
+    Back in the calendar: scheduled again.
+  * an occurrence without a row adopts a row from before the calendar (the
+    old rules) at the same time, else on the same day; else it is a new
+    plenum. One that is already over is not created after the fact.
+  * future rows from before the calendar that no occurrence took over were
+    the old schedule: they are cancelled (and deleted when nothing points at
+    them).
+  * completed plenums, and past ones that stay past, are never rewritten.
+* **A read that fails changes nothing**, and neither does one that finds no
+  plenum ahead: an emptied or re-made calendar must not cancel the plenum
+  the open round collects for (the log warns). Without a
+  `[kummerkasten.calendar]` (or without its password) the bot has no dates
+  and leaves the plenums it knows as they are.
 * A **round** collects everything for one plenum: exactly one is open, and
-  it belongs to the next scheduled plenum. Cancel a plenum, and the round
-  (with its "delete after the next plenum" submissions and its check-ins)
-  carries on to the next one.
+  it belongs to the next scheduled plenum. A plenum cancelled in the
+  calendar hands the round (with its "delete after the next plenum"
+  submissions and its check-ins) on to the next one.
 * **Moving a plenum is a normal operation**, at any notice, even on its day
   or after its time passed without it happening. The row keeps its ID, so
   its round, *delete after* submissions, check-ins, measures and
   announcements stay with it; `original_starts_at` keeps the first date,
-  `starts_at` the current one, with an optional reason. Everything derived
-  from the date follows the current one: check-in deadlines set relative to
-  the plenum (and their reminder), the day-before summary, completion. A
-  move may not pass another scheduled plenum (that would hand the round to
-  it); cancel instead. Nothing is scheduled as a stored job: the bot works
+  `starts_at` the current one. Everything derived from the date follows the
+  current one: check-in deadlines set relative to the plenum (and their
+  reminder), the day-before summary, completion. A move past another
+  scheduled plenum hands the open round (with its *delete after*
+  submissions and check-ins) to the one that now comes first, as a
+  cancellation does. Nothing is scheduled as a stored job: the bot works
   from the plenum's current date every minute, so nothing can still run
   for an old date.
 * **A date passing is not the plenum happening.** After its time a plenum
@@ -611,6 +639,13 @@ An update (or any restart) while a check-in is running loses nothing:
   moment", never a locked chat or a lost draft.
 * **The scheduler** (notices, reminders, closing, redactions) carries on
   after an unexpected error in one tick.
+* **Moving to the calendar** (2026-10-22, migration 9): the database of a
+  running survey opens as it is. The first read of the calendar links each
+  existing plenum to its occurrence at the same time (else the same day), so
+  the open round, its feedback, check-ins and announcements stay on the
+  same rows; only the future rest of the old schedule is cancelled. An old
+  config with `plenum_time` still starts (it is ignored, with a warning);
+  one without `[kummerkasten.calendar]` starts too and changes no plenum.
 
 What the bot refuses at startup, to keep data consistent:
 
@@ -635,7 +670,8 @@ cargo test
 cargo clippy --all-targets
 ```
 
-The bot needs `mxbot-common` from `bb2c163` on: the runtime room allow-list
+The calendar comes from `mxbot-common`'s `calendar` feature (CalDAV and
+iCalendar, shared with calendar-bot and plenum-bot). The bot needs `mxbot-common` from `bb2c163` on: the runtime room allow-list
 (`rooms::DynamicRooms`), `private` (private chats, fresh membership checks,
 room version choice) and `send::classify_error` (rate limits for requests
 other than sends). To develop against a local checkout, add a temporary
@@ -643,8 +679,8 @@ other than sends). To develop against a local checkout, add a temporary
 `../mxbot-common`, but never commit it: Docker builds can't see `../`.
 
 Modules: `flow` (state machine, pure) · `screens` (texts and buttons) ·
-`engine` (flow + database) · `dm` (Matrix side) · `plenum` (rules) ·
-`plenums` (occurrences, rounds) · `lifecycle` (completion) · `submissions` ·
+`engine` (flow + database) · `dm` (Matrix side) · `calendar` (reading the
+Nextcloud calendar) · `plenums` (rows from the calendar, rounds) · `lifecycle` (completion) · `submissions` ·
 `catalog` · `surveys` (templates, versions) · `checkins` (runs, answers,
 delivery, deadlines) · `reconcile` (one chat per eligible resident) ·
 `stats` (aggregates, privacy policy) · `results` (texts) · `ideas` ·

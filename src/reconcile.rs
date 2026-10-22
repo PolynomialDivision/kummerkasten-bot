@@ -143,7 +143,7 @@ async fn create<H: Homeserver>(hs: &H, user: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
     use std::{
         collections::{HashMap, HashSet},
         sync::Mutex,
@@ -207,7 +207,7 @@ mod tests {
     }
 
     fn db() -> Db {
-        Db::from_connection(with_default_rule(at(2026, 11, 2, 12)))
+        Db::from_connection(with_house_calendar(at(2026, 11, 2, 12)))
     }
 
     fn chat_of(db: &Db, user: &str) -> Option<String> {

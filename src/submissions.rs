@@ -273,7 +273,7 @@ pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::plenums::tests::{at, with_default_rule};
+    use crate::plenums::tests::{at, with_house_calendar};
 
     pub fn new(conn: &Connection, identity: Identity, retention: Retention) -> NewSubmission {
         let topic_id: i64 = conn
@@ -340,7 +340,7 @@ pub(crate) mod tests {
 
     #[test]
     fn anonymous_submissions_know_nobody() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let secrets = Secrets::from_master(&[3; 32]);
         let s = new(&conn, Identity::Anonymous, Retention::Keep);
         let done = submit(
@@ -369,7 +369,7 @@ pub(crate) mod tests {
 
     #[test]
     fn floor_submissions_know_the_floor_only_and_named_ones_the_person() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let secrets = Secrets::from_master(&[3; 32]);
         let today = at(2026, 11, 2, 12).date_naive();
         let f = floor(&conn);
@@ -390,7 +390,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_code_opens_its_own_submission_only() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let secrets = Secrets::from_master(&[3; 32]);
         let today = at(2026, 11, 2, 12).date_naive();
         let s = new(&conn, Identity::Anonymous, Retention::Keep);
@@ -431,7 +431,7 @@ pub(crate) mod tests {
 
     #[test]
     fn delete_after_plenum_points_at_the_plenum_entity() {
-        let conn = with_default_rule(at(2026, 11, 2, 12));
+        let conn = with_house_calendar(at(2026, 11, 2, 12));
         let secrets = Secrets::from_master(&[3; 32]);
         let today = at(2026, 11, 2, 12).date_naive();
         let next = plenums::next(&conn).unwrap().unwrap();
