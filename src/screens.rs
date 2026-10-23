@@ -101,9 +101,21 @@ pub struct View {
     pub buttons: Vec<(String, Action)>,
 }
 
+/// The most reactions Element shows under a message: with more, only the
+/// first 8 and "Show all" (`MAX_ITEMS_WHEN_LIMITED`, element-web 2026-10).
+pub const REACTIONS_SHOWN: usize = 9;
+
 impl View {
+    /// The buttons in the order they are added as reactions: the order of
+    /// the text, but on a screen with more than Element shows, the step
+    /// buttons (➡️ Next, ⬅️ Back …) first, so they are never the hidden ones
+    /// (the choices are listed in the text, and "Show all" brings the rest).
     pub fn keys(&self) -> Vec<String> {
-        self.buttons.iter().map(|(k, _)| k.clone()).collect()
+        let mut keys: Vec<String> = self.buttons.iter().map(|(k, _)| k.clone()).collect();
+        if keys.len() > REACTIONS_SHOWN {
+            keys.sort_by_key(|k| !RESERVED.iter().any(|r| same_key(r, k)));
+        }
+        keys
     }
 }
 

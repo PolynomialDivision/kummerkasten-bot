@@ -248,12 +248,25 @@ async fn show_screen(
         .map(|(_, e)| e);
     if let Some(event) = &current {
         let (r, e) = (room_id.clone(), event.clone());
-        let editable = kk
+        let (editable, had) = kk
             .engine
             .db
-            .run(move |c| store::screen_is_editable(c, &r, &e))
+            .run(move |c| {
+                Ok((
+                    store::screen_is_editable(c, &r, &e)?,
+                    store::screen_buttons(c, &r, &e)?.unwrap_or_default(),
+                ))
+            })
             .await
-            .unwrap_or(false);
+            .unwrap_or_default();
+        // Element orders a message's reactions by when each key first came
+        // under it, even if it was taken away since: an edit to other
+        // buttons puts the ones used before (⬅️) at their old place. Harmless
+        // while all are shown; with more than Element shows, a fresh screen,
+        // so the step buttons it puts first are the ones in sight.
+        let editable = editable
+            && (msg.buttons.len() <= screens::REACTIONS_SHOWN
+                || screens::buttons_kept(&had, &msg.buttons) == msg.buttons.len());
         if editable {
             match edit_screen(kk, room, event, msg).await {
                 Ok(complete) => {

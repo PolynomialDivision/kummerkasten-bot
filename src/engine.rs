@@ -3141,4 +3141,70 @@ mod tests {
         .unwrap();
         assert!(out[0].text.contains("📈 **Results**"));
     }
+
+    /// The shipped house cleaning survey, tapped through question by question.
+    /// Its long questions have more buttons than Element shows (8 of them,
+    /// then "Show all"): ➡️ and ⬅️ come first there, never hidden.
+    #[test]
+    fn the_house_cleaning_survey_can_be_answered_to_the_end() {
+        let mut chat = Chat::survey();
+        let now = chat.now;
+        let run = chat
+            .engine
+            .db
+            .with(|c| {
+                let file = crate::survey_file::SurveyFile::parse(crate::survey_file::SHIPPED[0].1)?;
+                crate::survey_file::apply(c, &file)?;
+                let plan = crate::checkins::plan(
+                    c,
+                    "house_cleaning",
+                    &Default::default(),
+                    now,
+                    chrono::Duration::hours(24),
+                )?;
+                let id = crate::checkins::start(c, &plan, "@admin:x", now)?;
+                crate::checkins::run(c, id)
+            })
+            .unwrap();
+        chat.told(run.id, CheckinText::Notice);
+        let mut out = chat.tap("▶️");
+        for (i, q) in run.questions.iter().enumerate() {
+            let s = screen(&out).clone();
+            assert!(s.text.contains(&format!("{}/12", i + 1)), "{i}: {}", s.text);
+            out = match q.kind {
+                crate::surveys::QKind::Multiple => {
+                    assert!(s.buttons.len() > screens::REACTIONS_SHOWN, "{i}");
+                    assert!(
+                        screens::same_key(&s.buttons[0], "➡️")
+                            && screens::same_key(&s.buttons[1], "⬅️"),
+                        "{i}: {:?}",
+                        s.buttons
+                    );
+                    let first = s.buttons[2].clone();
+                    let ticked = chat.tap(&first);
+                    assert_eq!(ticked[0].kind, Kind::Edit, "{i}: {ticked:?}");
+                    assert_eq!(ticked[0].buttons, s.buttons, "{i}");
+                    chat.tap("➡️")
+                }
+                crate::surveys::QKind::Text => chat.tap("⏭️"),
+                _ => {
+                    assert!(s.buttons.len() <= screens::REACTIONS_SHOWN, "{i}");
+                    let first = s.buttons[0].clone();
+                    let next = chat.tap(&first);
+                    if q.allow_comment {
+                        assert!(screen(&next).text.contains("Anything to add?"));
+                        chat.tap("⏭️")
+                    } else {
+                        next
+                    }
+                }
+            };
+            assert!(!out.is_empty(), "question {}: the tap did nothing", i + 1);
+        }
+        assert!(
+            screen(&out).text.contains("submit your answers"),
+            "{}",
+            screen(&out).text
+        );
+    }
 }
