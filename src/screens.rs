@@ -208,6 +208,14 @@ pub fn buttons_kept(old: &[(String, String)], new: &[String]) -> usize {
         .count()
 }
 
+/// A long reaction row can only be edited in place if its reaction keys
+/// already have the exact order wanted by the new screen. Matrix clients
+/// may retain the first-seen order even after a reaction is redacted, so a
+/// changed long row needs a fresh event to make its visible controls usable.
+pub fn can_edit_reaction_order(old: &[(String, String)], new: &[String]) -> bool {
+    new.len() <= REACTIONS_SHOWN || buttons_kept(old, new) == new.len()
+}
+
 pub fn resolve(view: &View, key: &str) -> Option<Action> {
     view.buttons
         .iter()
@@ -220,6 +228,11 @@ pub fn typed(view: &View, text: &str) -> Option<Action> {
     let t = text.trim().to_lowercase();
     match t.as_str() {
         "back" | "zurück" => return Some(Action::Back),
+        // Matrix clients differ in how many reactions they show and how
+        // they order them. Multi-select screens keep ➡️ near the front,
+        // but plain text must remain a reliable way to advance even when a
+        // client hides that reaction.
+        "next" | "weiter" | "continue" => return Some(Action::Next),
         "cancel" | "abbrechen" | "menu" | "stop" => return Some(Action::Cancel),
         _ => {}
     }
@@ -1063,7 +1076,8 @@ fn question(run: &Run, index: usize, q: &Version, answer: Option<&Answer>) -> Vi
                     b.buttons.push((key, action));
                 }
             }
-            b.gap().line("Tap to tick as many as fit, then:");
+            b.gap()
+                .line("Tap to tick as many as fit, then ➡️ Next (or send `weiter`):");
             b.button(NEXT, "**Next**", Action::Next);
         }
         QKind::Text => {
@@ -1359,6 +1373,24 @@ mod tests {
         assert_eq!(buttons_kept(&had(&["➡\u{fe0f}"]), &want(&["➡"])), 1);
         assert_eq!(buttons_kept(&[], &want(&["📝"])), 0);
     }
+
+    #[test]
+    fn a_long_reaction_row_is_replaced_if_its_order_would_change() {
+        let had = |keys: &[&str]| -> Vec<(String, String)> {
+            keys.iter()
+                .map(|k| (k.to_string(), format!("${k}")))
+                .collect()
+        };
+        let want = |keys: &[&str]| -> Vec<String> { keys.iter().map(|k| k.to_string()).collect() };
+        let old = had(&["⬅️", "😩", "😕", "🙂", "😐", "🙁", "😭", "➡️", "🫠", "🤔"]);
+        let new = want(&["➡️", "⬅️", "😩", "😕", "🙂", "😐", "🙁", "😭", "🫠", "🤔"]);
+        assert!(!can_edit_reaction_order(&old, &new));
+        assert!(can_edit_reaction_order(
+            &had(&["➡️", "⬅️", "😩", "😕", "🙂", "😐", "🙁", "😭", "🫠", "🤔"]),
+            &new
+        ));
+        assert!(can_edit_reaction_order(&old, &want(&["⬅️", "✅"])));
+    }
     use crate::db::memory_connection;
 
     #[test]
@@ -1380,6 +1412,8 @@ mod tests {
         assert_eq!(resolve(&v, "2️⃣"), Some(Action::Location(kitchen2.id)));
         assert_eq!(typed(&v, " 2 "), Some(Action::Location(kitchen2.id)));
         assert_eq!(typed(&v, "cancel"), Some(Action::Cancel));
+        assert_eq!(typed(&v, "weiter"), Some(Action::Next));
+        assert_eq!(typed(&v, "next"), Some(Action::Next));
         // Top level: distinct emojis are their own buttons.
         let mut f = Flow::default();
         f.push(Screen::Location { parent: None });

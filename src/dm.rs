@@ -264,9 +264,7 @@ async fn show_screen(
         // buttons puts the ones used before (⬅️) at their old place. Harmless
         // while all are shown; with more than Element shows, a fresh screen,
         // so the step buttons it puts first are the ones in sight.
-        let editable = editable
-            && (msg.buttons.len() <= screens::REACTIONS_SHOWN
-                || screens::buttons_kept(&had, &msg.buttons) == msg.buttons.len());
+        let editable = editable && screens::can_edit_reaction_order(&had, &msg.buttons);
         if editable {
             match edit_screen(kk, room, event, msg).await {
                 Ok(complete) => {

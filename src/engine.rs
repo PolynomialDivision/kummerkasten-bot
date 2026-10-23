@@ -3184,7 +3184,15 @@ mod tests {
                     let ticked = chat.tap(&first);
                     assert_eq!(ticked[0].kind, Kind::Edit, "{i}: {ticked:?}");
                     assert_eq!(ticked[0].buttons, s.buttons, "{i}");
-                    chat.tap("➡️")
+                    if i == 1 {
+                        // The essential next step must remain available even
+                        // if a Matrix client hides/reorders the reaction.
+                        let advanced = chat.say("weiter");
+                        assert!(screen(&advanced).text.contains(&format!("{}/12", i + 2)));
+                        advanced
+                    } else {
+                        chat.tap("➡️")
+                    }
                 }
                 crate::surveys::QKind::Text => chat.tap("⏭️"),
                 _ => {
