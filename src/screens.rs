@@ -99,6 +99,9 @@ impl Ctx<'_> {
 pub struct View {
     pub text: String,
     pub buttons: Vec<(String, Action)>,
+    /// Actions addressed by typed list number, including choices that cannot
+    /// be represented by a reaction emoji.
+    pub numbered: Vec<Action>,
 }
 
 /// The most reactions Element shows under a message: with more, only the
@@ -237,6 +240,9 @@ pub fn typed(view: &View, text: &str) -> Option<Action> {
         _ => {}
     }
     let n: usize = t.trim_end_matches('.').parse().ok()?;
+    if let Some(action) = view.numbered.get(n.checked_sub(1)?) {
+        return Some(action.clone());
+    }
     let key = NUMBERS.get(n.checked_sub(1)?)?;
     resolve(view, key)
 }
@@ -244,6 +250,7 @@ pub fn typed(view: &View, text: &str) -> Option<Action> {
 struct Builder {
     lines: Vec<String>,
     buttons: Vec<(String, Action)>,
+    numbered: Vec<Action>,
 }
 
 impl Builder {
@@ -251,6 +258,7 @@ impl Builder {
         Self {
             lines: vec![title.into()],
             buttons: Vec::new(),
+            numbered: Vec::new(),
         }
     }
 
@@ -286,10 +294,20 @@ impl Builder {
         items: &[(String, String)],
         action: impl Fn(usize) -> Action,
     ) -> &mut Self {
-        for (key, line, a) in option_keys(items, action) {
+        if items.len() + 2 > REACTIONS_SHOWN {
+            self.gap().line("Or send the number of your choice.");
+        }
+        let show_numbers = items.len() + 2 > REACTIONS_SHOWN;
+        for (i, (key, line, a)) in option_keys(items, action).into_iter().enumerate() {
+            self.numbered.push(a.clone());
             match key {
                 Some(key) => {
-                    self.lines.push(format!("{key} {line}"));
+                    let number = if show_numbers {
+                        format!("{}. ", i + 1)
+                    } else {
+                        String::new()
+                    };
+                    self.lines.push(format!("{key} {number}{line}"));
                     self.buttons.push((key, a));
                 }
                 // More than ten: still listed, typed by number.
@@ -314,6 +332,7 @@ impl Builder {
         View {
             text: self.lines.join("\n"),
             buttons: std::mem::take(&mut self.buttons),
+            numbered: std::mem::take(&mut self.numbered),
         }
     }
 }
@@ -1061,23 +1080,30 @@ fn question(run: &Run, index: usize, q: &Version, answer: Option<&Answer>) -> Vi
                 .iter()
                 .map(|c| (c.emoji.clone(), crate::markup::literal(&c.label)))
                 .collect();
+            let show_numbers = q.choices.len() + 2 > REACTIONS_SHOWN;
             for (i, (key, line, action)) in
                 option_keys(&items, |i| Action::Toggle(q.choices[i].version_id))
                     .into_iter()
                     .enumerate()
             {
+                b.numbered.push(action.clone());
                 let mark = if ticked(q.choices[i].version_id) {
                     "☑️"
                 } else {
                     "⬜"
                 };
                 if let Some(key) = key {
-                    b.lines.push(format!("{key} {mark} {line}"));
+                    let number = if show_numbers {
+                        format!("{}. ", i + 1)
+                    } else {
+                        String::new()
+                    };
+                    b.lines.push(format!("{key} {number}{mark} {line}"));
                     b.buttons.push((key, action));
                 }
             }
             b.gap()
-                .line("Tap to tick as many as fit, then ➡️ Next (or send `weiter`):");
+                .line("Tap choices or send their numbers, then ➡️ Next (or send `weiter`):");
             b.button(NEXT, "**Next**", Action::Next);
         }
         QKind::Text => {
@@ -1420,6 +1446,22 @@ mod tests {
         let v = view(&f, &ctx);
         assert!(v.keys().contains(&"🍳".to_owned()));
         assert!(v.keys().contains(&"⏭️".to_owned()));
+    }
+
+    #[test]
+    fn options_after_the_tenth_can_be_selected_by_their_displayed_number() {
+        let items: Vec<(String, String)> = (1..=12)
+            .map(|i| ("🙂".to_owned(), format!("choice {i}")))
+            .collect();
+        let mut builder = Builder::new("Pick a choice");
+        builder.options(&items, |i| Action::Value((i + 1) as i64));
+        let view = builder.done();
+
+        assert!(view.text.contains("1️⃣ 1. 🙂 choice 1"));
+        assert!(view.text.contains("11. 🙂 choice 11"));
+        assert!(view.text.contains("12. 🙂 choice 12"));
+        assert_eq!(typed(&view, "11"), Some(Action::Value(11)));
+        assert_eq!(typed(&view, "12."), Some(Action::Value(12)));
     }
 
     #[test]

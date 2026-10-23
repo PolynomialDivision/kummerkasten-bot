@@ -2679,6 +2679,7 @@ mod tests {
         let view = screens::View {
             text: String::new(),
             buttons: Vec::new(),
+            numbered: Vec::new(),
         };
         assert!(Msg::edit(view).in_session());
         assert!(!Msg::receipt(String::new()).in_session());
