@@ -34,6 +34,15 @@ note, a receipt), the next step comes as a fresh screen at the bottom and
 the old one is removed. Receipts (✅ stored, the deletion code) are never
 edited.
 
+**Long screens.** Element shows 9 reactions under a message, then only 8
+and "Show all". On a screen with more buttons, ➡️ Next, ⬅️ Back and the
+other step buttons come first, so they are always in sight, and the
+choices are numbered: typing a number picks it, `next` goes on. Element
+keeps a reaction's first place even after it was taken away, so such a
+screen is only edited in place while its buttons stay the same (ticking
+choices); the next long question comes as a fresh screen, with a
+notification of its own.
+
 A pressed button is released (the bot takes your reaction away) once the
 screen has changed, so the same button works again on the next step. If
 the bot can't handle a tap or a message, it says so in a short note instead

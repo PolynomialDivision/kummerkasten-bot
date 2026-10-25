@@ -329,7 +329,9 @@ async fn show_screen(
 /// Edit the screen `event` to show `msg`, then bring its buttons in line:
 /// the bot's reactions that still fit (a common start) stay, the rest are
 /// redacted and the new ones added in order, so every button shown works
-/// and they keep the order of the text.
+/// and they keep the order of [`screens::View::keys`] (the text's, but on
+/// a crowded screen the step buttons first: the caller sends those as a
+/// fresh screen when their order would change).
 ///
 /// An error means the edit itself did not go out (the caller sends a fresh
 /// screen then). Once it is out, trouble with the bookkeeping is logged:

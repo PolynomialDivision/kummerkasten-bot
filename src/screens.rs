@@ -108,6 +108,12 @@ pub struct View {
 /// first 8 and "Show all" (`MAX_ITEMS_WHEN_LIMITED`, element-web 2026-10).
 pub const REACTIONS_SHOWN: usize = 9;
 
+/// A screen with more buttons than Element shows: its step buttons come
+/// first and its options are numbered, so the hidden ones can be typed.
+pub fn crowded(buttons: usize) -> bool {
+    buttons > REACTIONS_SHOWN
+}
+
 impl View {
     /// The buttons in the order they are added as reactions: the order of
     /// the text, but on a screen with more than Element shows, the step
@@ -115,7 +121,7 @@ impl View {
     /// (the choices are listed in the text, and "Show all" brings the rest).
     pub fn keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.buttons.iter().map(|(k, _)| k.clone()).collect();
-        if keys.len() > REACTIONS_SHOWN {
+        if crowded(keys.len()) {
             keys.sort_by_key(|k| !RESERVED.iter().any(|r| same_key(r, k)));
         }
         keys
@@ -216,7 +222,7 @@ pub fn buttons_kept(old: &[(String, String)], new: &[String]) -> usize {
 /// may retain the first-seen order even after a reaction is redacted, so a
 /// changed long row needs a fresh event to make its visible controls usable.
 pub fn can_edit_reaction_order(old: &[(String, String)], new: &[String]) -> bool {
-    new.len() <= REACTIONS_SHOWN || buttons_kept(old, new) == new.len()
+    !crowded(new.len()) || buttons_kept(old, new) == new.len()
 }
 
 pub fn resolve(view: &View, key: &str) -> Option<Action> {
@@ -251,6 +257,12 @@ struct Builder {
     lines: Vec<String>,
     buttons: Vec<(String, Action)>,
     numbered: Vec<Action>,
+    /// Option lines with a button, numbered ("3. ") once the screen is done
+    /// if it is crowded: (line, where the number goes, the number).
+    numbers: Vec<(usize, usize, usize)>,
+    /// Lines that depend on the numbers: (line, numbered, plain); without a
+    /// plain text the line (and the gap before it) is left out.
+    hints: Vec<(usize, String, Option<String>)>,
 }
 
 impl Builder {
@@ -259,6 +271,8 @@ impl Builder {
             lines: vec![title.into()],
             buttons: Vec::new(),
             numbered: Vec::new(),
+            numbers: Vec::new(),
+            hints: Vec::new(),
         }
     }
 
@@ -270,6 +284,32 @@ impl Builder {
     fn gap(&mut self) -> &mut Self {
         self.lines.push(String::new());
         self
+    }
+
+    /// A line that reads `numbered` on a crowded screen, `plain` (or
+    /// nothing) otherwise.
+    fn hint(&mut self, numbered: &str, plain: Option<&str>) -> &mut Self {
+        self.hints.push((
+            self.lines.len(),
+            numbered.to_owned(),
+            plain.map(str::to_owned),
+        ));
+        self.lines.push(String::new());
+        self
+    }
+
+    /// Option `i` (from [`option_keys`]): its button, or without one (past
+    /// ten numbers) a line with its number.
+    fn option(&mut self, i: usize, key: Option<String>, text: &str, action: Action) {
+        self.numbered.push(action.clone());
+        match key {
+            Some(key) => {
+                self.numbers.push((self.lines.len(), key.len() + 1, i + 1));
+                self.lines.push(format!("{key} {text}"));
+                self.buttons.push((key, action));
+            }
+            None => self.lines.push(format!("{}. {text}", i + 1)),
+        }
     }
 
     fn button(&mut self, key: &str, label: &str, action: Action) -> &mut Self {
@@ -294,27 +334,10 @@ impl Builder {
         items: &[(String, String)],
         action: impl Fn(usize) -> Action,
     ) -> &mut Self {
-        if items.len() + 2 > REACTIONS_SHOWN {
-            self.gap().line("Or send the number of your choice.");
-        }
-        let show_numbers = items.len() + 2 > REACTIONS_SHOWN;
+        self.gap()
+            .hint("🔢 Or send the number of your choice.", None);
         for (i, (key, line, a)) in option_keys(items, action).into_iter().enumerate() {
-            self.numbered.push(a.clone());
-            match key {
-                Some(key) => {
-                    let number = if show_numbers {
-                        format!("{}. ", i + 1)
-                    } else {
-                        String::new()
-                    };
-                    self.lines.push(format!("{key} {number}{line}"));
-                    self.buttons.push((key, a));
-                }
-                // More than ten: still listed, typed by number.
-                None => {
-                    self.lines.push(line);
-                }
-            }
+            self.option(i, key, &line, a);
         }
         self
     }
@@ -329,6 +352,25 @@ impl Builder {
     }
 
     fn done(&mut self) -> View {
+        let numbered = crowded(self.buttons.len());
+        for (line, at, n) in self.numbers.drain(..) {
+            if numbered {
+                self.lines[line].insert_str(at, &format!("{n}. "));
+            }
+        }
+        // From the last, so the lines before keep their place.
+        for (line, with, plain) in std::mem::take(&mut self.hints).into_iter().rev() {
+            match (numbered, plain) {
+                (true, _) => self.lines[line] = with,
+                (false, Some(plain)) => self.lines[line] = plain,
+                (false, None) => {
+                    self.lines.remove(line);
+                    if line > 0 && self.lines[line - 1].is_empty() {
+                        self.lines.remove(line - 1);
+                    }
+                }
+            }
+        }
         View {
             text: self.lines.join("\n"),
             buttons: std::mem::take(&mut self.buttons),
@@ -416,7 +458,8 @@ pub fn finish_first(run: &Run) -> String {
     )
 }
 
-/// `(button key, line, action)` per option; no key beyond ten numbers.
+/// `(button key, line, action)` per option; no key beyond ten numbers
+/// (see [`Builder::option`]).
 fn option_keys(
     items: &[(String, String)],
     action: impl Fn(usize) -> Action,
@@ -443,7 +486,7 @@ fn option_keys(
             } else {
                 match NUMBERS.get(i) {
                     Some(n) => (Some((*n).to_owned()), titled, action(i)),
-                    None => (None, format!("{}. {titled}", i + 1), action(i)),
+                    None => (None, titled, action(i)),
                 }
             }
         })
@@ -1080,30 +1123,22 @@ fn question(run: &Run, index: usize, q: &Version, answer: Option<&Answer>) -> Vi
                 .iter()
                 .map(|c| (c.emoji.clone(), crate::markup::literal(&c.label)))
                 .collect();
-            let show_numbers = q.choices.len() + 2 > REACTIONS_SHOWN;
             for (i, (key, line, action)) in
                 option_keys(&items, |i| Action::Toggle(q.choices[i].version_id))
                     .into_iter()
                     .enumerate()
             {
-                b.numbered.push(action.clone());
                 let mark = if ticked(q.choices[i].version_id) {
                     "☑️"
                 } else {
                     "⬜"
                 };
-                if let Some(key) = key {
-                    let number = if show_numbers {
-                        format!("{}. ", i + 1)
-                    } else {
-                        String::new()
-                    };
-                    b.lines.push(format!("{key} {number}{mark} {line}"));
-                    b.buttons.push((key, action));
-                }
+                b.option(i, key, &format!("{mark} {line}"), action);
             }
-            b.gap()
-                .line("Tap choices or send their numbers, then ➡️ Next (or send `weiter`):");
+            b.gap().hint(
+                "👆 Tap choices or send their numbers, then ➡️ Next (or send `next`):",
+                Some("👆 Tap choices, then ➡️ Next:"),
+            );
             b.button(NEXT, "**Next**", Action::Next);
         }
         QKind::Text => {
@@ -1462,6 +1497,116 @@ mod tests {
         assert!(view.text.contains("12. 🙂 choice 12"));
         assert_eq!(typed(&view, "11"), Some(Action::Value(11)));
         assert_eq!(typed(&view, "12."), Some(Action::Value(12)));
+    }
+
+    /// A one-question check-in whose question picks several of `choices`.
+    fn multiple(choices: &[&str], required: bool) -> (Run, Version) {
+        let q = Version {
+            id: 1,
+            version: 1,
+            kind: QKind::Multiple,
+            text: "Where?".to_owned(),
+            config: Default::default(),
+            required,
+            allow_comment: false,
+            asks_suggestion: false,
+            metric: None,
+            problem: None,
+            choices: choices
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let (emoji, label) = c.split_once(' ').unwrap();
+                    crate::surveys::Choice {
+                        choice_id: i as i64 + 1,
+                        version_id: i as i64 + 1,
+                        emoji: emoji.to_owned(),
+                        label: label.to_owned(),
+                        problem: None,
+                        is_other: false,
+                    }
+                })
+                .collect(),
+        };
+        let run = Run {
+            id: 1,
+            emoji: "🧹".to_owned(),
+            title: "Cleaning".to_owned(),
+            intro: String::new(),
+            target: crate::checkins::Target::House,
+            identities: Vec::new(),
+            plenum_id: None,
+            opens_at: Utc::now(),
+            closes_at: Utc::now(),
+            reminder_at: None,
+            announce: false,
+            open: true,
+            questions: vec![q.clone()],
+        };
+        (run, q)
+    }
+
+    #[test]
+    fn a_multiple_choice_past_the_tenth_is_listed_with_its_number() {
+        let choices: Vec<String> = (1..=12).map(|i| format!("🙂 choice{i}")).collect();
+        let choices: Vec<&str> = choices.iter().map(String::as_str).collect();
+        let (run, q) = multiple(&choices, true);
+        let view = question(&run, 0, &q, None);
+        assert!(view.text.contains("1️⃣ 1. ⬜ 🙂 choice1"), "{}", view.text);
+        assert!(view.text.contains("\n11. ⬜ 🙂 choice11"), "{}", view.text);
+        assert!(view.text.contains("\n12. ⬜ 🙂 choice12"), "{}", view.text);
+        assert_eq!(typed(&view, "12"), Some(Action::Toggle(12)));
+    }
+
+    #[test]
+    fn choices_are_numbered_exactly_when_their_buttons_are_reordered() {
+        let seven = [
+            "🍳 Kitchen",
+            "🚿 Baths",
+            "🪜 Stairs",
+            "🛋️ Rooms",
+            "♻️ Rubbish",
+            "🧺 Laundry",
+            "🌿 Garden",
+        ];
+        // 7 choices, ➡️ Next, ⬅️ Back, ❌ Cancel: more than Element shows.
+        let (run, q) = multiple(&seven, true);
+        let view = question(&run, 0, &q, None);
+        assert!(crowded(view.buttons.len()));
+        assert!(same_key(&view.keys()[0], NEXT));
+        assert!(view.text.contains("🍳 1. ⬜ Kitchen"), "{}", view.text);
+        assert!(view.text.contains("🌿 7. ⬜ Garden"), "{}", view.text);
+        assert!(view.text.contains("send their numbers"), "{}", view.text);
+        // Three fit: no numbers, and the text does not promise any.
+        let (run, q) = multiple(&seven[..3], true);
+        let view = question(&run, 0, &q, None);
+        assert!(!crowded(view.buttons.len()));
+        assert!(view.text.contains("🍳 ⬜ Kitchen"), "{}", view.text);
+        assert!(!view.text.contains("1."), "{}", view.text);
+        assert!(
+            view.text.contains("👆 Tap choices, then ➡️ Next:"),
+            "{}",
+            view.text
+        );
+        assert!(!view.text.contains("numbers"), "{}", view.text);
+        // Single choice: the hint (and its gap) only on a crowded screen.
+        let items: Vec<(String, String)> = seven[..3]
+            .iter()
+            .map(|c| {
+                let (e, l) = c.split_once(' ').unwrap();
+                (e.to_owned(), l.to_owned())
+            })
+            .collect();
+        let mut b = Builder::new("Pick one");
+        b.gap().options(&items, |i| Action::Value(i as i64));
+        let view = b.nav();
+        assert_eq!(
+            view.text,
+            format!(
+                "Pick one\n\n🍳 Kitchen\n🚿 Baths\n🪜 Stairs\n\n{}",
+                nav_line()
+            )
+        );
     }
 
     #[test]
