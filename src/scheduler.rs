@@ -15,9 +15,12 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use mxbot_common::matrix_sdk::{
-    ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId},
-    RoomState,
+use mxbot_common::{
+    matrix_sdk::{
+        ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId},
+        RoomState,
+    },
+    supervise::Alive,
 };
 
 use crate::{
@@ -28,22 +31,20 @@ use crate::{
 };
 
 const TICK: Duration = Duration::from_secs(60);
+/// No tick for this long (a round hangs): the container turns unhealthy. A
+/// round may send and redact a lot (a cleared chat), so well above a minute.
+pub const STALLED_AFTER: Duration = Duration::from_secs(15 * 60);
 /// Between two redactions, to stay friendly with the homeserver.
 const REDACT_PAUSE: Duration = Duration::from_millis(250);
 
-pub async fn run(kk: Kk) {
+pub async fn run(kk: Kk, alive: Alive) {
     loop {
-        // Each tick on its own task: a panic in one is logged and the clock
-        // goes on. Otherwise nothing time-based (notices, reminders,
-        // closing, redactions) would happen again until a restart, and the
-        // health check (sync only) would not notice.
-        let ticking = tokio::spawn({
-            let kk = kk.clone();
-            async move { tick(&kk).await }
-        });
-        if let Err(error) = ticking.await {
-            tracing::error!(%error, "A scheduler tick failed; carrying on");
-        }
+        alive.tick();
+        // A panic in a tick ends the bot (panic = "abort", Cargo.toml) and
+        // Docker restarts it; a tick that hangs stops the ticks above and the
+        // container turns unhealthy. Either way the clock does not stop
+        // unnoticed (notices, reminders, closing, redactions).
+        tick(&kk).await;
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
             _ = kk.wake.notified() => {}

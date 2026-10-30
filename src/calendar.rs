@@ -14,9 +14,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
-use mxbot_common::calendar::{
-    caldav,
-    ics::{self, EntryTime, IcsEvent},
+use mxbot_common::{
+    calendar::{
+        caldav,
+        ics::{self, EntryTime, IcsEvent},
+    },
+    supervise::Alive,
 };
 
 use crate::{
@@ -201,10 +204,15 @@ pub async fn sync(kk: &Kk, reader: &mut Reader) {
     }
 }
 
-/// Every `refresh_minutes`, after the first read at startup.
-pub async fn run(kk: Kk, mut reader: Reader) {
+/// The longest a read normally takes, for the health check of [`run`].
+pub const SLOW_READ: Duration = Duration::from_secs(5 * 60);
+
+/// Every `refresh_minutes`, after the first read at startup; `alive` ticks
+/// once per read.
+pub async fn run(kk: Kk, mut reader: Reader, alive: Alive) {
     loop {
         tokio::time::sleep(reader.every()).await;
+        alive.tick();
         sync(&kk, &mut reader).await;
     }
 }

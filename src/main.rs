@@ -24,6 +24,7 @@ use mxbot_common::{
     rooms::DynamicRooms,
     send::send_with_retry,
     settings::Settings,
+    supervise::supervise_ticking,
     Bot,
 };
 use tokio::sync::{Mutex, Notify};
@@ -308,12 +309,20 @@ async fn main() -> Result<()> {
     // Screens a crash left behind, before anyone taps on them.
     dm::resume_screens(&kk).await;
     // The calendar first, so the clock never announces a date it would
-    // change a moment later.
+    // change a moment later. Both run as long as the bot: one that ends ends
+    // the bot (Docker starts it again), one without a round in time makes
+    // the container unhealthy.
     if let Some(mut reader) = reader {
         calendar::sync(&kk, &mut reader).await;
-        tokio::spawn(calendar::run(kk.clone(), reader));
+        supervise_ticking(
+            "plenum calendar",
+            3 * (reader.every() + calendar::SLOW_READ),
+            |alive| calendar::run(kk.clone(), reader, alive),
+        );
     }
-    tokio::spawn(scheduler::run(kk.clone()));
+    supervise_ticking("scheduler", scheduler::STALLED_AFTER, |alive| {
+        scheduler::run(kk.clone(), alive)
+    });
     bot.run().await
 }
 

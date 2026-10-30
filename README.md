@@ -655,7 +655,10 @@ An update (or any restart) while a check-in is running loses nothing:
 * **The server having trouble** right after a restart: "try again in a
   moment", never a locked chat or a lost draft.
 * **The scheduler** (notices, reminders, closing, redactions) carries on
-  after an unexpected error in one tick.
+  after an error in one tick. Should it or the calendar reader stop, the
+  bot exits and Docker starts it again; should one hang (the scheduler 15
+  minutes without a tick, the reader three refreshes and their reads), the
+  container turns unhealthy.
 * **Moving to the calendar** (2026-10-22, migration 9): the database of a
   running survey opens as it is. The first read of the calendar links each
   existing plenum to its occurrence at the same time (else the same day), so
