@@ -1,14 +1,18 @@
-//! SQLite access, as in the rest of the fleet: one connection behind a
-//! mutex, used from `spawn_blocking`, and numbered migrations applied once
-//! each, in order, every one in its own transaction.
+//! SQLite access through `mxbot_common::sqlite`, as in the rest of the
+//! fleet: one connection behind a mutex, used from `spawn_blocking`, and
+//! numbered migrations applied once each, in order, every one in its own
+//! transaction. A database from a newer image is refused.
 
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use anyhow::Result;
+#[cfg(test)]
+use mxbot_common::sqlite;
+use mxbot_common::sqlite::Options;
+#[cfg(test)]
+use rusqlite::Connection;
+
+pub use mxbot_common::sqlite::Db;
 
 /// Migrations in order. Never edit one that has shipped: add the next.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -26,122 +30,33 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (9, include_str!("../migrations/009_calendar_plenums.sql")),
 ];
 
-#[derive(Clone)]
-pub struct Db {
-    conn: Arc<Mutex<Connection>>,
-}
-
-impl Db {
-    pub async fn open(path: &Path) -> Result<Self> {
-        let path = path.to_owned();
-        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
-            let mut conn = Connection::open(&path)
-                .with_context(|| format!("Opening SQLite at {}", path.display()))?;
-            configure(&conn)?;
-            migrate(&mut conn)?;
-            Ok(conn)
-        })
-        .await??;
-        Ok(Self::from_connection(conn))
-    }
-
-    pub fn from_connection(conn: Connection) -> Self {
-        Self {
-            conn: Arc::new(Mutex::new(conn)),
-        }
-    }
-
-    /// Run `f` on the connection, off the async runtime.
-    pub async fn run<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            f(&mut conn)
-        })
-        .await?
-    }
-
-    /// Run `f` synchronously (tests and code already off the runtime).
-    #[cfg(test)]
-    pub fn with<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut conn)
-    }
-}
-
 /// `secure_delete` asks SQLite to overwrite deleted content in the main
 /// database file instead of leaving it in free pages. An extra measure,
 /// not a guarantee of physical erasure: the WAL (until its next
 /// checkpoint), the filesystem, the storage hardware, snapshots and backups
 /// may still hold older data: see the README.
+const OPTIONS: Options = Options {
+    secure_delete: true,
+};
+
+pub async fn open(path: &Path) -> Result<Db> {
+    Db::open(path, MIGRATIONS, OPTIONS).await
+}
+
+#[cfg(test)]
 fn configure(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA foreign_keys = ON;
-         PRAGMA secure_delete = ON;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;",
-    )
-    .context("Configuring SQLite")
+    sqlite::configure(conn, OPTIONS)
 }
 
 /// Apply every migration not applied yet. Returns how many ran.
+#[cfg(test)]
 pub fn migrate(conn: &mut Connection) -> Result<usize> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-             version     INTEGER PRIMARY KEY,
-             applied_at  TEXT NOT NULL
-         );",
-    )?;
-    // An older image over a database a newer one migrated: it would write
-    // what the schema no longer takes, or misread what it holds.
-    let newest: Option<i64> =
-        conn.query_row("SELECT max(version) FROM schema_migrations", [], |r| {
-            r.get(0)
-        })?;
-    let known = MIGRATIONS.last().map_or(0, |(version, _)| *version);
-    if let Some(newest) = newest.filter(|n| *n > known) {
-        anyhow::bail!(
-            "The database is from a newer version of the bot (migration {newest}, this one knows \
-             up to {known}). Run the newer image again, or restore a backup from before it."
-        );
-    }
-    let mut applied = 0;
-    for (version, sql) in MIGRATIONS {
-        let done: Option<i64> = conn
-            .query_row(
-                "SELECT version FROM schema_migrations WHERE version = ?1",
-                [version],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if done.is_some() {
-            continue;
-        }
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)
-            .with_context(|| format!("Applying migration {version}"))?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            rusqlite::params![version, crate::time::now_text()],
-        )?;
-        tx.commit()?;
-        tracing::info!(version, "Applied database migration");
-        applied += 1;
-    }
-    Ok(applied)
+    sqlite::migrate(conn, MIGRATIONS)
 }
 
 #[cfg(test)]
 pub fn memory_connection() -> Connection {
-    let mut conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-    migrate(&mut conn).unwrap();
-    conn
+    sqlite::memory_connection(MIGRATIONS).unwrap()
 }
 
 #[cfg(test)]
@@ -516,5 +431,106 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// The code this module had before `mxbot_common::sqlite`, kept as it
+    /// was so the test below builds databases exactly as production has them.
+    fn old_open(path: &Path, upto: usize) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .unwrap();
+        // Its indentation is part of the stored schema.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (\n             \
+             version     INTEGER PRIMARY KEY,\n             \
+             applied_at  TEXT NOT NULL\n         );",
+        )
+        .unwrap();
+        let mut conn = conn;
+        for (version, sql) in &MIGRATIONS[..upto] {
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(sql).unwrap();
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                rusqlite::params![version, crate::time::now_text()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn
+    }
+
+    /// Everything that makes up the schema, and the applied migrations.
+    fn shape(conn: &Connection) -> (Vec<String>, Vec<i64>, i64) {
+        let schema = conn
+            .prepare("SELECT type || ' ' || name || ': ' || ifnull(sql, '') FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let versions = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let user_version = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        (schema, versions, user_version)
+    }
+
+    #[tokio::test]
+    async fn databases_the_old_code_made_open_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = shape(&old_open(&dir.path().join("old.sqlite"), MIGRATIONS.len()));
+        assert_eq!(reference.1, (1..=9).collect::<Vec<i64>>());
+        assert_eq!(reference.2, 0);
+        // A fresh database ends up as the old code made it.
+        let db = open(&dir.path().join("fresh.sqlite")).await.unwrap();
+        assert_eq!(db.with(|c| Ok(shape(c))).unwrap(), reference);
+        // One at every older version upgrades to it, with its data and its
+        // migration history; one already current is not touched.
+        for upto in 1..=MIGRATIONS.len() {
+            let path = dir.path().join(format!("v{upto}.sqlite"));
+            let old = old_open(&path, upto);
+            old.execute(
+                "INSERT INTO authorized_rooms (room_id, label, added_by, added_at) \
+                 VALUES ('!h:x', 'House', '@a:x', 'then')",
+                [],
+            )
+            .unwrap();
+            let history = |c: &Connection| -> Vec<(i64, String)> {
+                c.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            };
+            let before = history(&old);
+            drop(old);
+            let db = open(&path).await.unwrap();
+            db.with(|c| {
+                assert_eq!(shape(c), reference, "from version {upto}");
+                assert_eq!(history(c)[..upto], before[..]);
+                let label: String = c.query_row(
+                    "SELECT label FROM authorized_rooms WHERE room_id = '!h:x'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(label, "House");
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 }

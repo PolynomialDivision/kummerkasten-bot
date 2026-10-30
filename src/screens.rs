@@ -6,6 +6,7 @@
 //! (🍳 Kitchen 1–4), and typing the number works too.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use mxbot_common::reaction;
 
 use crate::{
     catalog::{Catalog, Node},
@@ -130,8 +131,7 @@ impl View {
 
 /// Same key, with or without the emoji variation selector.
 pub fn same_key(a: &str, b: &str) -> bool {
-    let bare = |s: &str| s.replace('\u{fe0f}', "");
-    bare(a) == bare(b)
+    reaction::is_one_of(a, &[b])
 }
 
 /// Emojis that look alike as reactions (small in a phone's row of them).
@@ -1432,6 +1432,8 @@ mod tests {
         assert_eq!(buttons_kept(&had(&["😩", "😕", "⬅️"]), &want(&["😩"])), 1);
         // The emoji variation selector doesn't matter.
         assert_eq!(buttons_kept(&had(&["➡\u{fe0f}"]), &want(&["➡"])), 1);
+        assert!(same_key("➡️", "➡") && same_key("🗓", "🗓️") && same_key("☑️", "☑️"));
+        assert!(!same_key("📅", "📆") && !same_key("➡️", "⬅️") && !same_key("", "➡️"));
         assert_eq!(buttons_kept(&[], &want(&["📝"])), 0);
     }
 

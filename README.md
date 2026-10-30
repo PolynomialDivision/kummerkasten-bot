@@ -707,7 +707,7 @@ delivery, deadlines) · `reconcile` (one chat per eligible resident) ·
 `measures` · `summary` (day-before summary, updates) · `access` · `secrets` ·
 `scheduler` · `admin` · `admin_checkins` · `admin_results` · `store` · `db`
 (migrations in `migrations/`, applied once each, in order, each in a
-transaction).
+transaction, by mxbot-common's `sqlite`).
 
 ## Roadmap
 

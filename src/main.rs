@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&store_path)
         .with_context(|| format!("Creating {}", store_path.display()))?;
     let [db_file, key_file, settings_file] = mode.files();
-    let db = db::Db::open(&store_path.join(db_file)).await?;
+    let db = db::open(&store_path.join(db_file)).await?;
     let keyed = db.run(|c| store::holds_keyed_data(c)).await?;
     let secrets = secrets::Secrets::load_or_create(&store_path.join(key_file), !keyed)?;
     let settings = Settings::load(

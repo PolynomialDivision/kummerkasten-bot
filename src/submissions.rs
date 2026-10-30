@@ -265,7 +265,7 @@ pub fn coded_one(conn: &Connection, id: i64) -> Result<Option<View>> {
 
 /// Delete the record and its deletion code. Nothing is copied aside; what
 /// storage layers below the database keep is outside the bot's control
-/// (see `db::configure`).
+/// (see `db::OPTIONS`).
 pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.execute("DELETE FROM submissions WHERE id = ?1", [id])? == 1)
 }
