@@ -202,6 +202,18 @@ pub fn waiting(conn: &Connection) -> Result<(i64, i64)> {
     )?)
 }
 
+/// For the status file: messages still waiting (batches not yet expanded too), how many
+/// are stuck, and when the oldest was queued.
+pub fn backlog(conn: &Connection) -> Result<(i64, i64, Option<DateTime<Utc>>)> {
+    let (pending, stuck, oldest): (i64, i64, Option<String>) = conn.query_row(
+        "SELECT count(*), coalesce(sum(attempts >= ?1), 0), min(created_at) FROM outbox WHERE sent = 0",
+        [STUCK_AFTER],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let oldest = oldest.map(|text| time::parse_text(&text)).transpose()?;
+    Ok((pending, stuck, oldest))
+}
+
 /// Nothing of the batch left to send: forget it, and with it who was told.
 fn finish(conn: &Connection, kind: &str, ref_id: i64) -> Result<()> {
     conn.execute(
@@ -250,6 +262,29 @@ mod tests {
         // …and forgotten once it is done.
         assert!(rows(&conn).is_empty());
         assert_eq!(waiting(&conn).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn the_backlog_counts_waiting_and_stuck_messages_and_the_oldest() {
+        let now = at(2026, 11, 2, 12);
+        let conn = with_house_calendar(now);
+        assert_eq!(backlog(&conn).unwrap(), (0, 0, None));
+        queue(&conn, Kind::Summary, 3, now).unwrap();
+        queue(&conn, Kind::Notice, 4, now + Duration::minutes(5)).unwrap();
+        assert_eq!(backlog(&conn).unwrap(), (2, 0, Some(now)));
+        let row = batches(&conn).unwrap()[0].0;
+        let later = now + Duration::minutes(10);
+        expand(&conn, row, &["!house:x".into()], later).unwrap();
+        let item = due(&conn, later, 10).unwrap().remove(0);
+        for i in 0..STUCK_AFTER {
+            failed(&conn, &item, later + Duration::hours(i)).unwrap();
+        }
+        assert_eq!(
+            backlog(&conn).unwrap(),
+            (2, 1, Some(now + Duration::minutes(5)))
+        );
+        sent(&conn, &item).unwrap();
+        assert_eq!(backlog(&conn).unwrap().0, 1);
     }
 
     #[test]

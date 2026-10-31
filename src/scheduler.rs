@@ -12,7 +12,7 @@
 //! while the message is still there; a chat a resident left is left only
 //! once it is redacted.
 
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use chrono::Utc;
 use mxbot_common::{
@@ -20,6 +20,7 @@ use mxbot_common::{
         ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId},
         RoomState,
     },
+    status,
     supervise::Alive,
 };
 
@@ -38,6 +39,7 @@ pub const STALLED_AFTER: Duration = Duration::from_secs(15 * 60);
 const REDACT_PAUSE: Duration = Duration::from_millis(250);
 
 pub async fn run(kk: Kk, alive: Alive) {
+    alive.expect_every(TICK);
     loop {
         alive.tick();
         // A panic in a tick ends the bot (panic = "abort", Cargo.toml) and
@@ -45,10 +47,49 @@ pub async fn run(kk: Kk, alive: Alive) {
         // container turns unhealthy. Either way the clock does not stop
         // unnoticed (notices, reminders, closing, redactions).
         tick(&kk).await;
+        match take_failure() {
+            None => alive.ok(),
+            Some(reason) => alive.failed(reason),
+        }
+        report_outbox(&kk).await;
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
             _ = kk.wake.notified() => {}
         }
+    }
+}
+
+/// The first failure of the running round, for the status file
+/// (`mxbot_common::status`): only [`run`] runs the clocks, one round at a time.
+static ROUND_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// A clock of this round failed: logged where it happened, noted here.
+fn note(what: &str, error: &dyn std::fmt::Display) {
+    note_reason(format!("{what}: {error:#}"));
+}
+
+fn note_reason(reason: String) {
+    let mut failure = ROUND_FAILURE.lock().unwrap_or_else(|e| e.into_inner());
+    failure.get_or_insert(reason);
+}
+
+fn take_failure() -> Option<String> {
+    ROUND_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// The outbox's waiting messages, the oldest one's age and how many are stuck, for the
+/// status file. A failed count leaves the last one.
+async fn report_outbox(kk: &Kk) {
+    match kk.engine.db.run(|c| outbox::backlog(c)).await {
+        Ok((pending, stuck, oldest)) => {
+            let age = oldest.map(|at| (Utc::now() - at).to_std().unwrap_or_default());
+            status::queue("outbox").set(pending.max(0) as u64, age);
+            status::gauge("outbox_stuck").set(stuck as f64);
+        }
+        Err(error) => tracing::debug!(%error, "Could not count the outbox for the status file"),
     }
 }
 
@@ -100,7 +141,10 @@ async fn plenum_clock(kk: &Kk) {
             completed = n,
             "Plenum completed by policy; chats will be cleared"
         ),
-        Err(error) => tracing::error!(%error, "Plenum clock failed"),
+        Err(error) => {
+            tracing::error!(%error, "Plenum clock failed");
+            note("Plenum clock failed", &error);
+        }
     }
 }
 
@@ -139,6 +183,7 @@ async fn summary_clock(kk: &Kk) {
         .await;
     if let Err(error) = queued {
         tracing::error!(%error, "Summary clock failed");
+        note("Summary clock failed", &error);
     }
 }
 
@@ -167,6 +212,7 @@ async fn checkin_clock(kk: &Kk) {
         .await;
     if let Err(error) = queued {
         tracing::error!(%error, "Check-in clock failed");
+        note("Check-in clock failed", &error);
     }
 }
 
@@ -177,6 +223,7 @@ async fn outbox_clock(kk: &Kk) {
         Ok(batches) => batches,
         Err(error) => {
             tracing::error!(%error, "Reading the outbox failed");
+            note("Reading the outbox failed", &error);
             return;
         }
     };
@@ -185,6 +232,7 @@ async fn outbox_clock(kk: &Kk) {
             Ok(targets) => targets,
             Err(error) => {
                 tracing::error!(%error, kind = kind.as_str(), "Could not decide who gets a message");
+                note("Could not decide who gets a message", &error);
                 continue;
             }
         };
@@ -196,18 +244,26 @@ async fn outbox_clock(kk: &Kk) {
             .await
         {
             tracing::error!(%error, "Could not queue the messages of a batch");
+            note("Could not queue the messages of a batch", &error);
         }
     }
     let due = match kk.engine.db.run(|c| outbox::due(c, Utc::now(), 200)).await {
         Ok(due) => due,
         Err(error) => {
             tracing::error!(%error, "Reading the outbox failed");
+            note("Reading the outbox failed", &error);
             return;
         }
     };
     let mut told = std::collections::BTreeMap::<(i64, &str), usize>::new();
     for item in due {
         let outcome = send_item(kk, &item).await;
+        if outcome == dm::Told::Failed {
+            note_reason(format!(
+                "an outbox message ({}) not sent",
+                item.kind.as_str()
+            ));
+        }
         if outcome == dm::Told::Sent && item.kind.to_chats() {
             *told.entry((item.ref_id, item.kind.as_str())).or_default() += 1;
         }
@@ -227,7 +283,10 @@ async fn outbox_clock(kk: &Kk) {
                 "A message keeps failing to send; trying again every few hours"
             ),
             Ok(false) => {}
-            Err(error) => tracing::error!(%error, "Could not update the outbox"),
+            Err(error) => {
+                tracing::error!(%error, "Could not update the outbox");
+                note("Could not update the outbox", &error);
+            }
         }
     }
     // Aggregate counts only (how many were told), never who.
@@ -402,6 +461,7 @@ async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
             Ok(false) => return dm::Told::NotNeeded,
             Err(error) => {
                 tracing::error!(%error, "Could not read a check-in to announce");
+                note("Could not read a check-in to announce", &error);
                 return dm::Told::Failed;
             }
         }
@@ -413,6 +473,7 @@ async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
             Ok((_, text)) => text,
             Err(error) => {
                 tracing::error!(%error, "Could not write an announcement");
+                note("Could not write an announcement", &error);
                 return dm::Told::Failed;
             }
         };
@@ -429,6 +490,7 @@ async fn send_item(kk: &Kk, item: &outbox::Item) -> dm::Told {
         Ok(None) => return dm::Told::NotNeeded,
         Err(error) => {
             tracing::error!(%error, "Could not write a plenum message");
+            note("Could not write a plenum message", &error);
             return dm::Told::Failed;
         }
     };
@@ -490,6 +552,7 @@ async fn expire_drafts(kk: &Kk) {
         Ok(stale) => stale,
         Err(error) => {
             tracing::error!(%error, "Expiring drafts failed");
+            note("Expiring drafts failed", &error);
             return;
         }
     };
@@ -512,7 +575,10 @@ async fn expire_drafts(kk: &Kk) {
         };
         match kk.engine.fresh_menu(&who, &room_id, Utc::now()).await {
             Ok(menu) => msgs.extend(menu),
-            Err(error) => tracing::error!(%error, "No fresh menu after expiry"),
+            Err(error) => {
+                tracing::error!(%error, "No fresh menu after expiry");
+                note("No fresh menu after expiry", &error);
+            }
         }
         dm::deliver(kk, &room, &mxid, msgs).await;
     }
@@ -534,6 +600,7 @@ async fn redact_marked(kk: &Kk) {
             Ok(_) => return,
             Err(error) => {
                 tracing::error!(%error, "Reading events to redact failed");
+                note("Reading events to redact failed", &error);
                 return;
             }
         };
@@ -563,6 +630,7 @@ async fn redact_marked(kk: &Kk) {
                 Err(error) => {
                     if attempts + 1 >= store::STUCK_AFTER {
                         tracing::warn!(%error, attempts = attempts + 1, "A redaction keeps failing; trying again later");
+                        note("A redaction keeps failing", &error);
                     } else {
                         tracing::debug!(%error, "Redaction failed; will retry");
                     }
@@ -583,6 +651,7 @@ async fn redact_marked(kk: &Kk) {
                 .await;
             if let Err(error) = saved {
                 tracing::error!(%error, "Could not update a redaction");
+                note("Could not update a redaction", &error);
                 return;
             }
             progress |= forget;
@@ -608,6 +677,7 @@ async fn leave_left_chats(kk: &Kk) {
         Ok(rooms) => rooms,
         Err(error) => {
             tracing::error!(%error, "Reading chats to leave failed");
+            note("Reading chats to leave failed", &error);
             return;
         }
     };
@@ -615,12 +685,14 @@ async fn leave_left_chats(kk: &Kk) {
         if let Some(room) = room_of(kk, &room_id) {
             if let Err(error) = room.leave().await {
                 tracing::warn!(%error, "Could not leave a closed chat; trying again later");
+                note("Could not leave a closed chat", &error);
                 continue;
             }
         }
         let r = room_id.clone();
         if let Err(error) = kk.engine.db.run(move |c| store::left_room(c, &r)).await {
             tracing::error!(%error, "Could not note a left chat");
+            note("Could not note a left chat", &error);
         }
     }
 }
@@ -631,6 +703,7 @@ async fn post_notices(kk: &Kk) {
         Ok(pending) => pending,
         Err(error) => {
             tracing::error!(%error, "Reading pending notices failed");
+            note("Reading pending notices failed", &error);
             return;
         }
     };
@@ -640,6 +713,7 @@ async fn post_notices(kk: &Kk) {
         // Cleared first: a crash below means no notice, never two.
         if let Err(error) = kk.engine.db.run(move |c| store::clear_notice(c, &m)).await {
             tracing::error!(%error, "Could not clear a notice");
+            note("Could not clear a notice", &error);
             continue;
         }
         let Some(room) = resident.dm_room_id.as_deref().and_then(|r| room_of(kk, r)) else {
@@ -667,7 +741,10 @@ async fn post_notices(kk: &Kk) {
             .await
         {
             Ok(menu) => msgs.extend(menu),
-            Err(error) => tracing::error!(%error, "No fresh menu after clearing"),
+            Err(error) => {
+                tracing::error!(%error, "No fresh menu after clearing");
+                note("No fresh menu after clearing", &error);
+            }
         }
         dm::deliver(kk, &room, &resident.mxid, msgs).await;
     }

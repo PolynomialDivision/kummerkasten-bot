@@ -210,10 +210,22 @@ pub const SLOW_READ: Duration = Duration::from_secs(5 * 60);
 /// Every `refresh_minutes`, after the first read at startup; `alive` ticks
 /// once per read.
 pub async fn run(kk: Kk, mut reader: Reader, alive: Alive) {
+    alive.expect_every(reader.every());
     loop {
         tokio::time::sleep(reader.every()).await;
         alive.tick();
         sync(&kk, &mut reader).await;
+        // For the status file: the read just done, as `!kk` shows it.
+        let error = kk
+            .calendar
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error
+            .clone();
+        match error {
+            None => alive.ok(),
+            Some(error) => alive.failed(format!("calendar not read: {error}")),
+        }
     }
 }
 
