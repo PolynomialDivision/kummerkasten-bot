@@ -1224,7 +1224,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_room_with_an_open_check_in_for_its_members_stays() {
-        let now = at(2026, 11, 2, 12);
+        // the real clock: open_runs_for_room compares closes_at with it
+        let now = Utc::now();
         let mut conn = with_house_calendar(now);
         crate::store::add_room(&conn, "!kitchen:x", "Kitchen", "@admin:x").unwrap();
         let run = started(
