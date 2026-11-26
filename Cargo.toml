@@ -1,0 +1,30 @@
+[package]
+name = "kummerkasten-bot"
+version = "0.1.0"
+edition = "2021"
+description = "📮 Kummerkasten: feedback, check-ins and ideas for the house, in Matrix"
+
+[dependencies]
+anyhow       = "1"
+chrono       = { version = "0.4", features = ["serde"] }
+chrono-tz    = "0.10"
+hmac         = "0.12"
+mime         = "0.3"
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar", "sqlite"] }
+rand         = "0.8"
+reqwest      = { version = "0.13", default-features = false, features = ["rustls"] }
+rusqlite     = { version = "0.41", features = ["bundled"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+sha2         = "0.10"
+tokio        = { version = "1", features = ["full"] }
+toml         = "1"
+tracing      = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# A panic anywhere ends the bot and Docker restarts it, as a supervised task
+# that ends does (mxbot_common::supervise).
+[profile.release]
+panic = "abort"

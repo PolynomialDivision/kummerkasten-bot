@@ -1,0 +1,61 @@
+# Test fixture: house-infra's rendered config (2026-10-22), identifiers replaced with example values.
+# Rendered by Ansible from stacks/matrix-bots/secrets/kummerkasten-bot.config.toml.j2. Do not edit on the host.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@kummerkasten-bot:example.org"
+device_id = "EXAMPLEDEVICE"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@admin:example.org", "@admin2:example.org"]
+allowed_inviters = []
+allowed_rooms = ["!AdminChatRoomIdOfRoomVersion12xxxxxxxxxxxx", "!house:example.org"]
+dm_rooms = ["!AdminChatRoomIdOfRoomVersion12xxxxxxxxxxxx"]
+encryption_strategy = "all_devices"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = true
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[kummerkasten]
+timezone = "Europe/Berlin"
+# test: own database, only the admins, a check-in only to who starts it (matrix.yml)
+mode = "live"
+# survey: only the check-ins admins start, one message each, no menu (the bot's README,
+# "Survey-only mode"); full: everything (matrix.yml, matrix_bots.kummerkasten-bot.kummerkasten.ui)
+ui = "survey"
+
+# The house plenum's dates (2026-10-22): plenum-bot's calendar, shared read-only with the bot's
+# own Nextcloud account (cloud.yml bot_accounts). The bot keeps no schedule of its own. The
+# app password is CALDAV_PASSWORD (secret_env), never in this file.
+[kummerkasten.calendar]
+account_url = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
+calendar = "plenum-house"   # plenum-bot's calendar of the house plenum
+username = "kummerkasten-bot"
+password_env = "CALDAV_PASSWORD"
+refresh_minutes = 5
+
+[kummerkasten.settings]
+privacy_threshold = 3
+session_minutes = 60
+auto_complete = false
+complete_at = "23:59"
+summary_hours_before = 24
+reminder_hours = 24
+
+[[kummerkasten.rooms]]
+id = "!house:example.org"
+label = "House"
+central = true
+entry = true

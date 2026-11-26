@@ -1,0 +1,1138 @@
+//! `!kk survey …`, `!kk metric …`, `!kk checkin …`: editing check-in
+//! templates and starting check-ins, from an admin's verified chat.
+
+use std::time::{Duration as StdDuration, Instant};
+
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use mxbot_common::matrix_sdk::ruma::{
+    events::room::message::FileMessageEventContent, OwnedRoomId, OwnedUserId,
+};
+
+use crate::{
+    checkins::{self, StartOptions, Target},
+    dm::Kk,
+    markup::literal,
+    screens, survey_file,
+    surveys::{self, Edit, NewQuestion, QKind},
+    time,
+};
+
+/// How long a planned start waits for `!kk checkin go`.
+const PLAN_VALID: StdDuration = StdDuration::from_secs(30 * 60);
+
+pub const HELP: &str = "📊 **Check-ins**
+`!kk surveys` · `!kk survey new <key> <emoji> <title> [topic <topic>]`
+`!kk survey <key>`: the questions, numbered
+`!kk survey <key> intro <text>` · `!kk survey <key> title [emoji] <title>`
+`!kk survey <key> add <scale|yesno|single|multiple|text> [optional] [suggestion] [metric <key>] [problem <key>] <question>`
+`!kk survey <key> edit <n> <question>` · `required <n>` · `optional <n>` · `comment <n> on|off`
+`!kk survey <key> metric <n> <key|none>` · `problem <n> <key|none>` · `scale <n> <min> <max>`
+`!kk survey <key> choice <n> add [problem <key>] [other] [emoji] <label>`
+`!kk survey <key> choice <n> rename <c> <label>` · `choice <n> emoji <c> <emoji|none>` · `choice <n> problem <c> <key|none>` · `choice <n> remove <c>`
+`!kk survey <key> move <n> <to>` · `disable <n>` · `enable <n>` · `preview` · `export`
+`!kk survey load [<name>]`: a survey file (store/surveys/, or upload a .toml here)
+`!kk metrics` · `!kk metric add <key> <topic> <label>` · `!kk metric rename <key> <label>`
+`!kk checkin start <key> [house | room <!room> | floor <location>] [opens 2026-11-10 [18:00]] [closes 2026-11-14 [18:00] | closes 1d-before] [no-reminder] [announce] [no-plenum] [only anonymous,floor]`
+   without `closes`: until the plenum starts; `1d-before`/`12h-before` follow the plenum when it moves, a date doesn't
+`!kk checkin go` · `!kk checkin drop` · `!kk checkins` · `!kk checkin remind <n>` · `!kk checkin close <n>`
+`!kk rooms central <!room> [off]`: where `announce` posts";
+
+/// `!kk help` in survey-only mode: the whole way, nothing else.
+pub const SURVEY_HELP: &str = "📊 **Survey-only mode**
+Residents see nothing but the check-in you start. They get it as a message, answer it question by question, and are done.
+
+0️⃣ **Get one**
+📎 Upload a survey file (.toml) here, or `!kk survey load house_cleaning`
+`!kk survey load`: the files there are · `!kk survey cleaning export`: one as a file
+
+1️⃣ **Look at it**
+`!kk survey cleaning`: the questions, numbered
+`!kk survey cleaning preview`: each question as residents see it
+
+2️⃣ **Start it**
+`!kk checkin start cleaning`: shows what would happen, then
+`!kk checkin go` to start it (or `!kk checkin drop`)
+   options: `opens 2026-11-10 [18:00]` (invite then, not now) · `closes 2026-11-14 [18:00]` · `closes 1d-before` · `only anonymous` · `no-reminder` · `room <!room>` · `floor <location>`
+   by default it closes when the next plenum starts, with one reminder a day before
+
+3️⃣ **Follow it**
+`!kk checkins`: open and closed ones, how many answered
+`!kk checkin remind <n>`: its reminder now, to everyone who hasn't answered (the planned one still comes)
+
+4️⃣ **Close and read it**
+`!kk checkin close <n>`: end it now (otherwise it closes by itself)
+`!kk checkin results <n>`: the answers, once it is closed
+
+✏️ Change questions: `!kk survey cleaning edit <n> <question>` and more in `!kk help all`";
+
+/// Handles the check-in commands; `None` for anything else.
+pub async fn dispatch(kk: &Kk, actor: &str, args: &[&str]) -> Option<Result<String>> {
+    let reply = match args {
+        ["surveys"] => templates(kk).await,
+        ["survey", "new", key, emoji, rest @ ..] => {
+            let (title, topic) = split_option(rest, "topic");
+            let (key, emoji, topic) = (key.to_string(), emoji.to_string(), topic);
+            if title.is_empty() {
+                return Some(Err(anyhow::anyhow!("A title, please.")));
+            }
+            kk.engine
+                .db
+                .run(move |c| surveys::create_template(c, &key, &emoji, &title, topic.as_deref()))
+                .await
+                .map(|()| {
+                    "✅ Template created. Add questions with `!kk survey <key> add …`.".to_owned()
+                })
+        }
+        ["survey", "load"] => Ok(survey_files().await),
+        ["survey", "load", name] => load(kk, name).await,
+        ["survey", key, "export"] => Ok(format!(
+            "📎 Send `!kk survey {key} export` on its own: the file comes as an attachment."
+        )),
+        ["survey", key] => overview(kk, key).await,
+        ["survey", key, "preview"] => preview(kk, key).await,
+        ["survey", key, "intro", text @ ..] if !text.is_empty() => {
+            let (key, text) = (key.to_string(), text.join(" "));
+            kk.engine
+                .db
+                .run(move |c| surveys::set_intro(c, &key, &text))
+                .await
+                .map(|()| {
+                    "✏️ Intro updated. New check-ins show it; started ones keep theirs.".to_owned()
+                })
+        }
+        ["survey", key, "title", first, more @ ..] => {
+            let (emoji, title) = if looks_like_emoji(first) && !more.is_empty() {
+                (Some(first.to_string()), more.join(" "))
+            } else {
+                (None, [&[*first], more].concat().join(" "))
+            };
+            let key = key.to_string();
+            kk.engine
+                .db
+                .run(move |c| surveys::rename_template(c, &key, emoji.as_deref(), &title))
+                .await
+                .map(|()| {
+                    "✏️ Title updated. New check-ins show it; started ones keep theirs.".to_owned()
+                })
+        }
+        ["survey", key, "add", kind, rest @ ..] => add(kk, key, kind, rest).await,
+        ["survey", key, "move", n, to] => {
+            let (key, n, to) = (key.to_string(), number(n), number(to));
+            match (n, to) {
+                (Ok(n), Ok(to)) => kk
+                    .engine
+                    .db
+                    .run(move |c| surveys::move_question(c, &key, n, to))
+                    .await
+                    .map(|()| "↕️ Moved. New check-ins ask in this order.".to_owned()),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        ["survey", key, verb @ ("disable" | "enable"), n] => {
+            let active = *verb == "enable";
+            let key = key.to_string();
+            match number(n) {
+                Ok(n) => kk
+                    .engine
+                    .db
+                    .run(move |c| surveys::set_active(c, &key, n, active))
+                    .await
+                    .map(|()| {
+                        if active {
+                            "✅ Asked again in new check-ins.".to_owned()
+                        } else {
+                            "🚫 Not asked in new check-ins any more. Its history stays.".to_owned()
+                        }
+                    }),
+                Err(e) => Err(e),
+            }
+        }
+        ["survey", key, "choice", n, verb, rest @ ..] => match choice_edit(verb, rest) {
+            Some(edit) => run_edit(kk, key, n, edit).await,
+            None => Err(anyhow::anyhow!("See `!kk help` for the choice commands.")),
+        },
+        ["survey", key, verb, n, rest @ ..] => match edit_of(verb, rest) {
+            Some(edit) => run_edit(kk, key, n, edit).await,
+            None => return None,
+        },
+        ["metrics"] => kk
+            .engine
+            .db
+            .run(|c| surveys::metrics(c))
+            .await
+            .map(|list| format!("🧠 **Canonical metrics**\n{list}")),
+        ["metric", "add", key, topic, label @ ..] if !label.is_empty() => {
+            let (key, topic, label) = (key.to_string(), topic.to_string(), label.join(" "));
+            kk.engine
+                .db
+                .run(move |c| surveys::add_metric(c, &key, &topic, &label))
+                .await
+                .map(|()| "🧠 Metric added. Point questions at it with `!kk survey <key> metric <n> <metric>`.".to_owned())
+        }
+        ["metric", "rename", key, label @ ..] if !label.is_empty() => {
+            let (key, label) = (key.to_string(), label.join(" "));
+            kk.engine
+                .db
+                .run(move |c| surveys::rename_metric(c, &key, &label))
+                .await
+                .map(|()| "✏️ Metric renamed. Its key and history stay.".to_owned())
+        }
+        ["checkin", "start", key, rest @ ..] => plan_start(kk, actor, key, rest).await,
+        ["checkin", "go"] => go(kk, actor).await,
+        ["checkin", "drop"] => {
+            kk.pending_starts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(actor);
+            Ok("❌ Dropped. Nothing was started.".to_owned())
+        }
+        ["checkins"] => runs(kk).await,
+        ["checkin", "results" | "result", n] | ["results", n] => {
+            match n.trim_start_matches('#').parse::<i64>() {
+                Ok(id) => {
+                    let (k, zone) = (kk.engine.k(), kk.engine.zone);
+                    let exists = kk
+                        .engine
+                        .db
+                        .run(move |c| {
+                            Ok(c.query_row(
+                                "SELECT count(*) FROM survey_runs WHERE id = ?1",
+                                [id],
+                                |r| r.get::<_, i64>(0),
+                            )? > 0)
+                        })
+                        .await;
+                    match exists {
+                        Ok(true) => {
+                            kk.engine
+                                .db
+                                .run(move |c| {
+                                    crate::run_results::render(c, id, k, zone, Utc::now())
+                                })
+                                .await
+                        }
+                        Ok(false) => Err(anyhow::anyhow!(
+                            "There's no check-in #{id}. See `!kk checkins`."
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "Which check-in? A number from `!kk checkins`."
+                )),
+            }
+        }
+        ["checkin", "remind", n] => match n.trim_start_matches('#').parse::<i64>() {
+            Ok(id) => {
+                let open = kk
+                    .engine
+                    .db
+                    .run(move |c| {
+                        let exists: i64 = c.query_row(
+                            "SELECT count(*) FROM survey_runs WHERE id = ?1",
+                            [id],
+                            |r| r.get(0),
+                        )?;
+                        Ok((exists > 0)
+                            .then(|| checkins::run(c, id))
+                            .transpose()?
+                            .map(|r| r.is_open(Utc::now())))
+                    })
+                    .await;
+                match open {
+                    Ok(None) => Err(anyhow::anyhow!("There's no check-in #{id}. See `!kk checkins`.")),
+                    Ok(Some(false)) => Err(anyhow::anyhow!("Check-in #{id} isn't open.")),
+                    Err(error) => Err(error),
+                    Ok(Some(true)) => crate::dm::remind_now(kk, id).await.map(|(sent, skipped, failed)| {
+                        let mut reply = format!(
+                            "🔔 Check-in #{id}: reminder sent into {sent} chat(s). {skipped} didn't need it (answered, or no chat accepted yet)."
+                        );
+                        if failed > 0 {
+                            reply.push_str(&format!(" ⚠️ {failed} failed; try again later."));
+                        }
+                        reply.push_str(" The planned reminder still comes.");
+                        reply
+                    }),
+                }
+            }
+            Err(_) => Err(anyhow::anyhow!(
+                "Which check-in? A number from `!kk checkins`."
+            )),
+        },
+        ["checkin", "close", n] => match n.trim_start_matches('#').parse::<i64>() {
+            Ok(id) => kk
+                .engine
+                .db
+                .run(move |c| checkins::close(c, id, Utc::now()))
+                .await
+                .map(|closed| {
+                    if closed {
+                        format!("🔒 Check-in #{id} closed. Answers so far are kept.")
+                    } else {
+                        format!("🤔 Check-in #{id} isn't open.")
+                    }
+                }),
+            Err(_) => Err(anyhow::anyhow!(
+                "Which check-in? A number from `!kk checkins`."
+            )),
+        },
+        ["rooms", "central", ..] if kk.managed_rooms.is_some() => Err(crate::admin::managed()),
+        ["rooms", "central", room, rest @ ..] => {
+            let on = rest.first() != Some(&"off");
+            let room = room.to_string();
+            kk.engine
+                .db
+                .run(move |c| checkins::set_central(c, &room, on))
+                .await
+                .and_then(|done| {
+                    if !done {
+                        bail!("Authorize the room first: `!kk rooms add …`");
+                    }
+                    Ok(if on {
+                        "📣 Check-ins started with `announce` are announced there.".to_owned()
+                    } else {
+                        "🔕 No more announcements there.".to_owned()
+                    })
+                })
+        }
+        _ => return None,
+    };
+    Some(reply)
+}
+
+fn number(s: &str) -> Result<usize> {
+    s.parse()
+        .with_context(|| format!("{s:?} isn't a question number"))
+}
+
+/// `words…` and the value after `name` (removed from the words).
+fn split_option(rest: &[&str], name: &str) -> (String, Option<String>) {
+    let mut words = Vec::new();
+    let mut value = None;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == name && i + 1 < rest.len() {
+            value = Some(rest[i + 1].to_owned());
+            i += 2;
+        } else {
+            words.push(rest[i]);
+            i += 1;
+        }
+    }
+    (words.join(" "), value)
+}
+
+fn none_or(s: &str) -> Option<String> {
+    (s != "none" && s != "-").then(|| s.to_owned())
+}
+
+fn edit_of(verb: &str, rest: &[&str]) -> Option<Edit> {
+    Some(match (verb, rest) {
+        ("edit", text) if !text.is_empty() => Edit::Text(text.join(" ")),
+        ("required", []) => Edit::Required(true),
+        ("optional", []) => Edit::Required(false),
+        ("comment", ["on"]) => Edit::Comment(true),
+        ("comment", ["off"]) => Edit::Comment(false),
+        ("metric", [key]) => Edit::Metric(none_or(key)),
+        ("problem", [key]) => Edit::Problem(none_or(key)),
+        ("scale", [min, max]) => Edit::Scale {
+            min: min.parse().ok()?,
+            max: max.parse().ok()?,
+        },
+        _ => return None,
+    })
+}
+
+pub(crate) fn looks_like_emoji(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| !c.is_alphanumeric() && !c.is_ascii_punctuation())
+}
+
+pub(crate) fn choice_edit(verb: &str, rest: &[&str]) -> Option<Edit> {
+    Some(match (verb, rest) {
+        ("add", rest) => {
+            let (words, problem) = split_option(rest, "problem");
+            let mut words: Vec<&str> = words.split_whitespace().collect();
+            let is_other = words.first() == Some(&"other");
+            if is_other {
+                words.remove(0);
+            }
+            let emoji = match words.first() {
+                Some(w) if looks_like_emoji(w) && words.len() > 1 => words.remove(0).to_owned(),
+                _ => String::new(),
+            };
+            if words.is_empty() {
+                return None;
+            }
+            Edit::AddChoice {
+                emoji,
+                label: words.join(" "),
+                problem,
+                is_other,
+            }
+        }
+        ("rename", [c, label @ ..]) if !label.is_empty() => Edit::RenameChoice {
+            n: c.parse().ok()?,
+            label: label.join(" "),
+        },
+        ("emoji", [c, emoji]) => Edit::ChoiceEmoji {
+            n: c.parse().ok()?,
+            emoji: none_or(emoji).unwrap_or_default(),
+        },
+        ("problem", [c, key]) => Edit::ChoiceProblem {
+            n: c.parse().ok()?,
+            problem: none_or(key),
+        },
+        ("remove", [c]) => Edit::RemoveChoice { n: c.parse().ok()? },
+        _ => return None,
+    })
+}
+
+async fn run_edit(kk: &Kk, key: &str, n: &str, edit: Edit) -> Result<String> {
+    let n = number(n)?;
+    let key = key.to_owned();
+    let k = key.clone();
+    let touches_keys = matches!(
+        edit,
+        Edit::AddChoice { .. } | Edit::ChoiceEmoji { .. } | Edit::RemoveChoice { .. }
+    );
+    let (edited, warnings) = kk
+        .engine
+        .db
+        .run(move |c| {
+            let edited = surveys::edit(c, &k, n, edit)?;
+            let warnings = if touches_keys {
+                screens::choice_key_warnings(&surveys::choice_emojis(c, &k, n)?)
+            } else {
+                Vec::new()
+            };
+            Ok((edited, warnings))
+        })
+        .await?;
+    let reply = run_edit_reply(&key, n, &edited);
+    Ok(if warnings.is_empty() {
+        reply
+    } else {
+        format!("{reply}\n{}", warnings.join("\n"))
+    })
+}
+
+fn run_edit_reply(key: &str, n: usize, edited: &surveys::Edited) -> String {
+    match edited.new_version {
+        Some(_) => format!(
+            "⚠️ **This question was already asked in a check-in.**\n\
+             So I created a new version for future check-ins. Previous check-ins \
+             (and their answers) stay exactly as they were.\n\
+             🧠 If the meaning changed, point it at a different metric too: \
+             `!kk survey {key} metric {n} <metric>`."
+        ),
+        None => "✏️ Done.".to_owned(),
+    }
+}
+
+async fn templates(kk: &Kk) -> Result<String> {
+    let list = kk.engine.db.run(|c| surveys::templates(c)).await?;
+    let mut out = vec!["📊 **Check-in templates**".to_owned()];
+    for (key, emoji, title, n) in list {
+        out.push(format!(
+            "{emoji} **{}** `{key}` · {n} question(s)",
+            literal(&title)
+        ));
+    }
+    out.push(String::new());
+    out.push(HELP.to_owned());
+    Ok(out.join("\n"))
+}
+
+async fn overview(kk: &Kk, key: &str) -> Result<String> {
+    let key = key.to_owned();
+    kk.engine
+        .db
+        .run(move |c| {
+            let (emoji, title, intro): (String, String, String) = c.query_row(
+                "SELECT emoji, title, intro FROM survey_templates WHERE id = ?1",
+                [surveys::template_id(c, &key)?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let mut out = vec![format!("📊 **{emoji} {}** `{key}`", literal(&title))];
+            if !intro.is_empty() {
+                out.push(literal(&intro));
+            }
+            out.push(String::new());
+            for (i, q) in surveys::questions(c, &key)?.iter().enumerate() {
+                let v = &q.current;
+                let off = if q.active { "" } else { "🚫 " };
+                out.push(format!("**{}.** {off}{}", i + 1, literal(&v.text)));
+                let mut facts = vec![match v.kind {
+                    QKind::Scale => {
+                        let steps = v.config.steps();
+                        format!("Scale {}–{}", steps[0], steps[steps.len() - 1])
+                    }
+                    kind => kind.label().to_owned(),
+                }];
+                if !v.required {
+                    facts.push("optional".into());
+                }
+                if v.allow_comment {
+                    facts.push("💬 comment".into());
+                }
+                if v.asks_suggestion {
+                    facts.push("💡 asks for ideas".into());
+                }
+                if let Some(m) = &v.metric {
+                    facts.push(format!("🧠 `{m}`"));
+                }
+                if let Some(p) = &v.problem {
+                    facts.push(format!("⚠️ `{p}`"));
+                }
+                facts.push(format!("v{}", v.version));
+                if q.used {
+                    facts.push("🔒 asked before".into());
+                }
+                out.push(format!("     {}", facts.join(" · ")));
+                for (j, ch) in v.choices.iter().enumerate() {
+                    let problem = ch
+                        .problem
+                        .as_ref()
+                        .map(|p| format!(" → `{p}`"))
+                        .unwrap_or_default();
+                    let other = if ch.is_other { " (other)" } else { "" };
+                    out.push(format!(
+                        "     {}. {} {}{other}{problem}",
+                        j + 1,
+                        ch.emoji,
+                        literal(&ch.label)
+                    ));
+                }
+            }
+            out.push(String::new());
+            out.push(format!(
+                "➕ `!kk survey {key} add …` · ✏️ `edit <n> …` · ↕️ `move <n> <to>` · \
+                 🚫 `disable <n>` · 👀 `!kk survey {key} preview` · 🚀 `!kk checkin start {key}`"
+            ));
+            Ok(out.join("\n"))
+        })
+        .await
+}
+
+async fn preview(kk: &Kk, key: &str) -> Result<String> {
+    let key = key.to_owned();
+    let zone = kk.engine.zone;
+    kk.engine
+        .db
+        .run(move |c| {
+            let now = Utc::now();
+            // Only what residents see: a start too close to the plenum is
+            // refused at `checkin start`, here it is a note.
+            let plan = checkins::draft(
+                c,
+                &key,
+                &StartOptions {
+                    reminder: false,
+                    ..Default::default()
+                },
+                now,
+                chrono::Duration::hours(1),
+            )?;
+            let too_soon = checkins::closes_too_soon(&plan, now);
+            let run = checkins::Run {
+                id: 0,
+                emoji: plan.emoji.clone(),
+                title: plan.title.clone(),
+                intro: plan.intro.clone(),
+                target: plan.target.clone(),
+                identities: plan.identities.clone(),
+                plenum_id: plan.plenum.map(|p| p.0),
+                opens_at: plan.opens.unwrap_or(now),
+                closes_at: plan.closes_at,
+                reminder_at: None,
+                announce: false,
+                open: true,
+                questions: plan
+                    .versions
+                    .iter()
+                    .map(|v| surveys::version(c, *v))
+                    .collect::<Result<_>>()?,
+            };
+            let ctx = screens::Ctx {
+                zone: Some(zone),
+                today: Some(zone.date(now)),
+                ..Default::default()
+            };
+            let mut out = vec![
+                "👀 **Preview**: what residents will see".to_owned(),
+                String::new(),
+            ];
+            if too_soon {
+                out.push(format!(
+                    "⚠️ The next plenum starts within the hour, so `!kk checkin start {key}` \
+                     needs a `closes` date, like `closes 2026-11-14 18:00`."
+                ));
+                out.push(String::new());
+            }
+            out.push(screens::checkin_notice(&run, &ctx));
+            for i in 0..run.questions.len() {
+                out.push("· · ·".to_owned());
+                out.push(screens::question_preview(&run, i));
+            }
+            Ok(out.join("\n"))
+        })
+        .await
+}
+
+// ── Survey files (see `survey_file`) ───────────────────────────────────────
+
+/// Where admins keep survey files on the server.
+fn surveys_dir() -> std::path::PathBuf {
+    mxbot_common::config::store_path_from_env().join("surveys")
+}
+
+/// The answer to a file that was applied.
+fn applied_text(title: &str, applied: &survey_file::Applied) -> String {
+    let key = &applied.key;
+    let mut out = vec![format!(
+        "✅ **{}** saved: {} questions.",
+        literal(title),
+        applied.questions
+    )];
+    if applied.replaced {
+        out.push("♻️ It replaced the one with this key (never started).".to_owned());
+    }
+    out.push(format!(
+        "👀 `!kk survey {key} preview`\n🚀 `!kk checkin start {key}`"
+    ));
+    out.join("\n")
+}
+
+/// Read, check and store a survey file's text, all or nothing.
+pub async fn apply_file(kk: &Kk, text: String) -> Result<String> {
+    let file = survey_file::SurveyFile::parse(&text)?;
+    let title = file.title.clone();
+    let applied = kk
+        .engine
+        .db
+        .run(move |c| survey_file::apply(c, &file))
+        .await?;
+    tracing::info!(survey = %applied.key, questions = applied.questions, "Survey file applied");
+    Ok(applied_text(&title, &applied))
+}
+
+/// `!kk survey load <name>`: `store/surveys/<name>.toml`, else the one
+/// shipped with the bot by that name.
+async fn load(kk: &Kk, name: &str) -> Result<String> {
+    let file_name = survey_file::file_name(name)?;
+    let path = surveys_dir().join(&file_name);
+    let text = match tokio::fs::read(&path).await {
+        Ok(bytes) if bytes.len() > survey_file::MAX_BYTES => {
+            bail!("{file_name} is too large (at most 128 KB).")
+        }
+        Ok(bytes) => String::from_utf8(bytes).context("The file isn't UTF-8 text.")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match survey_file::SHIPPED.iter().find(|(n, _)| *n == file_name) {
+                Some((_, text)) => text.to_string(),
+                None => bail!("There's no {file_name}.\n\n{}", survey_files().await),
+            }
+        }
+        Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+    };
+    apply_file(kk, text).await
+}
+
+/// `!kk survey load`: the files there are.
+async fn survey_files() -> String {
+    let mut own = Vec::new();
+    if let Ok(mut dir) = tokio::fs::read_dir(surveys_dir()).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".toml") {
+                own.push(stem.to_owned());
+            }
+        }
+    }
+    own.sort();
+    let shipped: Vec<&str> = survey_file::SHIPPED
+        .iter()
+        .filter_map(|(n, _)| n.strip_suffix(".toml"))
+        .filter(|stem| !own.iter().any(|o| o == stem))
+        .collect();
+    let mut out = vec!["📂 **Survey files**".to_owned()];
+    for stem in &own {
+        out.push(format!("📄 `!kk survey load {stem}`"));
+    }
+    for stem in shipped {
+        out.push(format!("📦 `!kk survey load {stem}` (comes with the bot)"));
+    }
+    out.push(String::new());
+    out.push(format!(
+        "📎 Or upload a .toml file here. Your own go in `{}` on the server.",
+        surveys_dir().display()
+    ));
+    out.join("\n")
+}
+
+/// A file an admin uploaded in their chat with the bot: a survey (.toml),
+/// or a list of `!kk` commands (.txt), run as if sent as one message.
+pub async fn upload(kk: &Kk, sender: &OwnedUserId, file: &FileMessageEventContent) -> String {
+    let read = read_upload(kk, file).await;
+    match read {
+        Ok((name, text)) if name.ends_with(".txt") => crate::admin::run(kk, sender, &text).await,
+        Ok((_, text)) => apply_file(kk, text)
+            .await
+            .unwrap_or_else(|error| format!("😕 {error:#}")),
+        Err(error) => format!("😕 {error:#}"),
+    }
+}
+
+/// An uploaded file's name and text.
+async fn read_upload(kk: &Kk, file: &FileMessageEventContent) -> Result<(String, String)> {
+    let name = file.filename().trim().to_lowercase();
+    if !(name.ends_with(".toml") || name.ends_with(".txt")) {
+        bail!("I read survey files (.toml) and lists of `!kk` commands (.txt), not {name}.");
+    }
+    let too_large = || anyhow::anyhow!("{name} is too large (at most 128 KB).");
+    let size = file.info.as_ref().and_then(|i| i.size).map(u64::from);
+    if size.is_some_and(|s| s > survey_file::MAX_BYTES as u64) {
+        return Err(too_large());
+    }
+    let bytes = kk
+        .client
+        .media()
+        .get_file(file, false)
+        .await
+        .context("Could not download the file")?
+        .context("The file has no content.")?;
+    if bytes.len() > survey_file::MAX_BYTES {
+        return Err(too_large());
+    }
+    let text = String::from_utf8(bytes).context("The file isn't UTF-8 text.")?;
+    Ok((name, text))
+}
+
+/// `!kk survey <key> export` sent on its own: the key.
+pub fn export_request(body: &str) -> Option<String> {
+    let words: Vec<&str> = body.split_whitespace().collect();
+    match words.as_slice() {
+        [kk, "survey", key, "export"] if kk.eq_ignore_ascii_case("!kk") => Some(key.to_string()),
+        _ => None,
+    }
+}
+
+/// Template `key` as a file: `(file name, TOML)`.
+pub async fn export_file(kk: &Kk, key: &str) -> Result<(String, String)> {
+    let key = key.to_owned();
+    let file = kk
+        .engine
+        .db
+        .run(move |c| survey_file::export(c, &key))
+        .await?;
+    Ok((format!("{}.toml", file.key), file.to_toml()?))
+}
+
+/// `add <kind> [optional] [suggestion] [metric <key>] [problem <key>] <question>`.
+struct QuestionSpec {
+    kind: QKind,
+    text: String,
+    required: bool,
+    suggestion: bool,
+    metric: Option<String>,
+    problem: Option<String>,
+}
+
+fn question_spec(kind: &str, rest: &[&str]) -> Result<QuestionSpec> {
+    let kind = QKind::parse(kind)?;
+    let mut words = Vec::new();
+    let (mut required, mut suggestion) = (true, false);
+    let (mut metric, mut problem) = (None, None);
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "optional" if words.is_empty() => required = false,
+            "suggestion" if words.is_empty() => suggestion = true,
+            "metric" if words.is_empty() && i + 1 < rest.len() => {
+                metric = Some(rest[i + 1].to_owned());
+                i += 1;
+            }
+            "problem" if words.is_empty() && i + 1 < rest.len() => {
+                problem = Some(rest[i + 1].to_owned());
+                i += 1;
+            }
+            word => words.push(word),
+        }
+        i += 1;
+    }
+    Ok(QuestionSpec {
+        kind,
+        text: words.join(" "),
+        required,
+        suggestion,
+        metric,
+        problem,
+    })
+}
+
+async fn add(kk: &Kk, key: &str, kind: &str, rest: &[&str]) -> Result<String> {
+    let QuestionSpec {
+        kind,
+        text,
+        required,
+        suggestion,
+        metric,
+        problem,
+    } = question_spec(kind, rest)?;
+    let key = key.to_owned();
+    let k = key.clone();
+    let n = kk
+        .engine
+        .db
+        .run(move |c| {
+            surveys::add_question(
+                c,
+                &k,
+                NewQuestion {
+                    kind,
+                    text: &text,
+                    required,
+                    asks_suggestion: suggestion,
+                    metric: metric.as_deref(),
+                    problem: problem.as_deref(),
+                },
+            )
+        })
+        .await?;
+    let next = if kind.has_choices() {
+        format!(
+            "\nNow its choices: `!kk survey {key} choice {n} add [problem <key>] [emoji] <label>`"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!("➕ Question {n} added.{next}"))
+}
+
+async fn plan_start(kk: &Kk, actor: &str, key: &str, rest: &[&str]) -> Result<String> {
+    let zone = kk.engine.zone;
+    let now = Utc::now();
+    let mut opts = StartOptions::default();
+    let mut i = 0;
+    let rooms = kk
+        .engine
+        .db
+        .run(|c| crate::store::authorized_rooms(c))
+        .await?;
+    while i < rest.len() {
+        match rest[i] {
+            "house" => opts.target = Target::House,
+            "room" => {
+                let id = rest.get(i + 1).context("`room` needs a room ID")?;
+                let room = OwnedRoomId::try_from(*id).context("That isn't a room ID.")?;
+                let (_, label) = rooms
+                    .iter()
+                    .find(|(r, _)| r == room.as_str())
+                    .context("That room isn't authorized (`!kk rooms`).")?;
+                opts.target = Target::Room {
+                    room_id: room.to_string(),
+                    label: label.clone(),
+                };
+                i += 1;
+            }
+            "floor" => {
+                let loc = rest
+                    .get(i + 1)
+                    .context("`floor` needs a location key")?
+                    .to_string();
+                let found: Option<(i64, String)> = kk
+                    .engine
+                    .db
+                    .run(move |c| {
+                        use rusqlite::OptionalExtension;
+                        Ok(c.query_row(
+                            "SELECT id, label FROM locations WHERE key = ?1 AND is_floor = 1",
+                            [&loc],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?)
+                    })
+                    .await?;
+                let (location_id, label) =
+                    found.context("No floor with that key (`!kk locations`).")?;
+                opts.target = Target::Floor { location_id, label };
+                i += 1;
+            }
+            "closes" if rest.get(i + 1).is_some_and(|a| a.ends_with("-before")) => {
+                // `closes 1d-before` / `12h-before`: relative to the plenum.
+                let spec = rest[i + 1].trim_end_matches("-before");
+                let (n, unit) = spec.split_at(spec.len().saturating_sub(1));
+                let n: i64 = n
+                    .parse()
+                    .context("Like `closes 1d-before` or `closes 12h-before`.")?;
+                opts.deadline = checkins::Deadline::BeforePlenum(match unit {
+                    "d" => chrono::Duration::days(n),
+                    "h" => chrono::Duration::hours(n),
+                    _ => bail!("Like `closes 1d-before` or `closes 12h-before`."),
+                });
+                i += 1;
+            }
+            "opens" => {
+                // Planned for later: the invitations go out then.
+                let date = time::parse_date(rest.get(i + 1).context("`opens` needs a date")?)?;
+                let at = match rest.get(i + 2).and_then(|t| time::parse_hm(t).ok()) {
+                    Some(t) => {
+                        i += 1;
+                        t
+                    }
+                    None => chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                };
+                opts.opens = Some(zone.at(date, at));
+                i += 1;
+            }
+            "closes" => {
+                let date = time::parse_date(rest.get(i + 1).context("`closes` needs a date")?)?;
+                let at = match rest.get(i + 2).and_then(|t| time::parse_hm(t).ok()) {
+                    Some(t) => {
+                        i += 1;
+                        t
+                    }
+                    None => chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap(),
+                };
+                opts.deadline = checkins::Deadline::Fixed(zone.at(date, at));
+                i += 1;
+            }
+            "no-reminder" => opts.reminder = false,
+            "announce" => opts.announce = true,
+            "no-plenum" => opts.for_plenum = false,
+            "only" => {
+                opts.identities = checkins::parse_identities(
+                    rest.get(i + 1)
+                        .context("`only` needs e.g. anonymous,floor")?,
+                )?;
+                i += 1;
+            }
+            other => bail!("I don't understand {other:?}. See `!kk help`."),
+        }
+        i += 1;
+    }
+    // Test mode: whatever the target, only the admin who starts it.
+    let asked_for = kk.is_test().then(|| opts.target.describe());
+    if kk.is_test() {
+        opts.target = Target::Person {
+            mxid: actor.to_owned(),
+        };
+    }
+    // The same survey for the same people twice at once would ask them
+    // twice (and split the answers): close the open one first.
+    {
+        let (key, target) = (key.to_owned(), opts.target.clone());
+        let open = kk
+            .engine
+            .db
+            .run(move |c| checkins::open_run_of(c, &key, &target, Utc::now()))
+            .await?;
+        if let Some(id) = open {
+            bail!(
+                "#{id} of this survey is still open for the same people. \
+                 Close it first with `!kk checkin close {id}`."
+            );
+        }
+    }
+    let remind = kk.settings.get().remind_before();
+    let key = key.to_owned();
+    let o = opts.clone();
+    let plan = kk
+        .engine
+        .db
+        .run(move |c| checkins::plan(c, &key, &o, now, remind))
+        .await?;
+    let today = zone.date(now);
+    let mut out = vec![
+        "🚀 **Start check-in?**".to_owned(),
+        String::new(),
+        format!("{} {}", plan.emoji, literal(&plan.title)),
+        plan.target.describe(),
+    ];
+    if let Some(asked_for) = asked_for {
+        out.push(format!("   (live it would go to: {asked_for})"));
+    }
+    out.push(match plan.opens {
+        Some(at) => format!(
+            "🕒 Opens {} · nobody sees it before",
+            zone.day_time_label(at, today)
+        ),
+        None => "🕒 Opens right away".to_owned(),
+    });
+    out.extend([
+        format!("📝 {} question(s)", plan.versions.len()),
+        format!(
+            "🗓️ Closes {}{}",
+            zone.day_time_label(plan.closes_at, today),
+            match plan.plenum_offset {
+                Some(o) if o.is_zero() => " · when the plenum starts (moves with it)".to_owned(),
+                Some(o) => format!(" · {}h before the plenum (moves with it)", -o.num_hours()),
+                None => " · fixed".to_owned(),
+            }
+        ),
+    ]);
+    if let Some((_, _, at)) = plan.plenum {
+        out.push(format!("🗣️ Next plenum ({})", zone.day_label(at, today)));
+    }
+    out.push(match plan.reminder_at {
+        Some(at) => format!("🔔 One reminder · {}", zone.day_time_label(at, today)),
+        None => "🔕 No reminder".to_owned(),
+    });
+    out.push(if plan.announce {
+        "📣 DM + central house room".to_owned()
+    } else {
+        "📣 DM only".to_owned()
+    });
+    out.push(format!(
+        "👀 {}",
+        plan.identities
+            .iter()
+            .map(|i| i.title())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
+    out.push(String::new());
+    out.push("✅ `!kk checkin go` · ❌ `!kk checkin drop`".to_owned());
+    kk.pending_starts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(actor.to_owned(), (plan, Instant::now()));
+    Ok(out.join("\n"))
+}
+
+async fn go(kk: &Kk, actor: &str) -> Result<String> {
+    let plan = kk
+        .pending_starts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(actor)
+        .filter(|(_, at)| at.elapsed() < PLAN_VALID)
+        .map(|(plan, _)| plan)
+        .context("Nothing to start. Plan it first with `!kk checkin start <key> …`.")?;
+    let actor = actor.to_owned();
+    let opens = plan.opens.filter(|at| *at > Utc::now());
+    let id = kk
+        .engine
+        .db
+        .run(move |c| checkins::start(c, &plan, &actor, Utc::now()))
+        .await?;
+    kk.wake.notify_one();
+    if let Some(at) = opens {
+        let zone = kk.engine.zone;
+        let when = zone.day_time_label(at, zone.date(Utc::now()));
+        return Ok(format!(
+            "🕒 Check-in #{id} planned: it opens {when}.\n📬 Then everyone it's for gets one message in their Kummerkasten chat.\n🔒 Changed your mind? `!kk checkin close {id}`"
+        ));
+    }
+    Ok(if kk.is_test() {
+        format!("🚀 Check-in #{id} started, 🧪 only for you: the message comes into your Kummerkasten chat. 📬")
+    } else {
+        format!(
+            "🚀 Check-in #{id} started. Everyone it's for gets one message in their Kummerkasten chat. 📬"
+        )
+    })
+}
+
+async fn runs(kk: &Kk) -> Result<String> {
+    let zone = kk.engine.zone;
+    let list = kk.engine.db.run(|c| checkins::overview(c)).await?;
+    if list.is_empty() {
+        return Ok("📊 No check-ins yet. `!kk checkin start cleaning`".to_owned());
+    }
+    let today = zone.date(Utc::now());
+    let mut out = vec!["📊 **Check-ins**".to_owned()];
+    for checkins::RunRow {
+        id,
+        emoji,
+        title,
+        open,
+        opens_at,
+        closes_at,
+        responses,
+        eligible,
+    } in list
+    {
+        let now = Utc::now();
+        let state = if open && now < opens_at {
+            format!(
+                "🕒 planned, opens {} until {}",
+                zone.day_time_label(opens_at, today),
+                zone.day_time_label(closes_at, today)
+            )
+        } else if open {
+            format!("🟢 open until {}", zone.day_time_label(closes_at, today))
+        } else {
+            "🔒 closed".to_owned()
+        };
+        let answered = match eligible.filter(|e| *e > 0) {
+            Some(e) => format!("💬 {responses} of {e} answered"),
+            None => format!("💬 {responses} answered"),
+        };
+        out.push(format!("#{id} {emoji} {}", literal(&title)));
+        out.push(format!("   {state} · {answered}"));
+    }
+    out.push(String::new());
+    out.push("📈 `!kk checkin results <n>` · 🔒 `!kk checkin close <n>`".to_owned());
+    Ok(out.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_commands_parse() {
+        assert_eq!(
+            edit_of("edit", &["How", "satisfied?"]),
+            Some(Edit::Text("How satisfied?".into()))
+        );
+        assert_eq!(edit_of("optional", &[]), Some(Edit::Required(false)));
+        assert_eq!(edit_of("metric", &["none"]), Some(Edit::Metric(None)));
+        assert_eq!(
+            edit_of("scale", &["0", "10"]),
+            Some(Edit::Scale { min: 0, max: 10 })
+        );
+        assert_eq!(edit_of("frobnicate", &[]), None);
+        assert_eq!(
+            choice_edit("emoji", &["2", "2️⃣"]),
+            Some(Edit::ChoiceEmoji {
+                n: 2,
+                emoji: "2️⃣".into()
+            })
+        );
+        assert_eq!(
+            choice_edit("emoji", &["1", "none"]),
+            Some(Edit::ChoiceEmoji {
+                n: 1,
+                emoji: String::new()
+            })
+        );
+        assert_eq!(
+            choice_edit(
+                "add",
+                &["problem", "cleaning.reminders", "🔔", "Reminders", "fail"]
+            ),
+            Some(Edit::AddChoice {
+                emoji: "🔔".into(),
+                label: "Reminders fail".into(),
+                problem: Some("cleaning.reminders".into()),
+                is_other: false
+            })
+        );
+        assert_eq!(
+            choice_edit("add", &["other", "Something", "else"]),
+            Some(Edit::AddChoice {
+                emoji: String::new(),
+                label: "Something else".into(),
+                problem: None,
+                is_other: true
+            })
+        );
+        assert_eq!(
+            choice_edit("remove", &["2"]),
+            Some(Edit::RemoveChoice { n: 2 })
+        );
+    }
+}

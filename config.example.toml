@@ -1,0 +1,82 @@
+# 📮 kummerkasten-bot
+
+[matrix]
+homeserver   = "https://matrix.example.org"
+user_id      = "@kummerkasten:example.org"
+# Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
+access_token = "syt_REPLACE_ME"
+device_id    = "REPLACE_ME"
+# recovery_key = "OPTIONAL RECOVERY KEY"
+
+[security]
+# Who runs the Kummerkasten: `!kk …` in a verified, encrypted direct chat.
+admin_users = ["@admin:example.org"]
+# Nobody else may invite the bot anywhere. Admins may always open a direct
+# chat with it, and invite it to rooms they authorized (`!kk rooms add`).
+# Both lists are required: "all" is refused at startup.
+allowed_inviters = []
+allowed_rooms    = []
+# encryption_strategy = "identity_based"   # all_devices | identity_based | only_trusted
+# Whose devices count: "cross_signed" = every device you signed with your
+# own identity (a new identity is accepted), "verified" = only after
+# !admin verify (a new identity needs !reset-trust and a new verification).
+trust = "cross_signed"
+
+# Only accept admin commands from a device that counts under `trust` above.
+[security.admin_dm]
+require_verified_device = true
+
+[kummerkasten]
+# Every date residents see, and when a day ends.
+timezone = "Europe/Berlin"
+# "live" (default) or "test": its own database (kummerkasten-test.sqlite;
+# the live one is never touched), only admin_users have access, every
+# check-in goes only to the admin who starts it, messages say 🧪 Test.
+# mode = "test"
+# What residents see. "survey" (default for now): only the check-ins admins
+# start. They get it as a message, answer it, done. No menu, no entry
+# messages, no plenum summaries. "full": the whole Kummerkasten (feedback,
+# ideas, results). Nothing is deleted either way; switching back is a restart.
+# ui = "full"
+
+# The plenum's dates: only from this Nextcloud calendar. plenum-bot owns it
+# and shares it read-only with the bot's own Nextcloud account (Nextcloud
+# names the share "<calendar>_shared_by_<owner>"). Only that share is read:
+# not a calendar of the bot's own, not one of that name from anyone else.
+# Moving, cancelling or adding a plenum happens there; the bot follows. Left
+# out, the bot has no dates and leaves the plenums it knows as they are.
+[kummerkasten.calendar]
+account_url     = "https://cloud.example.org/remote.php/dav/calendars/kummerkasten-bot/"
+calendar        = "plenum-house"
+# The account that owns and shares it (default "plenum-bot").
+# owner         = "plenum-bot"
+username        = "kummerkasten-bot"
+# The environment variable with the account's app password (never here).
+password_env    = "CALDAV_PASSWORD"
+refresh_minutes = 5
+
+# The authorized rooms. Listed here, they are synced at every start (the
+# others deactivated) and `!kk rooms add/remove/central` are refused; left
+# out, admins manage them with those commands.
+# [[kummerkasten.rooms]]
+# id      = "!house:example.org"
+# label   = "House"
+# central = true    # the day-before summary and `announce` go here
+# entry   = true    # post the 📮 entry message once, when I'm in the room
+
+# Starting values; admins change them with `!admin set <key> <value>`.
+[kummerkasten.settings]
+# Results never describe fewer people than this (never below 2).
+privacy_threshold = 3
+# An unfinished draft is tidied away after this many minutes.
+session_minutes = 60
+# A plenum whose date passed waits for an admin's `!kk plenum complete`.
+# With auto_complete it completes by itself at complete_at on its day.
+auto_complete = false
+complete_at   = "23:59"
+# The day-before summary goes to the central room this many hours before
+# the plenum.
+summary_hours_before = 24
+# The one check-in reminder goes this many hours before the check-in closes
+# (to those who haven't answered; per check-in it can be switched off).
+reminder_hours = 24
